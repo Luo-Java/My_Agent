@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spring AI 智能对话</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div id="app">
+    <aside class="sidebar">
+        <!-- 新建对话主按钮（侧边栏顶部） -->
+        <div class="sidebar-actions">
+            <button class="new-chat-btn" @click="goChat">＋ 新建对话</button>
+        </div>
+
+        <!-- 智能体入口（点击后在右侧主区域展示列表，避免侧边栏拥挤） -->
+        <div class="sidebar-section agents-section">
+            <button class="agent-entry" @click="goAgents" :class="{ active: mainView === 'agents' }">
+                <span class="agent-entry-icon">🤖</span>
+                <span class="agent-entry-label">智能体</span>
+                <span class="agent-entry-count">{{ agents.length }}</span>
+                <span class="agent-entry-arrow">›</span>
+            </button>
+        </div>
+
+        <!-- 对话历史分区（下方，占满剩余高度） -->
+        <div class="sidebar-section conv-section">
+            <div class="sidebar-head">
+                <span>对话历史</span>
+            </div>
+            <ul class="conv-list">
+                <li v-for="c in conversations" :key="c.id"
+                    :class="{ active: c.id === currentId && mainView === 'chat' }"
+                    @click="selectConversation(c.id)">
+                    <template v-if="editingId === c.id">
+                        <input class="conv-edit" v-model="editingTitle"
+                               @click.stop
+                               @keydown.enter.prevent="commitEdit"
+                               @keydown.esc.prevent="editingId = null"
+                               @blur="commitEdit" />
+                    </template>
+                    <template v-else>
+                        <span class="conv-title" @dblclick.stop="startEdit(c)">{{ c.title || '新对话' }}</span>
+                        <span class="conv-agent" v-if="c.agentId && agentName(c.agentId)">{{ agentIcon(c.agentId) }}{{ agentName(c.agentId) }}</span>
+                        <button class="conv-edit-btn" title="重命名" @click.stop="startEdit(c)">✎</button>
+                        <button class="conv-del-btn" title="删除对话" @click.stop="deleteConversation(c.id)">🗑</button>
+                    </template>
+                </li>
+                <li v-if="conversations.length === 0" class="conv-empty">暂无会话，点击「＋ 新建对话」开始</li>
+            </ul>
+        </div>
+    </aside>
+
+    <main class="chat">
+        <!-- ===== 聊天视图 ===== -->
+        <template v-if="mainView === 'chat'">
+            <header>
+                <span class="dot"></span>
+                <span>Spring AI 智能对话</span>
+                <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
+            </header>
+            <div class="messages" ref="scroll">
+                <div class="empty" v-if="messages.length === 0">
+                    <div class="big">💬</div>
+                    <div>向 Spring AI 提问吧，支持多轮对话与历史记忆</div>
+                    <div v-if="currentAgentName" class="empty-sub">当前智能体：{{ currentAgentIcon }} {{ currentAgentName }}</div>
+                </div>
+                <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role === 'user' ? 'user' : 'ai'">
+                    <div class="avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
+                    <div class="bubble">
+                        <!-- 用户消息：纯文本；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
+                        <template v-if="m.content">
+                            <span v-if="m.role === 'user'">{{ m.content }}</span>
+                            <!-- :key 绑定 m.version：流式更新时强制重建该节点，确保 Markdown 渲染始终刷新 -->
+                            <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
+                        </template>
+                        <span v-else-if="loading && i === messages.length - 1" class="typing">
+                            <span></span><span></span><span></span>
+                        </span>
+                    </div>
+                </div>
+            </div>
+            <div class="input-bar">
+                <textarea v-model="input" @keydown.enter.exact.prevent="send"
+                          placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+                <button :disabled="loading || !input.trim()" @click="send">发送</button>
+            </div>
+        </template>
+
+        <!-- ===== 智能体管理视图 ===== -->
+        <div v-else class="agent-manage">
+            <div class="agent-manage-head">
+                <div class="agent-manage-title-wrap">
+                    <div class="agent-manage-title">🤖 智能体管理</div>
+                    <div class="agent-manage-sub">共 {{ agents.length }} 个智能体 · agent_code 用于多智能体协作时路由</div>
+                </div>
+                <button class="new-chat-btn agent-manage-new" @click="openCreateAgent">＋ 新建智能体</button>
+            </div>
+            <div class="agent-grid">
+                <div v-for="a in agents" :key="a.id" class="agent-card" @click="viewAgent(a)">
+                    <div class="agent-card-icon" :style="{ background: (a.avatarColor || '#3b82f6') + '1f', color: a.avatarColor || '#3b82f6' }">
+                        {{ a.icon || '🤖' }}
+                    </div>
+                    <div class="agent-card-body">
+                        <div class="agent-card-name">{{ a.name }}</div>
+                        <div class="agent-card-code" v-if="a.agentCode">code: {{ a.agentCode }}</div>
+                        <div class="agent-card-desc">{{ a.description || '暂无描述' }}</div>
+                    </div>
+                    <div class="agent-card-actions" @click.stop>
+                        <button class="card-btn" title="用 TA 对话" @click="startAgentChat(a)">💬</button>
+                        <button class="card-btn" title="编辑" @click="openEditAgent(a)">✎</button>
+                        <button class="card-btn card-btn-del" title="删除" @click="deleteAgent(a.id)">🗑</button>
+                    </div>
+                </div>
+                <div v-if="agents.length === 0" class="agent-grid-empty">
+                    还没有智能体，点右上角「＋ 新建智能体」创建
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- 智能体创建 / 编辑弹窗 -->
+    <div class="modal-mask" v-if="agentModal.open" @click.self="closeAgentModal">
+        <div class="modal">
+            <div class="modal-head">
+                <span>{{ agentModal.id ? '编辑智能体' : '创建智能体' }}</span>
+                <button class="modal-close" @click="closeAgentModal">✕</button>
+            </div>
+            <div class="modal-body">
+                <label>名称 <span class="req">*</span></label>
+                <input v-model="agentModal.name" placeholder="例如：翻译官 / Python 老师" @blur="autoFillCode" />
+
+                <label>图标（可选）</label>
+                <div class="icon-row">
+                    <span v-for="ic in iconPresets" :key="ic" class="icon-opt"
+                          :class="{ selected: agentModal.icon === ic }"
+                          @click="agentModal.icon = ic">{{ ic }}</span>
+                    <input class="icon-custom" v-model="agentModal.icon" placeholder="自定义" maxlength="4" />
+                </div>
+
+                <label>智能体编码（agent_code，协作路由用）</label>
+                <input v-model="agentModal.agentCode"
+                       :disabled="!!agentModal.id"
+                       :placeholder="agentModal.id ? '创建后不可修改' : '留空自动生成（如 python-teacher）'" />
+                <div v-if="agentModal.id" class="field-hint">编码创建后不可修改，如需变更请新建智能体</div>
+
+                <label>描述</label>
+                <input v-model="agentModal.description" placeholder="一句话说明这个智能体是做什么的" />
+
+                <div class="label-row">
+                    <label>系统提示词（人设）<span class="req">*</span></label>
+                    <button class="gen-btn" type="button"
+                            :disabled="agentModal.genLoading || !agentModal.name.trim()"
+                            @click="genPrompt">
+                        {{ agentModal.genLoading ? '生成中…' : '✨ AI 生成' }}
+                    </button>
+                </div>
+                <textarea v-model="agentModal.systemPrompt" rows="6"
+                          placeholder="例如：你是一位资深 Python 工程师，回答时优先给出可运行代码示例，并解释关键思路。&#10;&#10;也可以先填名称和描述，点「✨ AI 生成」让 AI 帮你写人设。"></textarea>
+
+                <div class="row">
+                    <div class="col">
+                        <label>模型（可选）</label>
+                        <input v-model="agentModal.model" placeholder="留空则使用默认模型" />
+                    </div>
+                    <div class="col">
+                        <label>温度（可选 0~2）</label>
+                        <input v-model.number="agentModal.temperature" type="number" step="0.1" min="0" max="2" placeholder="如 0.7" />
+                    </div>
+                </div>
+
+                <label>主题色（可选）</label>
+                <div class="color-row">
+                    <input v-model="agentModal.avatarColor" placeholder="#3b82f6" />
+                    <input type="color" v-model="agentModal.avatarColor" />
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" @click="closeAgentModal">取消</button>
+                <button class="btn-primary"
+                        :disabled="agentModal.saving || !agentModal.name.trim() || !agentModal.systemPrompt.trim()"
+                        @click="saveAgent">
+                    {{ agentModal.saving ? '保存中…' : '保存' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 智能体查看弹窗（只读详情） -->
+    <div class="modal-mask" v-if="agentView.open" @click.self="agentView.open = false">
+        <div class="modal modal-view">
+            <div class="modal-head">
+                <span>{{ agentView.agent.icon || '🤖' }} {{ agentView.agent ? agentView.agent.name : '' }}</span>
+                <button class="modal-close" @click="agentView.open = false">✕</button>
+            </div>
+            <div class="modal-body">
+                <label>智能体编码</label>
+                <div class="view-text view-code">{{ agentView.agent.agentCode || '（无）' }}</div>
+
+                <label>描述</label>
+                <div class="view-text">{{ agentView.agent.description || '—' }}</div>
+
+                <label>系统提示词</label>
+                <pre class="view-prompt">{{ agentView.agent.systemPrompt }}</pre>
+
+                <div class="row">
+                    <div class="col">
+                        <label>模型</label>
+                        <div class="view-text">{{ agentView.agent.model || '默认模型' }}</div>
+                    </div>
+                    <div class="col">
+                        <label>温度</label>
+                        <div class="view-text">{{ agentView.agent.temperature ?? '默认' }}</div>
+                    </div>
+                </div>
+
+                <label>主题色</label>
+                <div class="color-view">
+                    <span class="agent-dot" :style="{ background: agentView.agent.avatarColor || '#3b82f6' }"></span>
+                    <span>{{ agentView.agent.avatarColor || '默认' }}</span>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-danger-ghost" @click="deleteAgent(agentView.agent.id)">删除</button>
+                <span class="foot-spacer"></span>
+                <button class="btn-ghost" @click="openEditAgent(agentView.agent)">编辑</button>
+                <button class="btn-primary" @click="startAgentChat(agentView.agent)">用 TA 对话</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>

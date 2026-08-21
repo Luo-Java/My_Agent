@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: My_Agent
+
+  # 启动时自动执行 schema.sql 建表（幂等：CREATE TABLE IF NOT EXISTS；
+  # continue-on-error 让“为旧表补列”的 ALTER 在列已存在时不报错）
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:sql/schema.sql
+      continue-on-error: true
+
+  datasource:
+    # 数据库 my_agent 不存在时，连接参数中的 createDatabaseIfNotExist 会自动创建
+    url: jdbc:mysql://localhost:3306/agent?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root@123}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  ai:
+    openai:
+      # API Key：推荐通过环境变量 OPENAI_API_KEY 注入，或在此直接填写
+      api-key: ${OPENAI_API_KEY:sk-67e763f880894e47a4e5cc56be6e0615}
+      # OpenAI 兼容的基础地址。
+      # 使用 DeepSeek / 通义千问 / 本地 Ollama 等兼容服务时，改成对应地址即可，
+      # 例如 DeepSeek: https://api.deepseek.com   本地 Ollama: http://localhost:11434
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      chat:
+        # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
+        model: qwen3.7-max-2026-05-17
+
+# MyBatis-Plus 配置
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+
+server:
+  port: 8080
+
+# 日志配置：输出全部级别（TRACE 是最低级别，涵盖 TRACE/DEBUG/INFO/WARN/ERROR）
+logging:
+  level:
+    root: info           # 全局所有框架与业务代码都输出
+    org.luo: debug        # 本项目代码显式设为 trace，确保自定义日志全量输出
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+
