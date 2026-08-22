@@ -45,6 +45,13 @@ public class Agent {
     /** 主题色（可选），前端展示用，如 #3b82f6。 */
     private String avatarColor;
 
+    /**
+     * 参数清单（JSON）：声明该智能体执行任务所需的参数，用于对话中的「追问 / 参数补全」。
+     * 例如：[{"key":"targetLang","label":"目标语言","required":true,"hint":"如：英语/日语","options":["英语","日语","韩语"]}]
+     * 为空表示不启用参数补全（走普通对话）。
+     */
+    private String paramSchema;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;

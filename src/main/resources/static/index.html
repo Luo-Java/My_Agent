@@ -141,14 +141,14 @@
                     <input class="icon-custom" v-model="agentModal.icon" placeholder="自定义" maxlength="4" />
                 </div>
 
-                <label>智能体编码（agent_code，协作路由用）</label>
+                <label>智能体编码（agent_code，协作路由用）<span class="req">*</span></label>
                 <input v-model="agentModal.agentCode"
                        :disabled="!!agentModal.id"
                        :placeholder="agentModal.id ? '创建后不可修改' : '留空自动生成（如 python-teacher）'" />
                 <div v-if="agentModal.id" class="field-hint">编码创建后不可修改，如需变更请新建智能体</div>
 
-                <label>描述</label>
-                <input v-model="agentModal.description" placeholder="一句话说明这个智能体是做什么的" />
+                <label>描述 <span class="req">*</span></label>
+                <input v-model="agentModal.description" placeholder="一句话说明这个智能体是做什么的（必填）" />
 
                 <div class="label-row">
                     <label>系统提示词（人设）<span class="req">*</span></label>
@@ -158,8 +158,35 @@
                         {{ agentModal.genLoading ? '生成中…' : '✨ AI 生成' }}
                     </button>
                 </div>
-                <textarea v-model="agentModal.systemPrompt" rows="6"
+                <textarea v-model="agentModal.systemPrompt" rows="9"
                           placeholder="例如：你是一位资深 Python 工程师，回答时优先给出可运行代码示例，并解释关键思路。&#10;&#10;也可以先填名称和描述，点「✨ AI 生成」让 AI 帮你写人设。"></textarea>
+
+                <!-- 参数补全编辑区：声明执行该智能体所需参数，对话中缺失会自动追问 -->
+                <div class="param-section">
+                    <div class="label-row">
+                        <label>参数补全（可选）</label>
+                        <button class="gen-btn" type="button" @click="addParam">＋ 添加参数</button>
+                    </div>
+                    <div class="field-hint">声明执行该智能体所需的参数；对话中若缺失会自动追问补全（最多 3 次）。无需参数可留空。</div>
+
+                    <div v-if="agentModal.paramList.length === 0" class="param-empty">暂无参数，点「＋ 添加参数」声明第一个。</div>
+
+                    <div v-for="(p, idx) in agentModal.paramList" :key="idx" class="param-row">
+                        <div class="param-head">
+                            <span class="param-idx">参数 {{ idx + 1 }}</span>
+                            <label class="param-req"><input type="checkbox" v-model="p.required" /> 必填</label>
+                            <button class="param-del" type="button" @click="removeParam(idx)" title="删除该参数">✕ 删除</button>
+                        </div>
+                        <div class="param-grid">
+                            <input v-model="p.key" class="param-key" placeholder="参数键(英文)" />
+                            <input v-model="p.label" class="param-label" placeholder="显示名" />
+                            <input v-model="p.hint" class="param-hint" placeholder="追问提示语" />
+                            <input v-model="p.optionsText" class="param-options" placeholder="可选项，顿号/逗号分隔" />
+                        </div>
+                    </div>
+
+                    <div class="field-hint">示例（翻译官）：目标语言 targetLang（必填，可选项：英语、日语、韩语）；语气 tone（可选，可选项：正式、口语）</div>
+                </div>
 
                 <div class="row">
                     <div class="col">
@@ -181,7 +208,7 @@
             <div class="modal-foot">
                 <button class="btn-ghost" @click="closeAgentModal">取消</button>
                 <button class="btn-primary"
-                        :disabled="agentModal.saving || !agentModal.name.trim() || !agentModal.systemPrompt.trim()"
+                        :disabled="agentModal.saving || !agentModal.name.trim() || !agentModal.agentCode.trim() || !agentModal.description.trim() || !agentModal.systemPrompt.trim()"
                         @click="saveAgent">
                     {{ agentModal.saving ? '保存中…' : '保存' }}
                 </button>
@@ -205,6 +232,18 @@
 
                 <label>系统提示词</label>
                 <pre class="view-prompt">{{ agentView.agent.systemPrompt }}</pre>
+
+                <label>参数补全</label>
+                <div v-if="parseParamSchema(agentView.agent.paramSchema).length" class="view-params">
+                    <div v-for="(p, i) in parseParamSchema(agentView.agent.paramSchema)" :key="i" class="view-param-item">
+                        <b>{{ p.label || p.key }}</b>
+                        <span v-if="p.required" class="req-tag">必填</span>
+                        <span v-else class="opt-tag">可选</span>
+                        <span v-if="p.hint" class="param-hint-text">（{{ p.hint }}）</span>
+                        <span v-if="p.optionsText" class="param-opts-text">可选项：{{ p.optionsText }}</span>
+                    </div>
+                </div>
+                <div class="view-text" v-else>无</div>
 
                 <div class="row">
                     <div class="col">

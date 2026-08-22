@@ -65,6 +65,7 @@ createApp({
             model: '',
             temperature: null,
             avatarColor: '',
+            paramList: [],   // 参数补全列表（结构化，保存时序列化为 JSON 串写入 paramSchema）
             saving: false,
             genLoading: false
         });
@@ -107,11 +108,10 @@ createApp({
             return '';
         });
 
-        // 切回聊天视图
-        function goChat() {
+        // 新建对话（总是创建新会话；无论当前是否已有会话）
+        async function goChat() {
             mainView.value = 'chat';
-            if (!currentId.value) newConversation();
-            else if (conversations.value.length === 0) newConversation();
+            await newConversation();
         }
 
         // 切到智能体管理视图
@@ -259,6 +259,7 @@ createApp({
                 open: true, id: null,
                 name: '', agentCode: '', icon: '', description: '', systemPrompt: '',
                 model: '', temperature: null, avatarColor: '',
+                paramList: [],
                 saving: false, genLoading: false
             });
         }
@@ -290,9 +291,58 @@ createApp({
                 model: a.model || '',
                 temperature: a.temperature ?? null,
                 avatarColor: a.avatarColor || '',
+                paramList: parseParamSchema(a.paramSchema),
                 saving: false, genLoading: false
             });
             agentView.open = false; // 从查看弹窗进入编辑时关闭查看弹窗
+        }
+
+        /**
+         * 把后端返回的 paramSchema（JSON 字符串）解析为前端可编辑的结构化列表。
+         * 每项：{ key, label, required, hint, optionsText }；optionsText 为可选项用「、」连接的文本。
+         */
+        function parseParamSchema(str) {
+            if (!str) return [];
+            try {
+                const arr = JSON.parse(str);
+                if (!Array.isArray(arr)) return [];
+                return arr.map(p => ({
+                    key: p.key || '',
+                    label: p.label || '',
+                    required: p.required !== false,
+                    hint: p.hint || '',
+                    optionsText: Array.isArray(p.options) ? p.options.join('、') : ''
+                }));
+            } catch (e) {
+                return [];
+            }
+        }
+
+        /**
+         * 把结构化 paramList 序列化为后端 paramSchema（JSON 字符串）。
+         * 过滤掉没填 key 的空行；无有效参数时返回空串（等价「无参数」，且可在编辑时清空已有配置）。
+         */
+        function buildParamSchema() {
+            const list = (agentModal.paramList || [])
+                .map(p => ({
+                    key: (p.key || '').trim(),
+                    label: (p.label || '').trim(),
+                    required: !!p.required,
+                    hint: (p.hint || '').trim(),
+                    options: (p.optionsText || '').split(/[、,，]/).map(s => s.trim()).filter(Boolean)
+                }))
+                .filter(p => p.key);
+            return list.length === 0 ? '' : JSON.stringify(list);
+        }
+
+        // 新增一个空白参数行
+        function addParam() {
+            agentModal.paramList.push({ key: '', label: '', required: true, hint: '', optionsText: '' });
+        }
+
+        // 删除指定索引的参数行
+        function removeParam(idx) {
+            agentModal.paramList.splice(idx, 1);
         }
 
         function closeAgentModal() {
@@ -339,7 +389,7 @@ createApp({
 
         async function saveAgent() {
             const m = agentModal;
-            if (!m.name.trim() || !m.systemPrompt.trim()) return;
+            if (!m.name.trim() || !m.agentCode.trim() || !m.description.trim() || !m.systemPrompt.trim()) return;
             if (!(m.agentCode || '').trim()) m.agentCode = autoGenCode(m.name); // 编码不允许为空：空则自动生成
             m.saving = true;
             const payload = {
@@ -350,7 +400,8 @@ createApp({
                 systemPrompt: m.systemPrompt,
                 model: m.model || null,
                 temperature: (m.temperature === '' || m.temperature == null) ? null : Number(m.temperature),
-                avatarColor: m.avatarColor || null
+                avatarColor: m.avatarColor || null,
+                paramSchema: buildParamSchema()
             };
             const url = m.id ? ('/api/agent/' + encodeURIComponent(m.id)) : '/api/agent';
             const method = m.id ? 'PUT' : 'POST';
@@ -478,6 +529,7 @@ createApp({
             goChat, goAgents,
             openCreateAgent, openEditAgent, closeAgentModal, saveAgent, deleteAgent,
             viewAgent, genPrompt, autoFillCode,
+            addParam, removeParam, parseParamSchema,
             agentName, agentIcon, renderMd, scroll
         };
     }

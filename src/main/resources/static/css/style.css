@@ -712,7 +712,7 @@ button {
 }
 
 .modal {
-    width: 480px;
+    width: 560px;
     max-width: calc(100vw - 32px);
     max-height: calc(100vh - 48px);
     background: var(--panel);
@@ -745,6 +745,8 @@ button {
 .modal-body {
     padding: 18px 20px;
     overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 0;   /* 关键：允许 flex 子项收缩，内部 overflow-y:auto 才能生效，避免字段被裁切 */
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -773,7 +775,7 @@ button {
     width: 100%;
 }
 
-.modal-body textarea { resize: vertical; line-height: 1.6; }
+.modal-body textarea { resize: vertical; line-height: 1.6; min-height: 180px; }
 
 .modal-body input:focus,
 .modal-body textarea:focus { border-color: var(--primary); }
@@ -899,6 +901,134 @@ button {
     background: #fff;
     cursor: pointer;
     flex: none;
+}
+
+/* ===== 参数补全编辑区 ===== */
+.param-section { margin-top: 14px; }
+
+.param-empty {
+    font-size: 13px;
+    color: var(--text-soft);
+    padding: 12px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    margin-top: 6px;
+}
+
+.param-row {
+    margin-top: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #fbfcfe;
+}
+
+/* 参数卡片头部：序号 + 必填 + 删除，单行排列 */
+.param-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed var(--border);
+}
+
+.param-idx {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+    white-space: nowrap;
+}
+
+.param-head .param-req {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+    margin: 0;
+    cursor: pointer;
+}
+
+.param-head .param-req input { width: auto; cursor: pointer; }
+
+.param-head .param-del {
+    margin-left: auto;
+}
+
+.param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
+    align-items: center;
+}
+
+/* 提示语、可选项占整行，避免被挤窄 */
+.param-grid .param-hint,
+.param-grid .param-options { grid-column: 1 / -1; }
+
+.param-grid input {
+    width: 100%;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    background: #fff;
+    color: var(--text);
+}
+
+.param-del {
+    background: transparent;
+    border: 1px solid rgba(239, 68, 68, .35);
+    color: #ef4444;
+    border-radius: 8px;
+    padding: 5px 10px;
+    height: 30px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.param-del:hover { background: rgba(239, 68, 68, .08); }
+
+/* 查看弹窗中的参数列表 */
+.view-params {
+    padding: 10px 12px;
+    background: #f7f9fc;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.9;
+}
+
+.view-param-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.req-tag {
+    font-size: 11px;
+    color: #ef4444;
+    background: rgba(239, 68, 68, .1);
+    border-radius: 6px;
+    padding: 1px 7px;
+}
+
+.opt-tag {
+    font-size: 11px;
+    color: var(--primary);
+    background: var(--primary-soft);
+    border-radius: 6px;
+    padding: 1px 7px;
+}
+
+.param-hint-text { color: var(--text-soft); font-size: 13px; }
+
+.param-opts-text {
+    color: var(--text-soft);
+    font-size: 12px;
+    background: #eef1f6;
+    border-radius: 6px;
+    padding: 1px 7px;
 }
 
 .modal-foot {

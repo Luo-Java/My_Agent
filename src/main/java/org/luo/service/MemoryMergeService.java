@@ -1,0 +1,153 @@
+package org.luo.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.luo.entity.ChatMessage;
+import org.luo.entity.Conversation;
+import org.luo.memory.DbChatMemory;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+/**
+ * 会话记忆合并服务：对话结束后，将「溢出窗口的旧消息」与「已有摘要/关键事实」合并，
+ * 一次 LLM 调用同时产出更新后的滚动摘要与用户核心信息，回写 conversation 表。
+ * <p>
+ * 使用裸 {@link ChatModel} 直接调用（不走 advisor），否则 advisor 会把摘要指令当作对话消息写入记忆造成污染。
+ * 失败一律回退到已有记忆，保证主流程不被打断、长期记忆不丢。
+ */
+@Slf4j
+@Service
+public class MemoryMergeService {
+
+    /**
+     * 批量记忆合并阈值：累计溢出这么多条消息才触发一次 LLM 记忆合并（摘要 + 关键事实）。
+     * 值越大调用越少（默认 6 条 ≈ 每 3 轮一次），但批次之间溢出的消息会暂时缺席上下文；
+     * 值越小记忆越细但调用越频繁（设为 1 即回到每轮合并）。可调。
+     */
+    private static final int SUMMARY_BATCH_SIZE = 6;
+
+    private final ConversationService conversationService;
+    private final ChatModel chatModel;
+
+    public MemoryMergeService(ConversationService conversationService, ChatModel chatModel) {
+        this.conversationService = conversationService;
+        this.chatModel = chatModel;
+    }
+
+    /**
+     * 对话结束后检查：历史是否溢出窗口达到合并阈值，若是则触发一次 LLM 记忆合并。
+     * 本轮消息已由 advisor 通过 ChatMemory 落库，这里基于全量历史计算窗口起点，
+     * 窗口之外的旧消息由「滚动摘要 + 用户核心信息」接管，之后不再进入上下文。
+     */
+    public void maybeMergeMemory(String conversationId) {
+        try {
+            List<ChatMessage> history = conversationService.getHistory(conversationId);
+            int windowStart = DbChatMemory.computeWindowStart(history);
+            if (windowStart <= 0) {
+                return; // 全部历史都在 token 预算内，无需合并
+            }
+            Conversation conv = conversationService.getConversation(conversationId);
+            if (conv == null) return;
+            int alreadySummarized = conv.getSummarizedCount() == null ? 0 : conv.getSummarizedCount();
+            int newOverflow = windowStart - alreadySummarized;
+            if (newOverflow < SUMMARY_BATCH_SIZE) {
+                if (newOverflow > 0) {
+                    log.debug("记忆待合并：{} 条溢出消息未合并（阈值={}）", newOverflow, SUMMARY_BATCH_SIZE);
+                }
+                return;
+            }
+            if (alreadySummarized >= windowStart) {
+                log.warn("记忆状态不一致：已覆盖条数={} >= 窗口起点={}，跳过合并", alreadySummarized, windowStart);
+                return;
+            }
+            List<ChatMessage> delta = history.subList(alreadySummarized, windowStart);
+            SummaryResult sr = summarize(conv.getSummary(), conv.getCoreFacts(), delta);
+            conversationService.updateMemory(conversationId, sr.summary, sr.coreFacts, windowStart);
+            log.info("记忆合并完成：合并 {} 条，已覆盖条数={}", delta.size(), windowStart);
+        } catch (Exception e) {
+            log.error("记忆合并失败：会话={}", conversationId, e);
+        }
+    }
+
+    /**
+     * 将"新增溢出的历史"与"已有摘要/关键事实"合并，一次 LLM 调用同时产出：
+     * 更新后的滚动摘要 + 更新后的用户核心信息（关键事实清单）。
+     *
+     * @param existingSummary   之前的滚动摘要（首次为 {@code null}）
+     * @param existingCoreFacts 已提取的用户核心信息（首次为 {@code null}）
+     * @param newMessages       新溢出到记忆池的消息列表（按时间正序）
+     * @return 合并结果（摘要 + 核心信息）；LLM 调用失败时两者均回退原值
+     */
+    private SummaryResult summarize(String existingSummary, String existingCoreFacts, List<ChatMessage> newMessages) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("【已有摘要】\n").append(existingSummary == null || existingSummary.isBlank() ? "（无）" : existingSummary).append("\n\n");
+            sb.append("【已有关键事实】\n").append(existingCoreFacts == null || existingCoreFacts.isBlank() ? "（无）" : existingCoreFacts).append("\n\n");
+            sb.append("【新增对话内容】\n");
+            for (ChatMessage m : newMessages) {
+                sb.append(m.getRole()).append("：").append(m.getContent()).append("\n");
+            }
+            log.debug("生成摘要：调用 LLM 合并 {} 条新消息", newMessages.size());
+            ChatResponse response = chatModel.call(new Prompt(List.of(
+                    new SystemMessage("你负责维护一份对话记忆。每次收到【新增对话内容】时，把它与【已有摘要】和【已有关键事实】合并，"
+                            + "输出两部分，严格使用下面的格式（不要输出其他内容）：\n"
+                            + "## 摘要\n更新后的简洁中文摘要，保留关键事实、用户偏好、待办与结论；不要逐字复述。\n"
+                            + "## 关键事实\n从全部内容中提取的用户长期关键信息，每条以“- ”开头（如姓名、身份、偏好、待办、重要承诺）；没有则只输出“无”。"),
+                    new UserMessage(sb.toString()))));
+            var generation = response.getResult();
+            var assistantMessage = generation != null ? generation.getOutput() : null;
+            String reply = assistantMessage != null ? assistantMessage.getText() : null;
+            if (reply == null || reply.isBlank()) {
+                log.warn("生成摘要：LLM 返回为空，回退到已有记忆");
+                return new SummaryResult(existingSummary, existingCoreFacts);
+            }
+            SummaryResult sr = parseSummaryResult(reply, existingSummary, existingCoreFacts);
+            log.info("生成摘要完成：摘要长度={}，关键事实长度={}",
+                    sr.summary != null ? sr.summary.length() : 0,
+                    sr.coreFacts != null ? sr.coreFacts.length() : 0);
+            return sr;
+        } catch (Exception e) {
+            log.error("生成摘要失败：LLM 调用异常", e);
+            return new SummaryResult(existingSummary, existingCoreFacts);   // 失败：保留旧记忆，不阻断对话
+        }
+    }
+
+    /**
+     * 解析 LLM 返回的「摘要 + 关键事实」两段式文本，容错处理格式偏差：
+     * 找不到分隔符时整段视为摘要、关键事实保留旧值；关键事实为"无"时置为 null。
+     */
+    private SummaryResult parseSummaryResult(String reply, String existingSummary, String existingCoreFacts) {
+        String text = reply.trim();
+        int idx = text.indexOf("## 关键事实");
+        if (idx < 0) idx = text.indexOf("关键事实");
+        if (idx < 0) {
+            return new SummaryResult(text, existingCoreFacts);
+        }
+        String summaryPart = text.substring(0, idx).replaceAll("^##?\\s*摘要\\s*", "").trim();
+        String factsPart = text.substring(idx).replaceFirst("^##?\\s*关键事实\\s*", "").trim();
+        String summary = summaryPart.isBlank() ? existingSummary : summaryPart;
+        String coreFacts;
+        if (factsPart.isBlank() || "无".equals(factsPart)) {
+            coreFacts = null;
+        } else {
+            coreFacts = factsPart;
+        }
+        return new SummaryResult(summary, coreFacts);
+    }
+
+    /** LLM 一次记忆合并的产出：更新后的滚动摘要 + 用户核心信息。 */
+    private static final class SummaryResult {
+        final String summary;
+        final String coreFacts;
+
+        SummaryResult(String summary, String coreFacts) {
+            this.summary = summary;
+            this.coreFacts = coreFacts;
+        }
+    }
+}

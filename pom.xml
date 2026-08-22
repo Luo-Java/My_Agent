@@ -53,6 +53,12 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
         </dependency>
+        <!-- Spring AI：动态工具发现（ToolSearchToolCallingAdvisor，渐进式工具暴露，由 AI 在对话中按需选择调用） -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-tool-search-advisor</artifactId>
+            <version>2.0.0</version>
+        </dependency>
         <!-- MyBatis-Plus（Spring Boot 4 专用 starter） -->
         <dependency>
             <groupId>com.baomidou</groupId>
@@ -68,6 +74,12 @@
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <optional>true</optional>
+        </dependency>
+        <!-- Hutool：轻量工具集，路由 JSON 等用小工具解析（规避 Jackson ObjectMapper） -->
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.38</version>
         </dependency>
     </dependencies>
 

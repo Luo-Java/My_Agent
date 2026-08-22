@@ -9,6 +9,7 @@ package org.luo.dto;
  * @param icon          图标（可选，通常是 emoji）
  * @param description   智能体描述（可选）
  * @param systemPrompt  系统提示词 / 人设
+ * @param paramSchema   参数清单（JSON），声明执行所需参数用于追问/参数补全（可选）
  * @param model         模型名称覆盖（可选）
  * @param temperature   温度（可选，0~2）
  * @param avatarColor   主题色（可选）
@@ -20,6 +21,7 @@ public record UpsertAgentRequest(
         String icon,
         String description,
         String systemPrompt,
+        String paramSchema,
         String model,
         Double temperature,
         String avatarColor

@@ -48,7 +48,11 @@ public class AgentService {
      */
     @Transactional
     public Agent createAgent(UpsertAgentRequest req) {
-        log.info("创建智能体：名称={}", req != null ? req.name() : "(null)");
+        if (req == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "请求参数不能为空");
+        }
+        log.info("创建智能体：名称={}", req.name());
+        validateRequired(req, req.agentCode());
         Agent a = new Agent();
         applyFields(a, req);
         ensureUniqueCode(a);
@@ -76,6 +80,7 @@ public class AgentService {
         if (a == null) {
             throw new AiBusinessException(AiErrorCode.NOT_FOUND, "智能体不存在");
         }
+        validateRequired(req, a.getAgentCode()); // 编辑不允许改编码，以库内既有编码为准校验
         log.info("更新智能体：id={}", req.id());
         String oldCode = a.getAgentCode(); // 编辑不允许修改编码：先记下原值，映射后恢复
         applyFields(a, req);
@@ -143,6 +148,25 @@ public class AgentService {
     }
 
     /**
+     * 校验创建/更新智能体时必填字段非空：智能体编码、描述、系统提示词均不可为空。
+     *
+     * @param req           请求对象（描述/提示词取自 req）
+     * @param effectiveCode 生效的编码（创建时为 req.agentCode；更新时取库内既有编码）
+     * @throws AiBusinessException 任一必填为空时抛出
+     */
+    private void validateRequired(UpsertAgentRequest req, String effectiveCode) {
+        if (effectiveCode == null || effectiveCode.isBlank()) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "智能体编码(agentCode)不能为空");
+        }
+        if (req.description() == null || req.description().isBlank()) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "智能体描述不能为空");
+        }
+        if (req.systemPrompt() == null || req.systemPrompt().isBlank()) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "系统提示词不能为空");
+        }
+    }
+
+    /**
      * 将请求对象的字段映射到已有的 Agent 实例上（跳过空值，trim 字符串字段）。
      * 这是内部辅助方法，不在业务层暴露。
      *
@@ -151,11 +175,12 @@ public class AgentService {
      */
     private void applyFields(Agent a, UpsertAgentRequest req) {
         if (req.name() != null) a.setName(req.name().trim());
-        // agentCode：创建时留空自动生成；更新时留空保持原值
+        // agentCode：创建时若提供则采用（已校验非空）；更新时即便 req 带值也会被上层恢复为库内原值
         if (req.agentCode() != null && !req.agentCode().isBlank()) a.setAgentCode(req.agentCode().trim());
         if (req.icon() != null) a.setIcon(req.icon().trim());
         if (req.description() != null) a.setDescription(req.description().trim());
         if (req.systemPrompt() != null) a.setSystemPrompt(req.systemPrompt());
+        if (req.paramSchema() != null) a.setParamSchema(req.paramSchema());
         a.setModel(req.model() != null && !req.model().isBlank() ? req.model().trim() : null);
         a.setTemperature(req.temperature());
         a.setAvatarColor(req.avatarColor() != null && !req.avatarColor().isBlank() ? req.avatarColor().trim() : null);

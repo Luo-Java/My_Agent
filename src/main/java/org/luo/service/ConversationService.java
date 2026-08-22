@@ -185,7 +185,6 @@ public class ConversationService {
      * @param conversationId 会话 ID
      * @param userText       当前用户输入，首次时截取前 20 字作标题
      */
-    @Transactional
     public void touchConversation(String conversationId, String userText) {
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null) return;
