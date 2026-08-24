@@ -1,8 +1,6 @@
 package org.luo.entity;
 
-import com.baomidou.mybatisplus.annotation.IdType;
-import com.baomidou.mybatisplus.annotation.TableId;
-import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.annotation.*;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -21,6 +19,12 @@ public class Conversation {
 
     /** 绑定的智能体 ID，关联 agent.id（自增主键）；为空表示使用默认助手。 */
     private Long agentId;
+
+    /**
+     * 智能体绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；
+     * CLARIFY=追问流程临时绑定（用户转向别的话题时自动解绑）；为空表示未绑定。
+     */
+    private String agentBindSource;
 
     /** 较早对话的滚动摘要（长期记忆），超出最近窗口的历史会被 LLM 压缩进这里。 */
     private String summary;

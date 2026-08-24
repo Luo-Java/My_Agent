@@ -1,6 +1,9 @@
 package org.luo.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.extension.conditions.update.LambdaUpdateChainWrapper;
+import com.baomidou.mybatisplus.extension.conditions.update.UpdateChainWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
@@ -42,6 +45,7 @@ public class ConversationService {
         c.setId(UUID.randomUUID().toString());
         if (agentId != null) {
             c.setAgentId(agentId);
+            c.setAgentBindSource("EXPLICIT");   // 用户显式绑定：保持粘住，不因话题切换解绑
             c.setTitle(agentName != null ? agentName : "新对话");
         } else {
             c.setTitle("新对话");
@@ -134,6 +138,7 @@ public class ConversationService {
      * @param conversationId 会话 ID
      * @return 会话对象；conversationId 为空时返回 null
      */
+    @Transactional
     public Conversation ensureConversation(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return null;
         Conversation c = conversationMapper.selectById(conversationId);
@@ -201,13 +206,78 @@ public class ConversationService {
     }
 
     /**
+     * 落库一次「追问交互」：用户本轮输入 + 生成的追问文本（user + assistant 两条）。
+     * 由 ChatService 在确认进入追问分支、且非话题切换时调用，确保每轮只落库一次。
+     *
+     * @param conversationId 会话 ID
+     * @param userText       用户本轮输入
+     * @param assistantText  生成的追问文本（带 CLARIFY_PREFIX 前缀）
+     */
+    @Transactional
+    public void saveClarifyExchange(String conversationId, String userText, String assistantText) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        LocalDateTime now = LocalDateTime.now();
+        ChatMessage u = new ChatMessage();
+        u.setConversationId(conversationId);
+        u.setRole("user");
+        u.setContent(userText);
+        u.setCreatedAt(now);
+        ChatMessage a = new ChatMessage();
+        a.setConversationId(conversationId);
+        a.setRole("assistant");
+        a.setContent(assistantText);
+        a.setCreatedAt(now.plusNanos(1000));   // 保证 user 早于 assistant 的顺序
+        chatMessageMapper.insert(u);
+        chatMessageMapper.insert(a);
+    }
+
+    /**
+     * 中途绑定智能体到会话（用于追问流程：路由命中某带 paramSchema 的 agent 并进入追问时，
+     * 把该 agent 记到会话上，使下一轮用户的追问回答能复用同一 agent 继续补全参数，而不被当作
+     * 全新问题重新路由导致 agent 丢失）。
+     *
+     * @param conversationId 会话 ID
+     * @param agentId        要绑定的智能体 ID（null 时忽略）
+     */
+    @Transactional
+    public void bindAgent(String conversationId, Long agentId) {
+        if (conversationId == null || conversationId.isBlank() || agentId == null) return;
+        Conversation c = conversationMapper.selectById(conversationId);
+        if (c == null) return;
+        c.setAgentId(agentId);
+        c.setAgentBindSource("CLARIFY");   // 追问流程临时绑定：用户转向别的话题时由 ChatService 自动解绑
+        conversationMapper.updateById(c);
+        log.info("绑定智能体：会话={}，agentId={}，来源=CLARIFY", conversationId, agentId);
+    }
+
+    /**
+     * 解绑会话上的智能体（参数齐全、给出正式回答后调用，使后续轮次恢复正常智能路由，
+     * 不被追问期间临时绑定的 agent 长期粘住）。显式绑定（用户主动选 agent）的不应调用此方法。
+     *
+     * @param conversationId 会话 ID
+     */
+    @Transactional
+    public void unbindAgent(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        Conversation c = conversationMapper.selectById(conversationId);
+        if (c == null || c.getAgentId() == null) return;
+        // 一并清除来源标记，避免残留 EXPLICIT/CLARIFY 指向空绑定
+        LambdaUpdateWrapper<Conversation> wrapper = new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getAgentId, null)
+                .set(Conversation::getAgentBindSource, null);
+        conversationMapper.update(null, wrapper);
+        log.info("解绑智能体：会话={}", conversationId);
+    }
+
+    /**
      * 写入会话的长期记忆：滚动摘要 + 用户核心信息 + 已覆盖条数（一次 UPDATE）。
      * 当历史超出窗口时，ChatService 会批量调用此方法持久化。
      *
-     * @param conversationId   会话 ID
-     * @param summary          滚动摘要文本
-     * @param coreFacts        用户核心信息（关键事实清单）；无则传 null
-     * @param summarizedCount  已被摘要覆盖的最旧消息条数（按时间正序索引）
+     * @param conversationId  会话 ID
+     * @param summary         滚动摘要文本
+     * @param coreFacts       用户核心信息（关键事实清单）；无则传 null
+     * @param summarizedCount 已被摘要覆盖的最旧消息条数（按时间正序索引）
      */
     @Transactional
     public void updateMemory(String conversationId, String summary, String coreFacts, int summarizedCount) {

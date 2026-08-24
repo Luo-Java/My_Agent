@@ -105,6 +105,7 @@ public class AgentService {
         qw.eq("agent_id", id);
         for (Conversation c : conversationMapper.selectList(qw)) {
             c.setAgentId(null);
+            c.setAgentBindSource(null);   // 一并清除来源标记，避免残留 EXPLICIT/CLARIFY 指向已删除的 agent
             conversationMapper.updateById(c);
         }
         agentMapper.deleteById(id);

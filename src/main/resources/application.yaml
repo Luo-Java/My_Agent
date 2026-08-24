@@ -7,7 +7,7 @@ spring:
   sql:
     init:
       mode: always
-      schema-locations: classpath:sql/schema.sql
+      schema-locations: classpath:sql/schema.sql,classpath:sql/alter.sql
       continue-on-error: true
 
   datasource:
@@ -27,7 +27,7 @@ spring:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
       chat:
         # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
-        model: qwen3.7-max-2026-05-17
+        model: qwen3.7-plus
 
 # MyBatis-Plus 配置
 mybatis-plus:

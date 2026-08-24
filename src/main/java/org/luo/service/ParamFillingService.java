@@ -20,8 +20,10 @@ import cn.hutool.json.JSONUtil;
 /**
  * 参数补全与追问服务。
  * <p>
- * 对声明了 {@code paramSchema}（参数清单 JSON）的智能体，每轮先用 LLM 从「全量历史（AI 自带记忆）」
- * 抽取已收集参数，校验必填项；缺失则生成一条追问（带 {@link #CLARIFY_PREFIX} 前缀用于计数）直接返回，不调用主模型；
+ * 对声明了 {@code paramSchema}（参数清单 JSON）的智能体，每轮先用 LLM 从「当前追问任务范围内的历史
+ * （原始请求 + 至多 {@code MAX_CLARIFY} 轮问答，见 {@link #clarifyScopedHistory}）」抽取已收集参数，
+ * 校验必填项；缺失则生成一条追问
+ * （带 {@link #CLARIFY_PREFIX} 前缀用于计数）直接返回，不调用主模型；
  * 齐全后把已确认参数交给编排层注入主模型 prompt。追问次数受 {@link #MAX_CLARIFY} 上限约束，避免无限追问。
  * <p>
  * LLM 返回的参数抽取结果按「key: 取值」逐行输出后正则解析（不用 JSON 库）；
@@ -67,8 +69,12 @@ public class ParamFillingService {
         }
         // 历史（不含本轮用户输入，由 advisor 在调用主模型时落库；追问分支由本方法手动落库）
         List<ChatMessage> history = conversationService.getHistory(conversationId);
-        int asked = countClarifyStreak(history);                       // 已连续追问次数
-        Map<String, String> params = extractParams(message, history, schema);
+        int asked = countClarifyStreak(history);                       // 已连续追问次数（只看 assistant 消息，开销可忽略，用全量）
+        // 参数抽取只取「当前这一次追问任务」的范围：从最后一次正式回答（非追问）之后的用户请求开始，
+        // 到历史末尾。即「原始请求 + 至多 MAX_CLARIFY 轮问答」，天然有界，且跨任务自动隔离
+        // （同一会话里开新请求 = 新的参数作用域，不被更早的无关对话污染）。详见 clarifyScopedHistory。
+        List<ChatMessage> scoped = clarifyScopedHistory(history);
+        Map<String, String> params = extractParams(message, scoped, schema);
         List<ParamDef> missing = missingRequired(schema, params);
         Map<String, String> paramLabels = schema.stream()
                 .collect(Collectors.toMap(ParamDef::key, ParamDef::label, (a, b) -> a));
@@ -81,10 +87,9 @@ public class ParamFillingService {
             log.info("追问达上限（{}）：转交主模型，缺失参数={}", MAX_CLARIFY, missLabels);
             return new ClarifyDecision(null, params, paramLabels, true, missLabels);
         }
-        // 生成追问并落库（user + assistant），本轮不再调用主模型
-        conversationService.saveMessages(List.of(userMsg(conversationId, message)));
+        // 生成追问文本（本轮不再调用主模型）。落库改由编排层 ChatService 在确认进入追问、且非话题切换时统一完成，
+        // 避免「用户中途切换话题」时被误落库一条已失效的追问记录。
         String question = buildQuestion(missing, asked + 1);
-        conversationService.saveMessages(List.of(assistantMsg(conversationId, question)));
         log.info("参数补全追问（第 {} 次）：会话={}，缺失={}", asked + 1, conversationId,
                 missing.stream().map(ParamDef::key).collect(Collectors.joining(",")));
         return new ClarifyDecision(question, params, paramLabels, false, List.of());
@@ -120,7 +125,27 @@ public class ParamFillingService {
     }
 
     /**
-     * 用裸 ChatModel 从「历史 + 本轮输入」抽取已明确给出的参数值（纯文本行式，每行 "key: 取值"）。
+     * 返回会话中最近一条追问（{@link #CLARIFY_PREFIX} 前缀的 assistant 消息）的完整文本；
+     * 没有追问记录返回 null。供编排层在做「话题切换预检」时作为上下文传给路由，
+     * 让路由 LLM 区分「在回答追问」与「开启了新话题」。
+     */
+    public String lastClarifyQuestion(String conversationId) {
+        List<ChatMessage> history = conversationService.getHistory(conversationId);
+        if (history == null || history.isEmpty()) return null;
+        for (int i = history.size() - 1; i >= 0; i--) {
+            ChatMessage m = history.get(i);
+            if ("assistant".equals(m.getRole())
+                    && m.getContent() != null && m.getContent().startsWith(CLARIFY_PREFIX)) {
+                return m.getContent();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 用裸 ChatModel 从「当前追问任务范围内的历史 + 本轮输入」抽取已明确给出的参数值
+     * （纯文本行式，每行 "key: 取值"）。历史只取当前任务切片（见 {@link #clarifyScopedHistory}），
+     * 即原始请求 + 至多 MAX_CLARIFY 轮问答，避免被无关历史污染、也避免成本无界增长。
      * 只在用户明确表达时填值，禁止臆测；未提及的参数不输出任何行。抽取失败回退空 Map。
      */
     private Map<String, String> extractParams(String message, List<ChatMessage> history, List<ParamDef> schema) {
@@ -154,6 +179,27 @@ public class ParamFillingService {
     /**
      * 把 LLM 返回的参数行（"key: value"）解析为 map。只接受属于 schema 的 key，忽略噪声行。
      */
+    /**
+     * 取「当前追问任务」范围内的历史用于参数抽取：从最后一次正式回答（非 {@link #CLARIFY_PREFIX} 前缀的
+     * assistant 消息）之后的用户请求开始，到历史末尾。这样抽取只基于当前这一轮追问交互
+     * （原始请求 + 至多 {@code MAX_CLARIFY} 轮问答），既不会被更早的无关对话污染，也不会因长度截断
+     * 而漏掉原始请求里已给的参数。跨任务天然隔离：新请求 = 新的参数作用域。
+     */
+    private List<ChatMessage> clarifyScopedHistory(List<ChatMessage> history) {
+        if (history == null || history.isEmpty()) return history;
+        int start = 0;
+        for (int i = history.size() - 1; i >= 0; i--) {
+            ChatMessage m = history.get(i);
+            // 遇到一次「正式回答」即视为上一任务结束，当前任务从它之后开始
+            if ("assistant".equals(m.getRole())
+                    && (m.getContent() == null || !m.getContent().startsWith(CLARIFY_PREFIX))) {
+                start = i + 1;
+                break;
+            }
+        }
+        return history.subList(start, history.size());
+    }
+
     private Map<String, String> parseParamLines(String reply, List<ParamDef> schema) {
         Set<String> keys = schema.stream().map(ParamDef::key).collect(Collectors.toSet());
         Map<String, String> out = new LinkedHashMap<>();
@@ -227,24 +273,6 @@ public class ParamFillingService {
                     .append("。请基于已有信息尽力完成任务，不要再反复追问。\n");
         }
         return sb.toString();
-    }
-
-    private ChatMessage userMsg(String cid, String text) {
-        ChatMessage m = new ChatMessage();
-        m.setConversationId(cid);
-        m.setRole("user");
-        m.setContent(text);
-        m.setCreatedAt(java.time.LocalDateTime.now());
-        return m;
-    }
-
-    private ChatMessage assistantMsg(String cid, String text) {
-        ChatMessage m = new ChatMessage();
-        m.setConversationId(cid);
-        m.setRole("assistant");
-        m.setContent(text);
-        m.setCreatedAt(java.time.LocalDateTime.now());
-        return m;
     }
 
     /** 参数定义（来自 agent.paramSchema 的单条）。 */

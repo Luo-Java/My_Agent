@@ -7,7 +7,6 @@ import org.luo.entity.Conversation;
 import org.luo.tool.ToolRegistry;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
-import org.springframework.ai.chat.client.advisor.toolsearch.ToolSearchToolCallingAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
@@ -48,17 +47,18 @@ public class ChatService {
                        ConversationService conversationService,
                        AgentService agentService,
                        MessageChatMemoryAdvisor memoryAdvisor,
-                       ToolSearchToolCallingAdvisor toolSearchAdvisor,
                        ToolUsageLoggingAdvisor toolUsageLoggingAdvisor,
                        ParamFillingService paramFillingService,
                        AgentRouter agentRouter,
                        MemoryMergeService memoryMergeService,
                        PromptService promptService,
                        ToolRegistry toolRegistry) {
-        // 动态工具发现 Advisor：替换默认 ToolCallingAdvisor（DefaultChatClient 检测到已有 ToolAdvisor
-        // 会自动跳过默认注册），由 AI 在对话中自主决定调用哪些工具，无需按 Agent 手动配置。
+        // 工具挂载不在这里做：在 buildRequest 中按「当前请求是否路由/绑定到具体 Agent」门控挂载
+        // （普通对话不挂任何工具，避免把工具定义塞进每次对话的上下文；Agent 对话才挂全局能力池）。
+        // 全局能力池由 ToolRegistry 启动时预解析为 ToolCallback，由 AI 在 Agent 范围内自主决定调用哪些，
+        // 不按 Agent 手动写死工具列表、也无需 ToolSearch 渐进式披露（避免其反复 search 的往返开销）。
         // 工具使用监控 Advisor 放在链末尾，记录每次对话实际挂载了哪些工具。
-        this.chatClient = chatClientBuilder.defaultAdvisors(memoryAdvisor, toolSearchAdvisor, toolUsageLoggingAdvisor).build();
+        this.chatClient = chatClientBuilder.defaultAdvisors(memoryAdvisor, toolUsageLoggingAdvisor).build();
         this.conversationService = conversationService;
         this.agentService = agentService;
         this.paramFillingService = paramFillingService;
@@ -79,10 +79,38 @@ public class ChatService {
     public String chat(String conversationId, String message) {
         log.info("同步对话：会话={}", conversationId);
         Conversation conv = conversationService.ensureConversation(conversationId);
+        // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
+        boolean explicitBinding = "EXPLICIT".equals(conv.getAgentBindSource());
         Agent agent = determineAgent(conv, message);
+
+        // 话题切换预检：仅当会话处于「追问绑定(CLARIFY)」时。
+        // 携带「待回答的追问」重新审视本轮消息的真实意图，避免「深圳烧鸡味道怎么样」这类含城市词的新话题
+        // 被误当成天气补全、进而去查天气。必须放在参数补全之前：原实现依赖「是否凑齐参数」判断，
+        // 但新话题里若恰好含城市词会被直接凑齐参数，导致检测彻底进不去。
+        // 由路由 LLM 语义判断三态（不做关键词/语气词启发式）：
+        //   continueTask=用户在回答追问 → 保持绑定继续补全；
+        //   agent() 命中同一 agent → 继续补全；命中另一 agent → 转向（解绑）；
+        //   none（未命中且未在回答追问）= 新话题且无 agent 可接 → 转普通对话并解绑。
+        if (!explicitBinding && conv.getAgentId() != null && "CLARIFY".equals(conv.getAgentBindSource())) {
+            String pendingQuestion = paramFillingService.lastClarifyQuestion(conversationId);
+            AgentRouter.RouteDecision rd = agentRouter.route(message, pendingQuestion);
+            boolean keepBound = rd.continuation()
+                    || (rd.agent() != null && rd.agent().getId().equals(agent.getId()));
+            if (!keepBound) {
+                // 意图已转向：另一个 agent 或普通对话（agent()==null）。解除追问绑定，按新意图处理。
+                conversationService.unbindAgent(conversationId);
+                agent = rd.agent();
+            }
+        }
+
         ParamFillingService.ClarifyDecision decision = paramFillingService.decideClarify(conversationId, message, agent);
         if (decision.question != null) {
-            // 进入追问分支：decideClarify 已落库 user+assistant，这里只做收尾
+            // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮追问回答能复用同一 agent。
+            // 落库改由 saveClarifyExchange 统一完成（避免话题切换分支误落库失效的追问）。
+            if (agent != null && !explicitBinding) {
+                conversationService.bindAgent(conversationId, agent.getId());
+            }
+            conversationService.saveClarifyExchange(conversationId, message, decision.question);
             conversationService.touchConversation(conversationId, message);
             memoryMergeService.maybeMergeMemory(conversationId);
             return decision.question;
@@ -90,6 +118,8 @@ public class ChatService {
         ChatClient.ChatClientRequestSpec spec = buildRequest(conversationId, message, conv, agent, paramFillingService.buildParamBlock(decision));
         String reply = spec.call().content();
 
+        // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
+        if (!explicitBinding) conversationService.unbindAgent(conversationId);
         log.info("同步对话完成：回复长度={}", reply != null ? reply.length() : 0);
         conversationService.touchConversation(conversationId, message);
         memoryMergeService.maybeMergeMemory(conversationId);
@@ -107,15 +137,36 @@ public class ChatService {
     public Flux<String> stream(String conversationId, String message) {
         log.info("流式对话：会话={}", conversationId);
         Conversation conv = conversationService.ensureConversation(conversationId);
+        boolean explicitBinding = "EXPLICIT".equals(conv.getAgentBindSource());
         Agent agent = determineAgent(conv, message);
+
+        // 话题切换预检：与 chat() 完全一致（详见该方法的同名段落注释），必须在参数补全之前执行。
+        if (!explicitBinding && conv.getAgentId() != null && "CLARIFY".equals(conv.getAgentBindSource())) {
+            String pendingQuestion = paramFillingService.lastClarifyQuestion(conversationId);
+            AgentRouter.RouteDecision rd = agentRouter.route(message, pendingQuestion);
+            boolean keepBound = rd.continuation()
+                    || (rd.agent() != null && rd.agent().getId().equals(agent.getId()));
+            if (!keepBound) {
+                conversationService.unbindAgent(conversationId);
+                agent = rd.agent();
+            }
+        }
+
         ParamFillingService.ClarifyDecision decision = paramFillingService.decideClarify(conversationId, message, agent);
         if (decision.question != null) {
+            // 进入追问：临时绑定正在补全参数的 agent（CLARIFY），使下一轮回答能复用（避免被重新路由丢失）。
+            if (agent != null && !explicitBinding) {
+                conversationService.bindAgent(conversationId, agent.getId());
+            }
+            conversationService.saveClarifyExchange(conversationId, message, decision.question);
             conversationService.touchConversation(conversationId, message);
             memoryMergeService.maybeMergeMemory(conversationId);
             return Flux.just(decision.question);
         }
         ChatClient.ChatClientRequestSpec spec = buildRequest(conversationId, message, conv, agent, paramFillingService.buildParamBlock(decision));
 
+        // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
+        if (!explicitBinding) conversationService.unbindAgent(conversationId);
         // 动态工具发现已全局挂载：任何对话都可能触发工具调用。Spring AI 2.0.0 的 stream() 在
         // 合并工具调用分片时会抛 NoSuchElementException（OpenAiChatModel.ChunkMerger 已知缺陷）。
         // 统一改为 call() 走完「模型→工具→再回答」循环拿到完整答案，再分块模拟流式输出，兼顾正确性与打字效果。
@@ -166,10 +217,13 @@ public class ChatService {
                 .system(systemPrompt)
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
-        // 全局能力池：所有对话都挂载全部工具（启动时预解析为 ToolCallback，不重复反射）。
-        // 由 ToolSearchToolCallingAdvisor 做渐进式工具暴露，模型先搜索再决定调用哪些，
-        // 而不是按 Agent 手动配置。是否调用、调哪个，全由 AI 决定。
-        spec = spec.tools(toolRegistry.getToolCallbacks());
+        // 全局能力池（启动时预解析为 ToolCallback，不重复反射），但**只在本次请求已路由/绑定到
+        // 具体智能体时才挂载**：普通对话（agent 为空，如"你好"）不挂载任何工具，避免把工具定义
+        // 无谓地塞进每一次对话的上下文。是否调用、调哪个工具，仍由 AI 在 agent 范围内自主决定，
+        // 不按 Agent 手动写死工具列表（全局 ToolRegistry 自动收集）。
+        if (agent != null) {
+            spec = spec.tools(toolRegistry.getToolCallbacks());
+        }
         return applyAgentOptions(spec, agent);
     }
 

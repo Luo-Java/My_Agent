@@ -5,6 +5,7 @@ import org.springframework.ai.chat.client.ChatClientRequest;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.client.advisor.api.AdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.BaseAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
@@ -19,7 +20,7 @@ import java.util.stream.Collectors;
  * <p>
  * 日志同时记录两件事：
  * <ul>
- *   <li>本轮暴露 —— options 里当前挂了哪些工具（渐进式：第 1 轮只有 toolSearchTool，后续轮次注入已发现的真实工具）；</li>
+ *   <li>本轮暴露 —— options 里当前挂了哪些工具（Agent 对话挂全局能力池；普通对话不挂工具，暴露为空列表）；</li>
  *   <li>已执行 —— 对话历史里 ToolResponseMessage 记录的、真正跑过的工具。</li>
  * </ul>
  */
@@ -38,12 +39,14 @@ public class ToolUsageLoggingAdvisor implements BaseAdvisor {
         if (!(request.prompt().getOptions() instanceof ToolCallingChatOptions toolOptions)) {
             return request;
         }
-        String sessionId = String.valueOf(request.context().getOrDefault("conversationId", "unknown"));
+        String sessionId = String.valueOf(request.context().getOrDefault(ChatMemory.CONVERSATION_ID, "unknown"));
 
-        // 本轮暴露给模型的工具
-        List<String> exposed = toolOptions.getToolCallbacks().stream()
-                .map(tc -> tc.getToolDefinition().name())
-                .toList();
+        // 本轮暴露给模型的工具：普通对话（未挂载任何工具）时 getToolCallbacks() 为 null，需判空
+        List<String> exposed = toolOptions.getToolCallbacks() == null
+                ? List.of()
+                : toolOptions.getToolCallbacks().stream()
+                        .map(tc -> tc.getToolDefinition().name())
+                        .toList();
 
         // 对话历史中已实际执行的工具（ToolResponseMessage）
         List<String> executed = request.prompt().getInstructions().stream()
