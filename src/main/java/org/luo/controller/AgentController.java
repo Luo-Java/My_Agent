@@ -72,7 +72,8 @@ public class AgentController {
     public Agent update(@PathVariable Long id, @RequestBody UpsertAgentRequest req) {
         UpsertAgentRequest full = new UpsertAgentRequest(
                 id, req.name(), req.agentCode(), req.icon(), req.description(),
-                req.systemPrompt(), req.paramSchema(), req.model(), req.temperature(), req.avatarColor());
+                req.systemPrompt(), req.paramSchema(),
+                req.model(), req.temperature(), req.avatarColor());
         return agentService.updateAgent(full);
     }
 

@@ -4,11 +4,11 @@ spring:
 
   # 启动时自动执行 schema.sql 建表（幂等：CREATE TABLE IF NOT EXISTS；
   # continue-on-error 让“为旧表补列”的 ALTER 在列已存在时不报错）
-  sql:
-    init:
-      mode: always
-      schema-locations: classpath:sql/schema.sql,classpath:sql/alter.sql
-      continue-on-error: true
+#  sql:
+#    init:
+#      mode: always
+#      schema-locations: classpath:sql/schema.sql,classpath:sql/alter.sql
+#      continue-on-error: true
 
   datasource:
     # 数据库 my_agent 不存在时，连接参数中的 createDatabaseIfNotExist 会自动创建
@@ -46,7 +46,7 @@ server:
 logging:
   level:
     root: info           # 全局所有框架与业务代码都输出
-    org.luo: debug        # 本项目代码显式设为 trace，确保自定义日志全量输出
+    org.luo: info        # 本项目代码显式设为 trace，确保自定义日志全量输出
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
 

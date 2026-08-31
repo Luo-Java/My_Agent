@@ -6,6 +6,7 @@
     <title>Spring AI 智能对话</title>
     <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
@@ -22,6 +23,15 @@
                 <span class="agent-entry-icon">🤖</span>
                 <span class="agent-entry-label">智能体</span>
                 <span class="agent-entry-count">{{ agents.length }}</span>
+                <span class="agent-entry-arrow">›</span>
+            </button>
+        </div>
+
+        <!-- 动态规划器入口：进规划模式后，由 LLM 在运行时自动编排多个智能体协同完成目标 -->
+        <div class="sidebar-section planner-section">
+            <button class="agent-entry planner-entry" @click="startPlanner" :class="{ active: currentPlanner }">
+                <span class="agent-entry-icon">🧭</span>
+                <span class="agent-entry-label">智能规划</span>
                 <span class="agent-entry-arrow">›</span>
             </button>
         </div>
@@ -45,6 +55,7 @@
                     <template v-else>
                         <span class="conv-title" @dblclick.stop="startEdit(c)">{{ c.title || '新对话' }}</span>
                         <span class="conv-agent" v-if="c.agentId && agentName(c.agentId)">{{ agentIcon(c.agentId) }}{{ agentName(c.agentId) }}</span>
+                        <span class="conv-planner" v-else-if="c.planner">🧭 规划</span>
                         <button class="conv-edit-btn" title="重命名" @click.stop="startEdit(c)">✎</button>
                         <button class="conv-del-btn" title="删除对话" @click.stop="deleteConversation(c.id)">🗑</button>
                     </template>
@@ -61,16 +72,30 @@
                 <span class="dot"></span>
                 <span>Spring AI 智能对话</span>
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
+                <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
             </header>
             <div class="messages" ref="scroll">
                 <div class="empty" v-if="messages.length === 0">
                     <div class="big">💬</div>
                     <div>向 Spring AI 提问吧，支持多轮对话与历史记忆</div>
                     <div v-if="currentAgentName" class="empty-sub">当前智能体：{{ currentAgentIcon }} {{ currentAgentName }}</div>
+                <div v-if="currentPlanner" class="empty-sub">规划模式下，描述你的目标，AI 会自动编排多个智能体协同完成</div>
                 </div>
                 <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role === 'user' ? 'user' : 'ai'">
                     <div class="avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
                     <div class="bubble">
+                        <!-- 执行过程：本次运行期间的实时进度（任务规划 + 每步执行情况）。
+                             它不属于消息正文，后端也不写入会话记忆，刷新或重开会话后不会再出现。 -->
+                        <div class="steps-box" v-if="m.steps && m.steps.length">
+                            <div class="steps-head" @click="m.stepsOpen = !m.stepsOpen">
+                                <span class="steps-caret">{{ m.stepsOpen ? '▾' : '▸' }}</span>
+                                <span>执行过程 · {{ m.steps.length }} 条</span>
+                                <span class="steps-hint">不计入会话记忆</span>
+                            </div>
+                            <div class="steps-body" v-show="m.stepsOpen">
+                                <div class="steps-line" v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
+                            </div>
+                        </div>
                         <!-- 用户消息：纯文本；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
                         <template v-if="m.content">
                             <span v-if="m.role === 'user'">{{ m.content }}</span>

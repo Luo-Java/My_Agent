@@ -8,19 +8,70 @@ if (typeof marked !== 'undefined') {
     });
 }
 
-/** 将 Markdown 文本转为 HTML（防 XSS：先转义 HTML 标签后交给 marked） */
+/** 将 Markdown 文本转为 HTML（防 XSS：先转义 HTML 标签后交给 marked）。
+ *  ```echarts 代码块会被识别并替换为图表容器 div（.echarts-box，data-option 存 JSON），
+ *  由 renderCharts() 用 ECharts 渲染成真正的图表；JSON 未完整时保留为代码块。 */
 function renderMd(text) {
     if (!text) return '';
     if (typeof marked === 'undefined') return escapeHtml(text);
-    // 先转义用户输入中的 HTML 标签，再由 marked 生成安全的 Markdown HTML
-    const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // 1) 先转义用户输入中的 HTML 标签，同时抽出 echarts 代码块（避免占位符被转义/解析破坏）
+    const charts = [];
+    const escaped = text
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/```echarts\s*\n?([\s\S]*?)```/g, (m, json) => {
+            const idx = charts.length;
+            charts.push({ json: json || '' });
+            return '\n\n@@ECHARTS_' + idx + '@@\n\n';
+        });
+    // 2) 交给 marked 渲染
+    let html;
     try {
         const r = marked.parse(escaped);
-        // 兼容新版 marked 偶尔返回 Promise 的情况
-        return typeof r === 'string' ? r : escaped;
+        html = typeof r === 'string' ? r : escaped;
     } catch {
-        return escaped;
+        html = escaped;
     }
+    // 3) 还原图表占位：JSON 合法 → 图表容器 div；非法（流式未完整）→ 保留代码块
+    html = html.replace(/@@ECHARTS_(\d+)@@/g, (m, i) => {
+        const c = charts[+i];
+        if (!c) return '';
+        try {
+            JSON.parse(c.json);
+            const safe = escapeHtml(c.json).replace(/"/g, '&quot;');
+            return '<div class="echarts-box" data-option="' + safe + '"></div>';
+        } catch (e) {
+            return '<pre><code class="language-echarts">' + escapeHtml(c.json) + '</code></pre>';
+        }
+    });
+    return html;
+}
+
+/** 渲染所有 .echarts-box 容器（ECharts 图表）。防抖 300ms：流式高频重建 DOM 时避免反复 init。
+ *  流结束时需手动调用一次强制渲染。 */
+let chartRenderTimer = null;
+function renderCharts() {
+    if (typeof echarts === 'undefined') return;
+    if (chartRenderTimer) return; // 已有待执行的渲染任务，合并
+    chartRenderTimer = setTimeout(() => {
+        chartRenderTimer = null;
+        renderChartsNow();
+    }, 300);
+}
+function renderChartsNow() {
+    if (typeof echarts === 'undefined') return;
+    nextTick(() => {
+        document.querySelectorAll('.echarts-box').forEach(el => {
+            if (el.dataset.inited) return; // 已初始化，跳过
+            let opt;
+            try { opt = JSON.parse(el.dataset.option); } catch (e) { return; }
+            if (!opt) return;
+            try {
+                const chart = echarts.init(el);
+                chart.setOption(opt);
+                el.dataset.inited = '1';
+            } catch (e) { /* 单个图表失败不影响其余消息 */ }
+        });
+    });
 }
 
 /** 纯文本转义（marked 未加载时的兜底）。 */
@@ -108,6 +159,12 @@ createApp({
             return '';
         });
 
+        // 当前会话是否处于规划模式（由后端 planner 标志决定）
+        const currentPlanner = computed(() => {
+            const conv = conversations.value.find(c => c.id === currentId.value);
+            return !!(conv && conv.planner);
+        });
+
         // 新建对话（总是创建新会话；无论当前是否已有会话）
         async function goChat() {
             mainView.value = 'chat';
@@ -146,7 +203,7 @@ createApp({
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner },
                     ...conversations.value
                 ];
                 input.value = '';
@@ -154,6 +211,31 @@ createApp({
                 scrollToBottom();
             } catch (e) {
                 alert('创建会话失败：' + e.message);
+            }
+        }
+
+        // 开启规划模式会话（动态规划器：运行时由 LLM 根据用户目标自动编排多智能体步骤）
+        async function startPlanner() {
+            mainView.value = 'chat';
+            try {
+                const resp = await fetch('/api/chat/conversation', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ planner: true })
+                });
+                if (!resp.ok) { alert('创建规划会话失败'); return; }
+                const data = await resp.json();
+                currentId.value = data.conversationId;
+                messages.value = [];
+                conversations.value = [
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner },
+                    ...conversations.value
+                ];
+                input.value = '';
+                mainView.value = 'chat';
+                scrollToBottom();
+            } catch (e) {
+                alert('创建规划会话失败：' + e.message);
             }
         }
 
@@ -170,7 +252,7 @@ createApp({
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner },
                     ...conversations.value
                 ];
                 input.value = '';
@@ -194,6 +276,7 @@ createApp({
                 }
             } catch (e) { /* 忽略 */ }
             scrollToBottom();
+            renderChartsNow(); // 历史消息可能含 echarts 块，渲染图表
         }
 
         function startEdit(c) {
@@ -446,7 +529,9 @@ createApp({
             const convId = currentId.value;
 
             messages.value.push({ role: 'user', content: text, html: '', version: 0 });
-            messages.value.push({ role: 'assistant', content: '', html: '', version: 0 });
+            // steps：本次运行的执行过程（规划与逐步进展）。仅前端临时展示，后端不写入会话记忆，
+            // 因此刷新页面或重新打开会话时不会出现（历史消息只有最终结果）。
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true });
             input.value = '';
             loading.value = true;
             scrollToBottom();
@@ -477,17 +562,31 @@ createApp({
                             if (line.startsWith('data:')) data += line.slice(5).replace(/^ /, '');
                         });
                         if (!data) continue;
+                        // 后端按事件类型给字段名：token=正文分片（进记忆）；progress=执行过程（不进记忆）
+                        let progress = '';
                         try {
                             const parsed = JSON.parse(data);
-                            data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
+                            if (parsed && typeof parsed.progress === 'string') {
+                                progress = parsed.progress;
+                                data = '';
+                            } else {
+                                data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
+                            }
                         } catch (e) {
                             // 兼容旧格式：非 JSON 时按原始文本处理
                         }
-                        if (data) {
-                            const m = messages.value[lastIndex];
+                        const m = messages.value[lastIndex];
+                        if (progress) {
+                            // 执行过程：只收集到 steps 单独展示，绝不混进正文
+                            if (!m.steps) m.steps = [];
+                            m.steps.push(progress);
+                        } else if (data) {
+                            // 正文首个分片到达：自动收起执行过程，让最终结果成为视觉焦点（仍可手动展开）
+                            if (!m.content && m.steps && m.steps.length) m.stepsOpen = false;
                             m.content += data;
                             m.html = renderMd(m.content);   // 更新 html 供 v-html 渲染
                             m.version++;                    // 版本号自增，强制 v-html 节点重建，保证 Markdown 始终渲染
+                            renderCharts();                 // 防抖渲染图表（若内容已含完整 echarts 块）
                         }
                     }
                 };
@@ -501,6 +600,7 @@ createApp({
                 }
                 buf += decoder.decode();
                 flushEvents();
+                renderChartsNow(); // 流结束：强制渲染图表（防抖可能还没到点）
                 // 刷新侧边栏（标题/排序可能因首条消息而更新）
                 loadConversations();
             } catch (e) {
@@ -522,9 +622,9 @@ createApp({
 
         return {
             conversations, agents, messages, input, loading, currentId,
-            editingId, editingTitle, agentModal, agentView, currentAgentName, currentAgentIcon,
+            editingId, editingTitle, agentModal, agentView, currentAgentName, currentAgentIcon, currentPlanner,
             mainView, iconPresets,
-            send, newConversation, startAgentChat, selectConversation,
+            send, newConversation, startAgentChat, startPlanner, selectConversation,
             startEdit, commitEdit, deleteConversation,
             goChat, goAgents,
             openCreateAgent, openEditAgent, closeAgentModal, saveAgent, deleteAgent,

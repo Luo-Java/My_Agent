@@ -29,8 +29,10 @@ import java.util.List;
 @Slf4j
 public class DbChatMemory implements ChatMemory {
 
-    /** 维持上下文的最大原文 token 预算（近似值，按字符数估算）；超出部分由滚动摘要覆盖。 */
-    static final int MAX_RECENT_TOKENS = 1000;
+    /** 维持上下文的最大原文 token 预算（近似值，按字符数估算）；超出部分由滚动摘要覆盖。
+     *  <p>数值考虑：数据类回复（如分布表/成绩表）可达 1~3k 字符，1000 会把上一轮整体切掉，
+     *  导致模型看不到已有数据而重复查库；4000 可在成本可控前提下保住 1~2 轮数据型对话。 */
+    static final int MAX_RECENT_TOKENS = 4000;
 
     private final ConversationService conversationService;
 

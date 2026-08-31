@@ -1,6 +1,7 @@
 package org.luo.controller;
 
 import org.luo.dto.ChatRequest;
+import org.luo.dto.StreamEvent;
 import org.luo.service.ChatService;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -45,7 +46,14 @@ public class ChatController {
     }
 
     /**
-     * 流式对话：以 SSE 逐 token 推送 AI 回复，前端逐字渲染。
+     * 流式对话：以 SSE 推送事件，前端逐字渲染。
+     * <p>
+     * 每条事件的 data 都是 JSON，字段名即事件类型：
+     * <ul>
+     *   <li>{@code {"token":"..."}} —— 正文分片，前端累加进消息气泡，且是唯一写入会话记忆的内容；</li>
+     *   <li>{@code {"progress":"..."}} —— 执行过程（规划步骤、每步进展），前端单独展示为「执行过程」，
+     *       不属于消息正文、不写入会话记忆，刷新会话后不再出现。</li>
+     * </ul>
      *
      * @param request 会话 ID（可空，空则用默认会话）+ 用户消息
      * @return SSE 事件流
@@ -54,13 +62,14 @@ public class ChatController {
     public SseEmitter stream(@RequestBody ChatRequest request) {
         SseEmitter emitter = new SseEmitter(0L);
         String conversationId = resolveConversationId(request.conversationId());
-        Flux<String> flux = chatService.stream(conversationId, request.message());
+        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message());
 
-        flux.doOnNext(token -> {
+        flux.doOnNext(event -> {
                     try {
-                        // 用 JSON 包裹 token：回复内容中的换行/空行会被 JSON 转义，
+                        // 用 JSON 包裹文本：内容中的换行/空行会被 JSON 转义，
                         // 避免内容里的 \n\n 被前端误判为 SSE 事件边界导致数据错乱/丢字。
-                        emitter.send(Map.of("token", token));
+                        // 字段名用事件类型（token / progress），前端据此决定渲染到正文还是执行过程区。
+                        emitter.send(Map.of(event.type(), event.text() == null ? "" : event.text()));
                     } catch (IOException e) {
                         emitter.completeWithError(e);
                     }

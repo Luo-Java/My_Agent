@@ -21,6 +21,12 @@ public class Conversation {
     private Long agentId;
 
     /**
+     * 是否规划模式会话：1=动态规划器（运行时由 LLM 根据用户目标动态规划多智能体步骤并执行），
+     * 0=普通对话 / 单智能体会话。与 agent_id 互斥（但数据库层不做强约束，由业务层保证）。
+     */
+    private Boolean planner;
+
+    /**
      * 智能体绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；
      * CLARIFY=追问流程临时绑定（用户转向别的话题时自动解绑）；为空表示未绑定。
      */

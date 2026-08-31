@@ -44,7 +44,7 @@ public class AgentRouter {
      * 判断本次请求应路由到的智能体；未命中或判断失败返回 null（普通对话）。等价于 {@link #route(String, String)} 不带追问上下文。
      */
     public Agent route(String message) {
-        return route(message, null).agent();
+        return route(message, null, null).agent();
     }
 
     /**
@@ -55,6 +55,19 @@ public class AgentRouter {
      * @return {@link RouteDecision}：命中 agent（routeTo）/ 普通对话（none）/ 正在回答追问（continueTask）
      */
     public RouteDecision route(String message, String pendingQuestion) {
+        return route(message, pendingQuestion, null);
+    }
+
+    /**
+     * 携带「待回答的追问」与「最近若干轮对话上下文」做路由决策。
+     *
+     * @param message         当前用户输入
+     * @param pendingQuestion 编排层正在等待用户回答的追问文本（可空；为空时退化为普通路由）
+     * @param recentContext   最近若干轮对话文本（可空；用于识别「承接上一轮的短追问」，
+     *                        如上一轮在查天气、用户只说「北京呢？」这类缺主语的短句，避免被误判为普通对话）
+     * @return {@link RouteDecision}：命中 agent（routeTo）/ 普通对话（none）/ 正在回答追问（continueTask）
+     */
+    public RouteDecision route(String message, String pendingQuestion, String recentContext) {
         List<Agent> agents = agentService.listAgents();
         if (agents == null || agents.isEmpty()) {
             log.debug("智能路由：暂无智能体，跳过路由");
@@ -77,15 +90,25 @@ public class AgentRouter {
                     + "若用户本条消息是新的问题或新的请求（不是对该追问的回答，即便其中含有与追问参数相似的词，"
                     + "如问吃的、问别的），则按上述规则正常判断是否路由。\n\n"
                     : "";
-            log.debug("智能路由：调用 LLM 判断路由，可用智能体={}，有追问上下文={}", agents.size(),
-                    pendingQuestion != null && !pendingQuestion.isBlank());
+            // 对话上下文：最近若干轮，用于识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）
+            String contextBlock = (recentContext != null && !recentContext.isBlank())
+                    ? "【对话上下文】以下是本次请求之前，同一会话最近的对话内容（按时间顺序）。"
+                    + "仅供你判断这是「延续上一轮话题」还是「开启新话题」，不要据此编造任何参数：\n"
+                    + recentContext + "\n\n"
+                    : "";
+            log.debug("智能路由：调用 LLM 判断路由，可用智能体={}，有追问上下文={}，有对话上下文={}", agents.size(),
+                    pendingQuestion != null && !pendingQuestion.isBlank(),
+                    recentContext != null && !recentContext.isBlank());
             ChatResponse response = chatModel.call(new Prompt(List.of(
                     new SystemMessage("你是多智能体路由决策器。根据用户消息的内容判断：是否应该交由某个专属智能体（agent）来处理本次请求。\n\n"
                             + "判断规则：\n"
                             + "1. 只有当用户请求的意图与某个智能体的职责高度匹配时才路由（例如用户明确要求翻译 → 交给翻译类智能体；要求写代码 → 交给编程类智能体）。\n"
                             + "2. 一般闲聊、寒暄，或用户请求没有对应智能体能胜任时，不路由，进行普通对话。\n"
-                            + "3. 最多路由到一个智能体；犹豫时选择职责最匹配的，仍不匹配就不路由。\n\n"
+                            + "3. 最多路由到一个智能体；犹豫时选择职责最匹配的，仍不匹配就不路由。\n"
+                            + "4. 若用户消息很短、明显是承接上一轮话题（例如上一轮在查天气、用户只说「北京呢？」「那明天呢」），"
+                            + "应判定为延续上一轮话题，路由到与上一轮相同的智能体；不要因为信息不全就当作普通对话。\n\n"
                             + continuationHint
+                            + contextBlock
                             + "可用智能体清单：\n" + list
                             + "\n你必须且只能输出一个 JSON 对象（不要输出任何其它文字、解释或代码块包裹），三选一：\n"
                             + "需要路由时：{\"route\":true,\"agentCode\":\"<该智能体的编码>\"}\n"

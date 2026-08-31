@@ -233,6 +233,63 @@ header {
     border-top-left-radius: 4px;
 }
 
+/* ===== 执行过程（规划模式的实时进度，仅本次运行可见、不计入会话记忆） ===== */
+.steps-box {
+    margin: -2px 0 8px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    overflow: hidden;
+}
+
+.steps-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-soft);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.steps-head:hover { color: var(--primary); }
+
+.steps-caret {
+    font-size: 10px;
+    color: var(--text-soft);
+}
+
+/* 「不计入会话记忆」提示：靠右显示，弱化处理 */
+.steps-hint {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-soft);
+    background: var(--bg);
+    border-radius: 6px;
+    padding: 1px 6px;
+}
+
+.steps-body {
+    border-top: 1px dashed var(--border);
+    padding: 6px 10px 8px;
+}
+
+.steps-line {
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-soft);
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 2px 0;
+}
+
+/* 最新一条进度高亮，突出「当前正在做什么」 */
+.steps-line:last-child { color: var(--text); }
+
 /* ===== Markdown 渲染内容（AI 气泡内） ===== */
 .md-body {
     white-space: normal;
@@ -288,6 +345,16 @@ header {
 }
 .md-body li { margin: 2px 0; }
 .md-body li::marker { color: var(--primary); }
+
+/* ECharts 图表容器（由 ```echarts 代码块渲染而来） */
+.echarts-box {
+    width: 100%;
+    height: 340px;
+    margin: 10px 0;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #fff;
+}
 
 /* 表格 */
 .md-body table {
@@ -484,6 +551,20 @@ button {
     flex: none;
     white-space: nowrap;
 }
+
+/* 会话项上的规划模式徽标 */
+.conv-planner {
+    font-size: 11px;
+    color: #7c3aed;
+    background: #f3e8ff;
+    padding: 1px 6px;
+    border-radius: 6px;
+    flex: none;
+    white-space: nowrap;
+}
+
+/* 侧边栏规划入口上方留一点间距 */
+.planner-section { flex: none; }
 
 /* 通用色点（查看弹窗/卡片用） */
 .agent-dot {
@@ -692,6 +773,12 @@ button {
     background: var(--primary-soft);
     padding: 3px 10px;
     border-radius: 999px;
+}
+
+/* 顶部规划模式徽标（与智能体徽标区分色） */
+.planner-badge {
+    color: #7c3aed;
+    background: #f3e8ff;
 }
 
 .empty-sub {

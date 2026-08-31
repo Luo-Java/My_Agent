@@ -60,10 +60,21 @@ public class ParamFillingService {
      * @return 若 question 非 null 表示需要追问（已落库），编排层直接返回该文本；否则走主流程。
      */
     public ClarifyDecision decideClarify(String conversationId, String message, Agent agent) {
-        if (agent == null || agent.getParamSchema() == null || agent.getParamSchema().isBlank()) {
+        if (agent == null) {
             return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
         }
-        List<ParamDef> schema = parseSchema(agent.getParamSchema());
+        return decideClarify(conversationId, message, agent.getParamSchema());
+    }
+
+    /**
+     * 按参数清单（paramSchema JSON 字符串）做参数补全决策；paramSchema 为空时不追问。
+     * 供 {@link Agent} 复用（智能体声明 paramSchema 时启用追问/参数补全）。
+     */
+    public ClarifyDecision decideClarify(String conversationId, String message, String paramSchema) {
+        if (paramSchema == null || paramSchema.isBlank()) {
+            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
+        }
+        List<ParamDef> schema = parseSchema(paramSchema);
         if (schema.isEmpty()) {
             return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
         }
@@ -180,23 +191,18 @@ public class ParamFillingService {
      * 把 LLM 返回的参数行（"key: value"）解析为 map。只接受属于 schema 的 key，忽略噪声行。
      */
     /**
-     * 取「当前追问任务」范围内的历史用于参数抽取：从最后一次正式回答（非 {@link #CLARIFY_PREFIX} 前缀的
-     * assistant 消息）之后的用户请求开始，到历史末尾。这样抽取只基于当前这一轮追问交互
-     * （原始请求 + 至多 {@code MAX_CLARIFY} 轮问答），既不会被更早的无关对话污染，也不会因长度截断
-     * 而漏掉原始请求里已给的参数。跨任务天然隔离：新请求 = 新的参数作用域。
+     * 取最近若干轮历史（上限 12 条）用于参数抽取。覆盖最近一个完整任务（原始请求 + 至多 {@code MAX_CLARIFY} 轮追问 + 回答），
+     * 让跟进任务（例如「北京呢？」跟在查过深圳天气之后）能继承上一任务里用户已明确给出的隐式上下文
+     * （最典型是「今天」→ 日期=今天），避免本已齐的参数被错判为缺失、再次追问（例如又问「日期？」）。
+     * <p>
+     * 早先版本以「最后一次正式回答」为界硬切，会把上一任务的原始请求一起切掉，导致跟进任务拿不到「今天」等关键上下文。
+     * 现在改为条数截断：「禁止臆测」规则 + {@code paramSchema} 约束保证不会把别的智能体/无关任务的参数串进当前抽取
+     * （不同智能体的 schema 不同，同智能体也只有用户明确表达过的取值才会被采集）。
      */
     private List<ChatMessage> clarifyScopedHistory(List<ChatMessage> history) {
         if (history == null || history.isEmpty()) return history;
-        int start = 0;
-        for (int i = history.size() - 1; i >= 0; i--) {
-            ChatMessage m = history.get(i);
-            // 遇到一次「正式回答」即视为上一任务结束，当前任务从它之后开始
-            if ("assistant".equals(m.getRole())
-                    && (m.getContent() == null || !m.getContent().startsWith(CLARIFY_PREFIX))) {
-                start = i + 1;
-                break;
-            }
-        }
+        int cap = 12;
+        int start = Math.max(0, history.size() - cap);
         return history.subList(start, history.size());
     }
 

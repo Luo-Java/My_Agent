@@ -9,9 +9,15 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * 会话记忆合并服务：对话结束后，将「溢出窗口的旧消息」与「已有摘要/关键事实」合并，
@@ -33,10 +39,55 @@ public class MemoryMergeService {
 
     private final ConversationService conversationService;
     private final ChatModel chatModel;
+    /** 记忆合并专用线程池：与对话主链路（Reactor boundedElastic）隔离，合并再慢也不挤占对话执行线程。 */
+    private final Executor memoryMergeExecutor;
 
-    public MemoryMergeService(ConversationService conversationService, ChatModel chatModel) {
+    /**
+     * 正在合并中的会话集合：同一会话的记忆合并互斥，避免用户连发消息时并发触发多次 LLM 合并、
+     * 相互覆盖摘要（跳过的那次不会丢，下一轮对话结束时会再检查一遍）。
+     */
+    private final Set<String> merging = ConcurrentHashMap.newKeySet();
+
+    public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
+                              @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor) {
         this.conversationService = conversationService;
         this.chatModel = chatModel;
+        this.memoryMergeExecutor = memoryMergeExecutor;
+    }
+
+    /**
+     * 异步触发记忆合并：<b>不阻塞对话主流程</b>。
+     * <p>
+     * 合并达到阈值时需要一次额外的 LLM 调用（秒级），若同步执行会挡在「用户看到回复」之前。
+     * 因此本方法把检查与合并整体丢到 {@link #memoryMergeExecutor 专用线程池} 执行，调用方（回复已返回/已推送后）立即返回。
+     * 同一会话已有合并在进行中时直接跳过本次。
+     *
+     * @param conversationId 会话 ID
+     */
+    public void maybeMergeMemoryAsync(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        if (!merging.add(conversationId)) {
+            log.debug("记忆合并已在进行中，跳过本次：会话={}", conversationId);
+            return;
+        }
+        try {
+            // 专用线程池 + CompletableFuture：runAsync 提交，whenComplete 统一收尾
+            // （释放合并占位 + 兜底记录未预期异常），比手写 try/finally 更声明式。
+            // maybeMergeMemory 内部已 catch 业务异常，这里仅兜底，正常路径 ex 为 null。
+            CompletableFuture.runAsync(() -> maybeMergeMemory(conversationId), memoryMergeExecutor)
+                    .whenComplete((v, ex) -> {
+                        merging.remove(conversationId);
+                        if (ex != null) {
+                            log.warn("记忆合并任务异常：会话={}，原因={}", conversationId, ex.getMessage());
+                        }
+                    });
+        } catch (RejectedExecutionException e) {
+            // 提交被线程池拒绝（队列满/已关闭）：runAsync 的 execute 会同步抛出，此时任务未进队、
+            // whenComplete 永远不会触发，必须在这里释放 merging 占位，否则该会话后续轮次永远跳过合并。
+            // 本次不合并可接受：下一轮对话结束会再检查。
+            merging.remove(conversationId);
+            log.warn("记忆合并任务提交被拒绝，本次跳过：会话={}，原因={}", conversationId, e.getMessage());
+        }
     }
 
     /**

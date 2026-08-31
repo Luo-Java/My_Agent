@@ -48,13 +48,19 @@ public class ConversationController {
 
     /**
      * 开启新会话，返回会话 ID。
-     * 可绑定某个智能体：绑定时以其名称为会话初始标题。
+     * 可绑定某个智能体或标记为规划模式（二者互斥）：绑定时以其名称作为会话初始标题。
      *
-     * @param req 可选：{@code agentId} 绑定的智能体 ID
-     * @return 新会话信息（id / title / createdAt / agentId）
+     * @param req 可选：{@code agentId} 绑定的智能体 ID；{@code planner} 规划模式
+     * @return 新会话信息（id / title / createdAt / agentId / planner）
      */
     @PostMapping("/conversation")
     public NewConversationResponse createConversation(@RequestBody(required = false) CreateConversationRequest req) {
+        Boolean planner = (req == null) ? null : req.planner();
+        if (Boolean.TRUE.equals(planner)) {
+            // 规划模式会话：由 ChatService 交给动态规划器，运行时由 LLM 规划多智能体步骤
+            Conversation c = conversationService.createPlannerConversation();
+            return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), null, true);
+        }
         Long agentId = (req == null) ? null : req.agentId();
         String agentName = null;
         if (agentId != null) {
@@ -62,7 +68,7 @@ public class ConversationController {
             agentName = a != null ? a.getName() : null;
         }
         Conversation c = conversationService.createConversation(agentId, agentName);
-        return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), c.getAgentId());
+        return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), c.getAgentId(), false);
     }
 
     /**
@@ -90,12 +96,13 @@ public class ConversationController {
     /**
      * 会话列表，按最近更新时间倒序。
      *
-     * @return 会话摘要列表（id / title / updatedAt / agentId）
+     * @return 会话摘要列表（id / title / updatedAt / agentId / planner）
      */
     @GetMapping("/conversations")
     public List<ConversationSummary> listConversations() {
         return conversationService.listConversations().stream()
-                .map(c -> new ConversationSummary(c.getId(), c.getTitle(), c.getUpdatedAt(), c.getAgentId()))
+                .map(c -> new ConversationSummary(c.getId(), c.getTitle(), c.getUpdatedAt(),
+                        c.getAgentId(), c.getPlanner()))
                 .toList();
     }
 

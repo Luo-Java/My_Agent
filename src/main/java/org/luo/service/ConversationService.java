@@ -67,6 +67,47 @@ public class ConversationService {
     }
 
     /**
+     * 创建新会话（支持绑定智能体或标记为规划模式会话）。
+     *
+     * @param agentId   绑定的智能体 ID；null 表示不绑定智能体
+     * @param agentName 智能体名称，用于设置会话初始标题
+     * @param planner   是否规划模式会话（true 时以「🧭 智能规划」为标题，与 agentId 互斥）
+     * @return 新建的会话记录
+     */
+    @Transactional
+    public Conversation createConversation(Long agentId, String agentName, boolean planner) {
+        log.info("创建会话：agentId={}，planner={}", agentId, planner);
+        Conversation c = new Conversation();
+        c.setId(UUID.randomUUID().toString());
+        if (planner) {
+            // 规划模式会话：不参与 Agent 路由，由 ChatService 交给动态规划器编排多智能体步骤
+            c.setPlanner(true);
+            c.setTitle("🧭 智能规划");
+        } else if (agentId != null) {
+            c.setAgentId(agentId);
+            c.setAgentBindSource("EXPLICIT");   // 用户显式绑定：保持粘住，不因话题切换解绑
+            c.setTitle(agentName != null ? agentName : "新对话");
+        } else {
+            c.setTitle("新对话");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        c.setCreatedAt(now);
+        c.setUpdatedAt(now);
+        conversationMapper.insert(c);
+        return c;
+    }
+
+    /**
+     * 创建规划模式会话（动态规划器，运行时由 LLM 规划多智能体步骤）。
+     *
+     * @return 新建的会话记录
+     */
+    @Transactional
+    public Conversation createPlannerConversation() {
+        return createConversation(null, null, true);
+    }
+
+    /**
      * 重命名会话（手动修改标题）。
      *
      * @param conversationId 会话 ID
