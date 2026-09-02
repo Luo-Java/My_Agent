@@ -55,7 +55,9 @@ public class SqlQueryTool implements ToolProvider {
     private final ConcurrentLinkedDeque<Long> recentFailTimes = new ConcurrentLinkedDeque<>();
 
     public SqlQueryTool(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
+        // 不用注入进来的 Spring 共享单例（避免 setMaxRows 影响同数据源的其他使用者）：
+        // 克隆出一个隔离实例，仅对本工具内部设置最大行数。
+        this.jdbcTemplate = new JdbcTemplate(jdbcTemplate.getDataSource());
         this.jdbcTemplate.setMaxRows(MAX_ROWS);
     }
 

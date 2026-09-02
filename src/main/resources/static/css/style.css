@@ -287,6 +287,12 @@ header {
     padding: 2px 0;
 }
 
+/* 错误提示步骤（error 事件）：红字醒目，区别于普通进度 */
+.steps-line.steps-error {
+    color: #dc2626;
+    font-weight: 600;
+}
+
 /* 最新一条进度高亮，突出「当前正在做什么」 */
 .steps-line:last-child { color: var(--text); }
 
@@ -392,11 +398,97 @@ header {
 
 .input-bar {
     display: flex;
-    gap: 10px;
-    padding: 14px 16px;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 16px;
     border-top: 1px solid var(--border);
     background: var(--panel);
 }
+
+/* 输入区第一行：文本域 + 发送按钮 */
+.input-row {
+    display: flex;
+    gap: 10px;
+}
+
+/* 输入区第二行：左下角「智能规划」开关 + 右侧提示 */
+.input-foot {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-left: 2px;
+}
+
+/* 智能规划开关：胶囊按钮 + iOS 风格滑块，勾选后高亮成主色实底白字（醒目） */
+.planner-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 12px 4px 10px;
+    border-radius: 999px;
+    border: 1.5px solid var(--border);
+    background: #fff;
+    transition: background .2s, color .2s, border-color .2s, box-shadow .2s;
+}
+
+.planner-toggle:hover { border-color: var(--primary); background: var(--primary-soft); }
+
+/* 原生 checkbox 视觉隐藏（保留可访问性与 v-model），状态用滑块呈现 */
+.planner-toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    pointer-events: none;
+}
+.planner-toggle input:focus-visible + .toggle-switch { box-shadow: 0 0 0 3px rgba(59, 130, 246, .35); }
+
+/* 滑块轨道 */
+.toggle-switch {
+    flex: none;
+    width: 32px;
+    height: 18px;
+    border-radius: 999px;
+    background: #d3d9e2;
+    position: relative;
+    transition: background .2s;
+}
+.toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+    transition: left .2s;
+}
+
+/* 勾选态：主色实底 + 白字 + 滑块右移 + 外发光 */
+.planner-toggle.on {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 0 2px 10px rgba(59, 130, 246, .4);
+}
+.planner-toggle.on .toggle-switch { background: rgba(255, 255, 255, .4); }
+.planner-toggle.on .toggle-switch::after { left: 16px; }
+
+/* 绑定智能体会话：规划不可用，整体置灰 */
+.planner-toggle.disabled,
+.planner-toggle.disabled input { opacity: .45; cursor: not-allowed; }
+.planner-toggle.disabled:hover { border-color: var(--border); background: #fff; }
+
+.input-hint { font-size: 12px; color: var(--text-soft); }
 
 textarea {
     flex: 1;
@@ -850,7 +942,8 @@ button {
 .modal-body .req { color: #ef4444; }
 
 .modal-body input,
-.modal-body textarea {
+.modal-body textarea,
+.modal-body select {
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 9px 12px;
@@ -860,12 +953,14 @@ button {
     background: #fff;
     color: var(--text);
     width: 100%;
+    box-sizing: border-box;
 }
 
 .modal-body textarea { resize: vertical; line-height: 1.6; min-height: 180px; }
 
 .modal-body input:focus,
-.modal-body textarea:focus { border-color: var(--primary); }
+.modal-body textarea:focus,
+.modal-body select:focus { border-color: var(--primary); }
 
 /* 禁用的输入框（如编辑时不可修改的智能体编码） */
 .modal-body input:disabled {
@@ -1150,3 +1245,98 @@ button {
 
 .btn-ghost:hover { background: rgba(0, 0, 0, .04); }
 
+
+/* ===== 知识库管理（RAG） ===== */
+.kb-manage .kb-card .kb-meta {
+    font-size: 12px;
+    color: var(--text-soft);
+    margin-top: 6px;
+}
+.kb-manage .agent-manage-new:disabled { opacity: .5; cursor: not-allowed; }
+.kb-manage .agent-manage-head { align-items: center; }
+.kb-hint { padding: 12px 2px 0; }
+
+/* 库详情：左添加右列表 */
+.kb-detail-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.kb-detail-title { font-size: 18px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kb-back { padding: 7px 14px; font-size: 13px; flex: none; }
+
+.kb-detail-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    gap: 18px;
+    padding-top: 16px;
+    overflow: hidden;
+}
+
+.kb-add-panel {
+    width: 360px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+    background: var(--panel);
+    overflow-y: auto;
+}
+
+.kb-add-panel input,
+.kb-add-panel textarea {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+    background: #fff;
+    color: var(--text);
+    width: 100%;
+    box-sizing: border-box;
+}
+.kb-add-panel textarea { resize: vertical; line-height: 1.6; }
+.kb-add-panel input:focus,
+.kb-add-panel textarea:focus { border-color: var(--primary); }
+
+.kb-panel-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.kb-add-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.kb-add-foot .btn-primary { padding: 8px 18px; font-size: 13px; border: none; cursor: pointer; }
+.kb-add-foot .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+.kb-add-foot .field-hint { margin: 0; }
+
+.kb-chunk-list {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+    padding: 2px 2px 8px;
+}
+
+.kb-chunk-item {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: var(--panel);
+}
+.kb-chunk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; min-width: 0; }
+.kb-chunk-head .field-hint { margin: 0; flex: none; }
+.kb-chunk-head .agent-card-code { flex: none; max-width: 220px; }
+.kb-chunk-del { margin-left: auto; width: 26px; height: 26px; flex: none; }
+.kb-chunk-content {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.kb-more { text-align: center; padding-top: 2px; }
+.kb-more .btn-ghost { padding: 7px 16px; font-size: 13px; border: none; background: transparent; color: var(--primary); cursor: pointer; font-weight: 500; }
+.kb-more .btn-ghost:hover { text-decoration: underline; }

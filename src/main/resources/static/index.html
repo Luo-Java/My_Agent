@@ -27,14 +27,17 @@
             </button>
         </div>
 
-        <!-- 动态规划器入口：进规划模式后，由 LLM 在运行时自动编排多个智能体协同完成目标 -->
-        <div class="sidebar-section planner-section">
-            <button class="agent-entry planner-entry" @click="startPlanner" :class="{ active: currentPlanner }">
-                <span class="agent-entry-icon">🧭</span>
-                <span class="agent-entry-label">智能规划</span>
+        <!-- 知识库入口（RAG：全局库所有对话通用 + 每个智能体一个专属库） -->
+        <div class="sidebar-section kb-section">
+            <button class="agent-entry" @click="goKbs" :class="{ active: mainView === 'kbs' }">
+                <span class="agent-entry-icon">📚</span>
+                <span class="agent-entry-label">知识库</span>
+                <span class="agent-entry-count">{{ kbs.length }}</span>
                 <span class="agent-entry-arrow">›</span>
             </button>
         </div>
+
+        <!-- 动态规划模式：入口改为聊天输入框左下角的「🧭 智能规划」开关（勾选=本轮及后续按规划模式执行） -->
 
         <!-- 对话历史分区（下方，占满剩余高度） -->
         <div class="sidebar-section conv-section">
@@ -93,7 +96,8 @@
                                 <span class="steps-hint">不计入会话记忆</span>
                             </div>
                             <div class="steps-body" v-show="m.stepsOpen">
-                                <div class="steps-line" v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
+                                <div class="steps-line" :class="{ 'steps-error': s.startsWith('❌') }"
+                                     v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
                             </div>
                         </div>
                         <!-- 用户消息：纯文本；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
@@ -109,14 +113,28 @@
                 </div>
             </div>
             <div class="input-bar">
-                <textarea v-model="input" @keydown.enter.exact.prevent="send"
-                          placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-                <button :disabled="loading || !input.trim()" @click="send">发送</button>
+                <div class="input-row">
+                    <textarea v-model="input" @keydown.enter.exact.prevent="send"
+                              placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+                    <button :disabled="loading || !input.trim()" @click="send">发送</button>
+                </div>
+                <!-- 输入框左下角模式开关：勾选「智能规划」= 由动态规划器运行时编排多个智能体协同完成目标，
+                     取消 = 普通对话（智能路由 / 追问）。选择会写回会话，刷新后保持上次选择。
+                     绑定智能体的会话不支持规划（planner 与 agentId 互斥），置灰并提示。 -->
+                <div class="input-foot">
+                    <label class="planner-toggle" :class="{ on: planMode && !currentAgentId, disabled: !!currentAgentId }">
+                        <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId"
+                               title="勾选后按规划模式执行：AI 自动编排多个智能体协同完成你的目标" />
+                        <span class="toggle-switch"></span>
+                        <span class="toggle-text">🧭 智能规划</span>
+                    </label>
+                    <span v-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
+                </div>
             </div>
         </template>
 
         <!-- ===== 智能体管理视图 ===== -->
-        <div v-else class="agent-manage">
+        <div v-else-if="mainView === 'agents'" class="agent-manage">
             <div class="agent-manage-head">
                 <div class="agent-manage-title-wrap">
                     <div class="agent-manage-title">🤖 智能体管理</div>
@@ -144,6 +162,88 @@
                     还没有智能体，点右上角「＋ 新建智能体」创建
                 </div>
             </div>
+        </div>
+
+        <!-- ===== 知识库管理视图（RAG） ===== -->
+        <div v-else-if="mainView === 'kbs'" class="agent-manage kb-manage">
+            <!-- 库列表态 -->
+            <template v-if="!kbDetail.open">
+                <div class="agent-manage-head">
+                    <div class="agent-manage-title-wrap">
+                        <div class="agent-manage-title">📚 知识库管理</div>
+                        <div class="agent-manage-sub">RAG 检索增强：全局库（🌐）所有对话通用；每个智能体可维护一个专属库，仅对话交给它时检索</div>
+                    </div>
+                    <button class="new-chat-btn agent-manage-new" :disabled="availableAgents.length === 0"
+                            :title="availableAgents.length === 0 ? '所有智能体都已有专属知识库' : '为智能体创建专属知识库'"
+                            @click="openCreateKb">＋ 新建知识库</button>
+                </div>
+                <div v-if="availableAgents.length === 0" class="kb-hint field-hint">
+                    当前所有智能体都已拥有专属知识库（每个智能体至多一个）。想添加知识请直接点击对应知识库卡片进入管理。
+                </div>
+                <div class="agent-grid">
+                    <div v-for="kb in kbs" :key="kb.id" class="agent-card kb-card" @click="openKbDetail(kb)">
+                        <div class="agent-card-icon" :style="kbIconStyle(kb)">
+                            {{ kb.agentId ? (agentIcon(kb.agentId) || '🤖') : '🌐' }}
+                        </div>
+                        <div class="agent-card-body">
+                            <div class="agent-card-name">{{ kb.name }}</div>
+                            <div class="agent-card-code">
+                                {{ kb.agentId ? '专属库 · ' + (agentName(kb.agentId) || 'agent#' + kb.agentId) : '全局库 · 所有对话通用' }}
+                            </div>
+                            <div class="agent-card-desc">{{ kb.description || '暂无说明' }}</div>
+                            <div class="kb-meta">{{ kb.docCount || 0 }} 个知识块 · {{ fmtTime(kb.updatedAt) }} 更新</div>
+                        </div>
+                        <div class="agent-card-actions" @click.stop>
+                            <button class="card-btn" title="管理知识" @click="openKbDetail(kb)">📖</button>
+                            <button class="card-btn" title="重命名 / 改说明" @click="openRenameKb(kb)">✎</button>
+                            <button class="card-btn card-btn-del" v-if="kb.agentId" title="删除知识库" @click="deleteKb(kb.id)">🗑</button>
+                        </div>
+                    </div>
+                    <div v-if="kbs.length === 0" class="agent-grid-empty">知识库加载中…</div>
+                </div>
+            </template>
+
+            <!-- 库详情态：添加知识 + 知识块列表 -->
+            <template v-else>
+                <div class="agent-manage-head">
+                    <div class="kb-detail-head-left">
+                        <button class="btn-ghost kb-back" @click="kbDetail.open = false">‹ 返回</button>
+                        <div class="kb-detail-title">{{ kbDetail.kb.name }}</div>
+                        <span class="agent-card-code">{{ kbDetail.kb.agentId ? '专属库' : '全局库 · 所有对话通用' }}</span>
+                    </div>
+                    <div class="agent-manage-sub">共 {{ kbDetail.total }} 个知识块 · 对话时会自动语义检索最相关的若干块，作为参考资料注入提示词</div>
+                </div>
+                <div class="kb-detail-body">
+                    <!-- 左：添加知识 -->
+                    <div class="kb-add-panel">
+                        <div class="kb-panel-title">添加知识</div>
+                        <input v-model="kbDetail.source" placeholder="来源标注（可选）如：产品手册.pdf / 2026 校历" />
+                        <textarea v-model="kbDetail.text" rows="9"
+                                  placeholder="粘贴知识内容，可多行（多条）&#10;系统会自动分块（单块约 600 字）并向量化，之后对话即可语义检索到它"></textarea>
+                        <div class="kb-add-foot">
+                            <span class="field-hint">预计分块 {{ estimateBlocks }} 个</span>
+                            <button class="btn-primary" :disabled="kbDetail.adding || !kbDetail.text.trim()"
+                                    @click="addChunks">{{ kbDetail.adding ? '向量化中…' : '添加' }}</button>
+                        </div>
+                    </div>
+                    <!-- 右：已有知识块列表 -->
+                    <div class="kb-chunk-list">
+                        <div class="kb-panel-title">已有知识块（{{ kbDetail.total }}）</div>
+                        <div v-if="kbDetail.chunks.length === 0" class="agent-grid-empty">还没有知识块，在左侧粘贴内容添加</div>
+                        <div v-for="c in kbDetail.chunks" :key="c.id" class="kb-chunk-item">
+                            <div class="kb-chunk-head">
+                                <span class="agent-card-code" v-if="c.source">{{ c.source }}</span>
+                                <span class="field-hint">{{ fmtTime(c.createdAt) }}</span>
+                                <button class="card-btn card-btn-del kb-chunk-del" title="删除该知识块" @click="deleteChunk(c.id)">🗑</button>
+                            </div>
+                            <div class="kb-chunk-content">{{ c.content }}</div>
+                        </div>
+                        <div v-if="kbDetail.total > kbDetail.chunks.length" class="kb-more">
+                            <button class="btn-ghost" @click="loadMoreChunks">加载更多（还剩 {{ kbDetail.total - kbDetail.chunks.length }} 个）</button>
+                        </div>
+                    </div>
+                </div>
+            </template>
         </div>
     </main>
 
@@ -292,6 +392,44 @@
                 <span class="foot-spacer"></span>
                 <button class="btn-ghost" @click="openEditAgent(agentView.agent)">编辑</button>
                 <button class="btn-primary" @click="startAgentChat(agentView.agent)">用 TA 对话</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 知识库创建 / 重命名弹窗 -->
+    <div class="modal-mask" v-if="kbModal.open" @click.self="kbModal.open = false">
+        <div class="modal">
+            <div class="modal-head">
+                <span>{{ kbModal.mode === 'rename' ? '知识库设置' : '为智能体创建专属知识库' }}</span>
+                <button class="modal-close" @click="kbModal.open = false">✕</button>
+            </div>
+            <div class="modal-body">
+                <template v-if="kbModal.mode === 'create'">
+                    <label>归属智能体 <span class="req">*</span></label>
+                    <select v-model.number="kbModal.agentId" @change="autoKbName">
+                        <option v-for="a in availableAgents" :key="a.id" :value="a.id">
+                            {{ a.icon || '🤖' }} {{ a.name }}（暂无专属库）
+                        </option>
+                    </select>
+                    <div class="field-hint">该库只在此智能体处理对话时检索；全局通用资料请直接添加到「通用知识库」</div>
+                </template>
+                <template v-else>
+                    <label>归属</label>
+                    <div class="view-text">{{ kbModal.agentId ? '专属库 · ' + (agentName(kbModal.agentId) || 'agent#' + kbModal.agentId) : '全局库（所有对话通用）' }}</div>
+                </template>
+
+                <label>知识库名称 <span class="req">*</span></label>
+                <input v-model="kbModal.name" placeholder="如：产品知识库 / 校历与制度" />
+
+                <label>说明（可选）</label>
+                <input v-model="kbModal.description" placeholder="这个库主要放什么资料" />
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" @click="kbModal.open = false">取消</button>
+                <button class="btn-primary" :disabled="kbModal.saving || !kbModal.name.trim()"
+                        @click="saveKb">
+                    {{ kbModal.saving ? '保存中…' : (kbModal.mode === 'rename' ? '保存' : '创建') }}
+                </button>
             </div>
         </div>
     </div>

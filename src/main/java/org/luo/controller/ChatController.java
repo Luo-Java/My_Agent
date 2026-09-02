@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
@@ -41,7 +42,7 @@ public class ChatController {
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
         String conversationId = resolveConversationId(request.conversationId());
-        String reply = chatService.chat(conversationId, request.message());
+        String reply = chatService.chat(conversationId, request.message(), request.planner());
         return Map.of("content", reply);
     }
 
@@ -62,13 +63,13 @@ public class ChatController {
     public SseEmitter stream(@RequestBody ChatRequest request) {
         SseEmitter emitter = new SseEmitter(0L);
         String conversationId = resolveConversationId(request.conversationId());
-        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message());
+        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(), request.planner());
 
-        flux.doOnNext(event -> {
+        Disposable subscription = flux.doOnNext(event -> {
                     try {
                         // 用 JSON 包裹文本：内容中的换行/空行会被 JSON 转义，
                         // 避免内容里的 \n\n 被前端误判为 SSE 事件边界导致数据错乱/丢字。
-                        // 字段名用事件类型（token / progress），前端据此决定渲染到正文还是执行过程区。
+                        // 字段名用事件类型（token / progress / error），前端据此决定渲染到正文还是执行过程区。
                         emitter.send(Map.of(event.type(), event.text() == null ? "" : event.text()));
                     } catch (IOException e) {
                         emitter.completeWithError(e);
@@ -78,6 +79,10 @@ public class ChatController {
                 .doOnError(emitter::completeWithError)
                 .subscribe();
 
+        // 客户端断开（或超时）时取消订阅：停止后续事件推送与延迟任务，
+        // 避免 LLM 侧已排队的调用继续空烧 token（SSE 连接关闭会触发 onCompletion）。
+        emitter.onCompletion(subscription::dispose);
+        emitter.onTimeout(subscription::dispose);
         return emitter;
     }
 

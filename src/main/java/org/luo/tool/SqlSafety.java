@@ -22,7 +22,11 @@ public final class SqlSafety {
     /** 写/危险操作关键字黑名单（去注释去字符串后的小写语句中若含即为非法）。 */
     private static final String[] FORBIDDEN = {"insert", "update", "delete", "drop", "alter",
             "create", "truncate", "set ", "grant", "revoke", "merge", "replace", "call",
-            "exec", "lock", "unlock", "use ", "begin", "commit", "rollback"};
+            "exec", "lock", "unlock", "use ", "begin", "commit", "rollback",
+            // 文件读写与 DoS：SELECT ... INTO OUTFILE/DUMPFILE 可写服务器文件（若 DB 账号有 FILE 权限），
+            // SLEEP()/BENCHMARK() 可做延时攻击；LOAD_FILE() 可读服务器文件。
+            "into outfile", "into dumpfile", "outfile", "dumpfile", "load_file",
+            "sleep(", "benchmark(", "get_lock(", "release_lock("};
 
     /** 提取表名：FROM / JOIN 后紧跟的标识符（支持反引号）。 */
     private static final Pattern TABLE_PATTERN =

@@ -53,6 +53,20 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
         </dependency>
+        <!-- Spring AI 模板引擎（ST/StringTemplate）：提示词模板化渲染，StTemplateRenderer 依赖。
+             注：用模块本体而非 starter（starter 未在离线仓库）。
+             注意：本模块 pom 错误地声明了 antlr4-runtime，而 ST4 4.3.4 实际运行时依赖的是
+             antlr-runtime 3.x（org.antlr.runtime 包），故下面显式补充，否则运行时报 NoClassDefFoundError。 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-template-st</artifactId>
+        </dependency>
+        <!-- ST4 4.3.4 的真实运行时依赖（org.antlr.runtime 包），spring-ai-template-st 未正确传递 -->
+        <dependency>
+            <groupId>org.antlr</groupId>
+            <artifactId>antlr-runtime</artifactId>
+            <version>3.5.3</version>
+        </dependency>
         <!-- MyBatis-Plus（Spring Boot 4 专用 starter） -->
         <dependency>
             <groupId>com.baomidou</groupId>

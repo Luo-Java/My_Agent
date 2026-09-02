@@ -2,6 +2,10 @@ spring:
   application:
     name: My_Agent
 
+  # 导入独立提示词配置（agent.prompt.*），提示词集中外置，见 resources/prompts.yaml
+  config:
+    import: classpath:prompts.yaml
+
   # 启动时自动执行 schema.sql 建表（幂等：CREATE TABLE IF NOT EXISTS；
   # continue-on-error 让“为旧表补列”的 ALTER 在列已存在时不报错）
 #  sql:
@@ -28,6 +32,11 @@ spring:
       chat:
         # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
         model: qwen3.7-plus
+      # 知识库（RAG）向量化：与 chat 共用上方的 api-key / base-url（OpenAI 兼容的 /embeddings 端点）。
+      # 未配置/调用失败时对话不受影响（知识库检索静默降级），仅「添加知识」会明确报错。
+      embedding:
+        # 通义千问兼容模式的向量模型（text-embedding-v3/v2/v1）；OpenAI 官方用 text-embedding-3-small
+        model: text-embedding-v3
 
 # MyBatis-Plus 配置
 mybatis-plus:
@@ -46,7 +55,7 @@ server:
 logging:
   level:
     root: info           # 全局所有框架与业务代码都输出
-    org.luo: info        # 本项目代码显式设为 trace，确保自定义日志全量输出
+    org.luo: debug        # 本项目代码显式设为 trace，确保自定义日志全量输出
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
 

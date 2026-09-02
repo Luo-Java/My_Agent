@@ -8,6 +8,7 @@ import org.luo.exception.AiBusinessException;
 import org.luo.exception.AiErrorCode;
 import org.luo.service.AgentService;
 import org.luo.service.ChatService;
+import org.luo.service.PromptService;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -33,11 +34,11 @@ import java.util.List;
 public class AgentController {
 
     private final AgentService agentService;
-    private final ChatService chatService;
+    private final PromptService promptService;
 
-    public AgentController(AgentService agentService, ChatService chatService) {
+    public AgentController(AgentService agentService, PromptService promptService) {
         this.agentService = agentService;
-        this.chatService = chatService;
+        this.promptService = promptService;
     }
 
     @GetMapping
@@ -70,11 +71,15 @@ public class AgentController {
 
     @PutMapping("/{id}")
     public Agent update(@PathVariable Long id, @RequestBody UpsertAgentRequest req) {
-        UpsertAgentRequest full = new UpsertAgentRequest(
-                id, req.name(), req.agentCode(), req.icon(), req.description(),
-                req.systemPrompt(), req.paramSchema(),
-                req.model(), req.temperature(), req.avatarColor());
-        return agentService.updateAgent(full);
+        // 直接透传请求体（updateAgent 内部有 id 非空校验与字段映射）；仅当请求体未携带 id 时
+        // 用路径 id 补全，避免前端漏传导致 400。字段映射集中在校验后由 service 完成，不再手抄。
+        if (req.id() == null) {
+            req = new UpsertAgentRequest(
+                    id, req.name(), req.agentCode(), req.icon(), req.description(),
+                    req.systemPrompt(), req.paramSchema(),
+                    req.model(), req.temperature(), req.avatarColor());
+        }
+        return agentService.updateAgent(req);
     }
 
     @DeleteMapping("/{id}")
@@ -90,7 +95,7 @@ public class AgentController {
      */
     @PostMapping("/generate-prompt")
     public GeneratePromptResponse generatePrompt(@RequestBody GeneratePromptRequest req) {
-        String prompt = chatService.generateAgentPrompt(req.name(), req.description());
+        String prompt = promptService.generateAgentPrompt(req.name(), req.description());
         return new GeneratePromptResponse(prompt);
     }
 }

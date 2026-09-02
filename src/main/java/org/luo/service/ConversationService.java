@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.conditions.update.LambdaUpdateChainWrapper;
 import com.baomidou.mybatisplus.extension.conditions.update.UpdateChainWrapper;
 import lombok.extern.slf4j.Slf4j;
+import org.luo.constant.AgentBindSource;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
 import org.luo.mapper.ChatMessageMapper;
@@ -45,7 +46,7 @@ public class ConversationService {
         c.setId(UUID.randomUUID().toString());
         if (agentId != null) {
             c.setAgentId(agentId);
-            c.setAgentBindSource("EXPLICIT");   // 用户显式绑定：保持粘住，不因话题切换解绑
+            c.setAgentBindSource(AgentBindSource.EXPLICIT);   // 用户显式绑定：保持粘住，不因话题切换解绑
             c.setTitle(agentName != null ? agentName : "新对话");
         } else {
             c.setTitle("新对话");
@@ -85,7 +86,7 @@ public class ConversationService {
             c.setTitle("🧭 智能规划");
         } else if (agentId != null) {
             c.setAgentId(agentId);
-            c.setAgentBindSource("EXPLICIT");   // 用户显式绑定：保持粘住，不因话题切换解绑
+            c.setAgentBindSource(AgentBindSource.EXPLICIT);   // 用户显式绑定：保持粘住，不因话题切换解绑
             c.setTitle(agentName != null ? agentName : "新对话");
         } else {
             c.setTitle("新对话");
@@ -116,11 +117,26 @@ public class ConversationService {
     @Transactional
     public void renameConversation(String conversationId, String title) {
         if (conversationId == null || conversationId.isBlank()) return;
-        Conversation c = conversationMapper.selectById(conversationId);
-        if (c == null) return;
         log.info("重命名会话：id={}，新标题={}", conversationId, title != null ? title.trim() : "(null)");
-        c.setTitle(title == null ? "" : title.trim());
-        conversationMapper.updateById(c);
+        // 单趟 UPDATE：无需先查库（会话不存在时更新 0 行无副作用）
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getTitle, title == null ? "" : title.trim()));
+    }
+
+    /**
+     * 更新会话的规划模式标记（输入框「智能规划」开关写回会话，刷新后保持上次选择）。
+     * 仅更新 planner 单列，避免把不相关的内存态覆盖回数据库。
+     *
+     * @param conversationId 会话 ID
+     * @param planner        true=规划模式，false=普通对话
+     */
+    public void updatePlanner(String conversationId, boolean planner) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getPlanner, planner));
+        log.debug("更新会话规划标记：id={}，planner={}", conversationId, planner);
     }
 
     /**
@@ -159,6 +175,33 @@ public class ConversationService {
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId).orderByAsc("created_at");
         return chatMessageMapper.selectList(qw);
+    }
+
+    /**
+     * 读取某会话最近的 N 条历史消息（按时间正序返回）。
+     * <p>
+     * 内部先按 {@code created_at} 倒序取最近 N 条再反转成正序——供记忆窗口读取
+     * （DbChatMemory）使用，避免长会话每轮全量 selectList 后再在内存截断。
+     * <p>
+     * 注意：为让「倒序取最近 N 条」走索引，需要 {@code (conversation_id, created_at)} 复合索引；
+     * 新建库已由 schema.sql 创建，存量库请手动执行：
+     * {@code ALTER TABLE chat_message ADD INDEX idx_conv_created (conversation_id, created_at);}
+     *
+     * @param conversationId 会话 ID
+     * @param limit          最多取多少条；小于等于 0 时退化为全量查询（兼容原行为）
+     * @return 该会话最近的 N 条消息，按时间正序
+     */
+    public List<ChatMessage> getRecentHistory(String conversationId, int limit) {
+        if (limit <= 0) {
+            return getHistory(conversationId);
+        }
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId)
+                .orderByDesc("created_at")
+                .last("LIMIT " + limit);   // limit 为受控 int 参数，无注入风险
+        List<ChatMessage> list = chatMessageMapper.selectList(qw);
+        java.util.Collections.reverse(list); // 倒序取回后恢复正序
+        return list;
     }
 
     /**
@@ -227,6 +270,9 @@ public class ConversationService {
 
     /**
      * 更新会话的更新时间；未手动命名的会话用首条用户消息作为会话标题。
+     * <p>
+     * 保持 select+update 两趟（而非单趟条件 UPDATE）：必须先读原标题才能判断「是否为新对话、
+     * 需要自动命名」，该判断无法用单条 SQL 原子表达。
      *
      * @param conversationId 会话 ID
      * @param userText       当前用户输入，首次时截取前 20 字作标题
@@ -283,11 +329,11 @@ public class ConversationService {
     @Transactional
     public void bindAgent(String conversationId, Long agentId) {
         if (conversationId == null || conversationId.isBlank() || agentId == null) return;
-        Conversation c = conversationMapper.selectById(conversationId);
-        if (c == null) return;
-        c.setAgentId(agentId);
-        c.setAgentBindSource("CLARIFY");   // 追问流程临时绑定：用户转向别的话题时由 ChatService 自动解绑
-        conversationMapper.updateById(c);
+        // 单趟 UPDATE：无需先查库（会话不存在时更新 0 行无副作用）
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getAgentId, agentId)
+                .set(Conversation::getAgentBindSource, AgentBindSource.CLARIFY));  // 追问流程临时绑定：用户转向别的话题时由 ChatService 自动解绑
         log.info("绑定智能体：会话={}，agentId={}，来源=CLARIFY", conversationId, agentId);
     }
 

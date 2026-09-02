@@ -1,6 +1,7 @@
 package org.luo.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.config.PromptProperties;
 import org.luo.entity.Agent;
 import org.luo.entity.ChatMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
@@ -41,10 +42,13 @@ public class ParamFillingService {
 
     private final ChatModel chatModel;
     private final ConversationService conversationService;
+    private final PromptProperties promptProperties;
 
-    public ParamFillingService(ChatModel chatModel, ConversationService conversationService) {
+    public ParamFillingService(ChatModel chatModel, ConversationService conversationService,
+                               PromptProperties promptProperties) {
         this.chatModel = chatModel;
         this.conversationService = conversationService;
+        this.promptProperties = promptProperties;
     }
 
     /**
@@ -170,10 +174,8 @@ public class ParamFillingService {
                 .collect(Collectors.joining("\n"));
         try {
             ChatResponse r = chatModel.call(new Prompt(List.of(
-                    new SystemMessage("你是参数抽取器。根据对话历史与本次用户输入，从下面的参数清单中提取用户已经明确给出的参数值。\n"
-                            + "规则：\n1. 只在用户明确表达时才填值，禁止臆测或默认。\n2. 只输出用户已明确给出值的参数，每行一条，"
-                            + "格式为「参数key: 取值」（key 使用下面清单中的英文 key，冒号后直接跟取值，不要加引号、不要代码块、不要任何解释）。\n"
-                            + "3. 用户未提及或无法确定的参数，一律不要输出。\n参数清单（key）：\n" + schemaText),
+                    new SystemMessage(PromptProperties.render(promptProperties.paramExtractorSystem(),
+                            Map.of("schemaText", schemaText))),
                     new UserMessage("对话历史：\n" + (histText.isBlank() ? "（无）" : histText)
                             + "\n\n本次用户输入：\n" + message))));
             var generation = r.getResult();
@@ -309,6 +311,11 @@ public class ParamFillingService {
         final Map<String, String> paramLabels;    //参数标签
         final boolean limited;        //是否到达追问次数上限
         final List<String> missingLabels;   //缺失参数
+
+        /** 追问文本；非 null 表示需要追问（供编排层 AgentRoundHandler 跨包访问）。 */
+        public String getQuestion() {
+            return question;
+        }
 
         ClarifyDecision(String question, Map<String, String> params, Map<String, String> paramLabels,
                         boolean limited, List<String> missingLabels) {

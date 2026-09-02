@@ -1,6 +1,7 @@
 package org.luo.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.config.PromptProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
 import org.luo.memory.DbChatMemory;
@@ -39,6 +40,8 @@ public class MemoryMergeService {
 
     private final ConversationService conversationService;
     private final ChatModel chatModel;
+    /** 记忆合并提示词（纯静态，外置）。 */
+    private final String memoryMergeSystem;
     /** 记忆合并专用线程池：与对话主链路（Reactor boundedElastic）隔离，合并再慢也不挤占对话执行线程。 */
     private final Executor memoryMergeExecutor;
 
@@ -49,10 +52,12 @@ public class MemoryMergeService {
     private final Set<String> merging = ConcurrentHashMap.newKeySet();
 
     public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
-                              @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor) {
+                              @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor,
+                              PromptProperties promptProperties) {
         this.conversationService = conversationService;
         this.chatModel = chatModel;
         this.memoryMergeExecutor = memoryMergeExecutor;
+        this.memoryMergeSystem = promptProperties.memoryMergeSystem();
     }
 
     /**
@@ -145,10 +150,7 @@ public class MemoryMergeService {
             }
             log.debug("生成摘要：调用 LLM 合并 {} 条新消息", newMessages.size());
             ChatResponse response = chatModel.call(new Prompt(List.of(
-                    new SystemMessage("你负责维护一份对话记忆。每次收到【新增对话内容】时，把它与【已有摘要】和【已有关键事实】合并，"
-                            + "输出两部分，严格使用下面的格式（不要输出其他内容）：\n"
-                            + "## 摘要\n更新后的简洁中文摘要，保留关键事实、用户偏好、待办与结论；不要逐字复述。\n"
-                            + "## 关键事实\n从全部内容中提取的用户长期关键信息，每条以“- ”开头（如姓名、身份、偏好、待办、重要承诺）；没有则只输出“无”。"),
+                    new SystemMessage(memoryMergeSystem),
                     new UserMessage(sb.toString()))));
             var generation = response.getResult();
             var assistantMessage = generation != null ? generation.getOutput() : null;

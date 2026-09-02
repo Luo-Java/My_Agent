@@ -5,10 +5,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.dto.UpsertAgentRequest;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
+import org.luo.entity.KnowledgeBase;
+import org.luo.entity.KnowledgeChunk;
 import org.luo.exception.AiBusinessException;
 import org.luo.exception.AiErrorCode;
 import org.luo.mapper.AgentMapper;
 import org.luo.mapper.ConversationMapper;
+import org.luo.mapper.KnowledgeBaseMapper;
+import org.luo.mapper.KnowledgeChunkMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,10 +38,16 @@ public class AgentService {
 
     private final AgentMapper agentMapper;
     private final ConversationMapper conversationMapper;
+    /** 以下两个 Mapper 仅用于删除智能体时级联清理其专属知识库（避免引入 service 循环依赖，直接操作数据层）。 */
+    private final KnowledgeBaseMapper kbMapper;
+    private final KnowledgeChunkMapper chunkMapper;
 
-    public AgentService(AgentMapper agentMapper, ConversationMapper conversationMapper) {
+    public AgentService(AgentMapper agentMapper, ConversationMapper conversationMapper,
+                        KnowledgeBaseMapper kbMapper, KnowledgeChunkMapper chunkMapper) {
         this.agentMapper = agentMapper;
         this.conversationMapper = conversationMapper;
+        this.kbMapper = kbMapper;
+        this.chunkMapper = chunkMapper;
     }
 
     /**
@@ -93,7 +103,8 @@ public class AgentService {
     }
 
     /**
-     * 删除智能体，并解除所有会话对其的绑定（会话与消息保留，退回默认助手）。
+     * 删除智能体，并解除所有会话对其的绑定（会话与消息保留，退回默认助手）；
+     * 同时级联删除其专属知识库（含全部知识块）——智能体不存在后专属库即失效，避免残留孤儿库。
      *
      * @param id 要删除的智能体 ID
      */
@@ -107,6 +118,13 @@ public class AgentService {
             c.setAgentId(null);
             c.setAgentBindSource(null);   // 一并清除来源标记，避免残留 EXPLICIT/CLARIFY 指向已删除的 agent
             conversationMapper.updateById(c);
+        }
+        // 级联清理专属知识库（删除逻辑与 KbService.deleteKb 保持一致：先删块再删库）
+        KnowledgeBase kb = kbMapper.selectOne(new QueryWrapper<KnowledgeBase>().eq("agent_id", id).last("LIMIT 1"));
+        if (kb != null) {
+            chunkMapper.delete(new QueryWrapper<KnowledgeChunk>().eq("kb_id", kb.getId()));
+            kbMapper.deleteById(kb.getId());
+            log.info("删除智能体：级联删除其专属知识库 id={}（{} 个知识块）", kb.getId(), kb.getDocCount());
         }
         agentMapper.deleteById(id);
         syncPromptFile();
@@ -146,6 +164,25 @@ public class AgentService {
         return agentMapper.selectOne(new QueryWrapper<Agent>()
                 .eq("agent_code", code.trim())
                 .last("LIMIT 1"));
+    }
+
+    /**
+     * 生成智能体清单文本（每行一条 {@code "- 名称 (编码)：描述"}），供 LLM 决策场景使用：
+     * 智能路由（AgentRouter）与动态规划（PlannerService）共用同一格式，改格式（如加图标/温度/参数）
+     * 只需在此一处维护，避免两处手拼清单造成配置漂移。
+     *
+     * @param agents 智能体列表（可为空）
+     * @return 清单文本；列表为空时返回空串
+     */
+    public String buildAgentListText(List<Agent> agents) {
+        if (agents == null || agents.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Agent a : agents) {
+            sb.append("- ").append(a.getName())
+                    .append(" (").append(a.getAgentCode()).append(")")
+                    .append("：").append(a.getDescription()).append("\n");
+        }
+        return sb.toString();
     }
 
     /**

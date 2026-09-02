@@ -1,6 +1,7 @@
 package org.luo.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.config.PromptProperties;
 import org.luo.entity.Agent;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -13,6 +14,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 智能路由服务：对「未绑定智能体的普通会话」，根据消息内容判断是否应交给某个专属智能体（agent）处理。
@@ -34,10 +36,12 @@ public class AgentRouter {
 
     private final AgentService agentService;
     private final ChatModel chatModel;
+    private final PromptProperties promptProperties;
 
-    public AgentRouter(AgentService agentService, ChatModel chatModel) {
+    public AgentRouter(AgentService agentService, ChatModel chatModel, PromptProperties promptProperties) {
         this.agentService = agentService;
         this.chatModel = chatModel;
+        this.promptProperties = promptProperties;
     }
 
     /**
@@ -75,46 +79,27 @@ public class AgentRouter {
         }
         if (message == null || message.isBlank()) return RouteDecision.none();
         try {
-            StringBuilder list = new StringBuilder();
-            for (Agent a : agents) {
-                list.append("- ").append(a.getName())
-                        .append(" (").append(a.getAgentCode()).append(")")
-                        .append("：").append(a.getDescription())
-                        .append("\n");
-            }
+            // 智能体清单文本与动态规划共用一处维护（AgentService.buildAgentListText），避免两处手拼漂移
+            String list = agentService.buildAgentListText(agents);
             // 追问上下文提示：仅当存在待回答的追问时追加，引导模型区分「回答追问」与「新话题」
             String continuationHint = (pendingQuestion != null && !pendingQuestion.isBlank())
-                    ? "【重要】当前有一个待补全信息的追问（用户此前请求的任务）：\n" + pendingQuestion + "\n"
-                    + "判断规则：若用户本条消息是对该追问的直接回答（如给出城市名、日期、语言等具体取值，"
-                    + "或与追问相关的简短补充），则视为「正在回答追问、继续当前任务」，输出 {\"route\":false,\"continue\":true}；\n"
-                    + "若用户本条消息是新的问题或新的请求（不是对该追问的回答，即便其中含有与追问参数相似的词，"
-                    + "如问吃的、问别的），则按上述规则正常判断是否路由。\n\n"
+                    ? PromptProperties.render(promptProperties.routerContinuationHint(),
+                            Map.of("pendingQuestion", pendingQuestion))
                     : "";
             // 对话上下文：最近若干轮，用于识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）
             String contextBlock = (recentContext != null && !recentContext.isBlank())
-                    ? "【对话上下文】以下是本次请求之前，同一会话最近的对话内容（按时间顺序）。"
-                    + "仅供你判断这是「延续上一轮话题」还是「开启新话题」，不要据此编造任何参数：\n"
-                    + recentContext + "\n\n"
+                    ? PromptProperties.render(promptProperties.routerContextBlock(),
+                            Map.of("recentContext", recentContext))
                     : "";
             log.debug("智能路由：调用 LLM 判断路由，可用智能体={}，有追问上下文={}，有对话上下文={}", agents.size(),
                     pendingQuestion != null && !pendingQuestion.isBlank(),
                     recentContext != null && !recentContext.isBlank());
+            String system = PromptProperties.render(promptProperties.routerSystem(), Map.of(
+                    "continuationHint", continuationHint,
+                    "contextBlock", contextBlock,
+                    "agentList", list));
             ChatResponse response = chatModel.call(new Prompt(List.of(
-                    new SystemMessage("你是多智能体路由决策器。根据用户消息的内容判断：是否应该交由某个专属智能体（agent）来处理本次请求。\n\n"
-                            + "判断规则：\n"
-                            + "1. 只有当用户请求的意图与某个智能体的职责高度匹配时才路由（例如用户明确要求翻译 → 交给翻译类智能体；要求写代码 → 交给编程类智能体）。\n"
-                            + "2. 一般闲聊、寒暄，或用户请求没有对应智能体能胜任时，不路由，进行普通对话。\n"
-                            + "3. 最多路由到一个智能体；犹豫时选择职责最匹配的，仍不匹配就不路由。\n"
-                            + "4. 若用户消息很短、明显是承接上一轮话题（例如上一轮在查天气、用户只说「北京呢？」「那明天呢」），"
-                            + "应判定为延续上一轮话题，路由到与上一轮相同的智能体；不要因为信息不全就当作普通对话。\n\n"
-                            + continuationHint
-                            + contextBlock
-                            + "可用智能体清单：\n" + list
-                            + "\n你必须且只能输出一个 JSON 对象（不要输出任何其它文字、解释或代码块包裹），三选一：\n"
-                            + "需要路由时：{\"route\":true,\"agentCode\":\"<该智能体的编码>\"}\n"
-                            + "不需要路由时：{\"route\":false}\n"
-                            + "用户在回答当前追问、继续当前任务时：{\"route\":false,\"continue\":true}\n"
-                            + "注意：agentCode 必须是上方清单里某个智能体括号内给出的确切编码。"),
+                    new SystemMessage(system),
                     new UserMessage("用户消息：\n" + message))));
             var generation = response.getResult();
             var assistantMessage = generation != null ? generation.getOutput() : null;

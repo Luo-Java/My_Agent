@@ -1,6 +1,7 @@
 package org.luo.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.config.PromptProperties;
 import org.luo.entity.Agent;
 import org.luo.exception.AiBusinessException;
 import org.luo.exception.AiErrorCode;
@@ -21,33 +22,18 @@ import java.util.List;
 @Service
 public class PromptService {
 
-    /** 默认 System Prompt：未绑定智能体时使用的通用助手指令（约束 AI 输出为规范 Markdown）。 */
-    private static final String DEFAULT_SYSTEM_PROMPT = """
-            你是一个专业、友好的 AI 助手。请严格遵守以下输出格式要求：
+    /** 默认 System Prompt：未绑定智能体时使用的通用助手指令（约束 AI 输出为规范 Markdown）。从配置外置。 */
+    private final String defaultSystemPrompt;
 
-            1. 使用 Markdown 格式组织回复内容：
-               - 用 ## 或 ### 分段标题（不要用 # 一级标题）
-               - 代码片段用 ```语言 包裹代码块，行内变量/函数用 `反引号`
-               - 列表用 - 或数字编号
-               - 表格用标准 Markdown 表格语法
-
-            2. 内容结构要求：
-               - 先给出结论或直接回答，再展开解释
-               - 分点说明时每条不超过两行
-               - 代码示例必须附带简短注释说明关键步骤
-               - 长回复请用分段和空行保持可读性
-
-            3. 禁止事项：
-               - 不要输出原始 Markdown 源码符号作为装饰（如 ### 冒泡排序 **算法**）
-               - 不要在正文里混入 HTML 标签
-               - 不要使用过多的 emoji 或特殊符号
-               - 回复开头不要加「你好」「您好」等寒暄，直接回答问题
-            """;
+    /** 提示词生成指令（元提示词）。从配置外置。 */
+    private final String promptGeneratorInstruction;
 
     private final ChatModel chatModel;
 
-    public PromptService(ChatModel chatModel) {
+    public PromptService(ChatModel chatModel, PromptProperties promptProperties) {
         this.chatModel = chatModel;
+        this.defaultSystemPrompt = promptProperties.defaultSystem();
+        this.promptGeneratorInstruction = promptProperties.promptGenerator();
     }
 
     /**
@@ -60,7 +46,7 @@ public class PromptService {
                 return p;
             }
         }
-        return DEFAULT_SYSTEM_PROMPT;
+        return defaultSystemPrompt;
     }
 
     /**
@@ -78,16 +64,7 @@ public class PromptService {
         log.info("生成智能体提示词：名称={}", name);
         try {
             ChatResponse response = chatModel.call(new Prompt(List.of(
-                    new SystemMessage("""
-                            你是一位专业的提示词（Prompt）工程师。根据用户提供的智能体名称和描述，创作一段高质量的中文系统提示词（人设设定）。
-                            要求：
-                            1. 直接输出提示词正文本身，不要输出任何解释、前言、后语，不要用代码块包裹。
-                            2. 用第二人称「你」开头，明确角色定位、职责范围与目标用户。
-                            3. 包含对回答风格与输出格式的具体要求（涉及代码时用 Markdown 代码块等）。
-                            4. 列出 2~4 条具体行为准则，例如回复结构、禁止事项、处理边界。
-                            5. 若智能体执行任务需要特定输入（如翻译的目标语言），在行为准则中明确：缺少必要输入时必须先向用户追问确认，不可臆测。
-                            6. 全文 150~400 字，语气专业、指令明确。
-                            """),
+                    new SystemMessage(promptGeneratorInstruction),
                     new UserMessage("智能体名称：" + name
                             + "\n描述：" + (description == null || description.isBlank() ? "（无）" : description)))));
             var generation = response.getResult();

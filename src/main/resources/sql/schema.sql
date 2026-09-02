@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS chat_message (
     content         TEXT                                 COMMENT '消息内容（用户提问或AI回复文本）',
     created_at      DATETIME                             COMMENT '消息写入时间（同一轮用户与助手相差纳秒级以保证顺序）',
     PRIMARY KEY (id),
-    INDEX idx_conversation (conversation_id)
+    INDEX idx_conversation (conversation_id),
+    -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
+    INDEX idx_conv_created (conversation_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '会话消息表：存储每个会话下的多轮对话明细';
 
 -- 智能体表：可在页面创建的各类 AI 角色，绑定到会话后决定对话人设与模型参数
@@ -42,3 +44,29 @@ CREATE TABLE IF NOT EXISTS agent (
     PRIMARY KEY (id),
     UNIQUE KEY uk_agent_code (agent_code)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '智能体表：可创建的各类 AI 角色，绑定到会话后决定对话人设';
+
+-- 知识库表：每个智能体可维护一个专属知识库（agent_id 唯一）；agent_id 为 NULL 的是最外层全局知识库（所有对话通用）。
+-- 注意：MySQL 唯一索引对 NULL 不生效，全局库唯一性由服务层（KbService.getOrCreateGlobal）保证。
+CREATE TABLE IF NOT EXISTS kb (
+    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '知识库ID',
+    name        VARCHAR(128) NOT NULL                   COMMENT '知识库名称',
+    agent_id    BIGINT       DEFAULT NULL               COMMENT '归属智能体ID（关联 agent.id）；NULL=全局知识库（所有对话通用）',
+    description VARCHAR(512) DEFAULT NULL               COMMENT '知识库说明',
+    doc_count   INT          NOT NULL DEFAULT 0         COMMENT '知识块数量（冗余，便于列表展示，由增删操作维护）',
+    created_at  DATETIME                                 COMMENT '创建时间',
+    updated_at  DATETIME                                 COMMENT '最后更新时间（含知识块变更）',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_kb_agent (agent_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识库表：智能体专属库（agent_id 非空）+ 全局库（agent_id 为 NULL）';
+
+-- 知识块表：知识库的最小检索单元（一段文本 + 它的向量，向量由 Embedding API 生成，存 JSON float 数组）
+CREATE TABLE IF NOT EXISTS kb_chunk (
+    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '知识块ID',
+    kb_id       BIGINT       NOT NULL                COMMENT '所属知识库ID（关联 kb.id）',
+    content     TEXT         NOT NULL                COMMENT '知识块原文',
+    source      VARCHAR(200) DEFAULT NULL            COMMENT '来源标注（如文档名/条目名），供引用溯源与展示',
+    embedding   MEDIUMTEXT   DEFAULT NULL            COMMENT '内容向量（JSON float 数组），余弦相似度检索用',
+    created_at  DATETIME                              COMMENT '创建时间',
+    PRIMARY KEY (id),
+    INDEX idx_kb (kb_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识块表：知识库内容的分块与向量存储';

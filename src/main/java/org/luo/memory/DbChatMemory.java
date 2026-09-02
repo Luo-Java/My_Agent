@@ -34,6 +34,13 @@ public class DbChatMemory implements ChatMemory {
      *  导致模型看不到已有数据而重复查库；4000 可在成本可控前提下保住 1~2 轮数据型对话。 */
     static final int MAX_RECENT_TOKENS = 4000;
 
+    /**
+     * SQL 层预取上限条数：先取最近这么多条，再由 {@link #computeWindowStart} 按 token 预算精确截断。
+     * 单条消息通常远小于 4000 字符，200 条足以覆盖整个预算窗口；极端超长消息由内存截断兜底。
+     * 好处：长会话（数百条）下每轮读取不再全表 selectList。
+     */
+    private static final int SQL_FETCH_LIMIT = 200;
+
     private final ConversationService conversationService;
 
     public DbChatMemory(ConversationService conversationService) {
@@ -79,7 +86,9 @@ public class DbChatMemory implements ChatMemory {
             return List.of();
         }
         try {
-            List<ChatMessage> history = conversationService.getHistory(conversationId);
+            // SQL 层先取最近 N 条（走 (conversation_id, created_at) 索引），再按 token 预算精确截断，
+            // 避免长会话每轮全量 selectList 后再在内存里丢窗口。
+            List<ChatMessage> history = conversationService.getRecentHistory(conversationId, SQL_FETCH_LIMIT);
             int windowStart = computeWindowStart(history);
             List<Message> result = new ArrayList<>(history.size() - windowStart);
             for (int i = windowStart; i < history.size(); i++) {
