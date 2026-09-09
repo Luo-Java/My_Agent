@@ -29,6 +29,13 @@ import cn.hutool.json.JSONUtil;
  * <p>
  * LLM 返回的参数抽取结果按「key: 取值」逐行输出后正则解析（不用 JSON 库）；
  * 而 agent.paramSchema 配置用 Hutool 的 {@code JSONUtil} 解析（规避 ObjectMapper，与智能路由解析风格一致）。
+ * <p>
+ * <b>跨 turn 一致性契约</b>：本服务<b>无显式状态</b>（不新增 Conversation 字段），每轮从
+ * DB 全量历史重放推导——追问计数（{@link #countClarifyStreak}）与参数抽取
+ * （{@link #clarifyScopedHistory} 最近 12 条）都以历史消息为准，天然跨请求、跨重启、多实例一致。
+ * 该推导依赖「历史消息全量保留」：{@link MemoryMergeService} 的滚动摘要只把窗口外消息排除出
+ * 主模型上下文、<b>不物理删除 chat_message 行</b>（见其类注释）。若未来改为物理归档旧消息，
+ * 必须先同步本服务的重放逻辑（否则追问计数与已确认参数会静默丢失）。
  */
 @Slf4j
 @Service

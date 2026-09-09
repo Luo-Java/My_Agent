@@ -51,7 +51,7 @@ public class ChatComposer {
     private final PromptService promptService;
     private final ToolRegistry toolRegistry;
     private final ChatMemory chatMemory;
-    private final KbService kbService;
+    private final KbSearchService kbSearchService;
 
     public ChatComposer(ChatClient.Builder chatClientBuilder,
                         MessageChatMemoryAdvisor memoryAdvisor,
@@ -60,7 +60,7 @@ public class ChatComposer {
                         ToolRegistry toolRegistry,
                         ChatMemory chatMemory,
                         PromptProperties promptProperties,
-                        KbService kbService) {
+                        KbSearchService kbSearchService) {
         // 中间步骤客户端：先 clone 出一份干净的 builder（clone 须在 defaultAdvisors 之前，避免继承到记忆 Advisor）
         this.internalChatClient = chatClientBuilder.clone().defaultAdvisors(toolUsageLoggingAdvisor).build();
         this.chatClient = chatClientBuilder.defaultAdvisors(memoryAdvisor, toolUsageLoggingAdvisor).build();
@@ -68,7 +68,7 @@ public class ChatComposer {
         this.toolRegistry = toolRegistry;
         this.chatMemory = chatMemory;
         this.realtimeDataRule = promptProperties.realtimeRule();
-        this.kbService = kbService;
+        this.kbSearchService = kbSearchService;
     }
 
     /** 带记忆的 ChatClient：普通对话 / 通用助手兜底回答使用。 */
@@ -86,14 +86,15 @@ public class ChatComposer {
      * + 已确认参数 + 当前输入，并给会话记忆 Advisor 传入 conversationId（用于读取与写回历史）。
      * <p>
      * 最终 prompt 顺序为：「人设 + 长期记忆 → 知识库资料（若命中） → 窗口原文（由 advisor 注入） → 当前输入」。
-     * conv 由调用方一次查出后传入，本方法不再查库。RAG 检索范围为「本轮实际使用的智能体」的专属库
-     * + 全局知识库（见 {@link KbService#buildKbContext}），由 {@code agent} 参数驱动。
+     * conv 由调用方一次查出后传入，本方法不再查库。RAG 是否检索由<b>会话级开关</b>
+     * {@code conv.ragEnabled} 决定（false=不检索；true=自动检索全局库 + 本轮 agent 专属库，
+     * 见 {@link KbSearchService#buildKbContext(Boolean, Agent, String)}）。
      */
     public ChatClient.ChatClientRequestSpec buildRequest(String conversationId, String message, Conversation conv,
                                                          Agent agent, String paramBlock) {
         String systemPrompt = applyRealtimeRule(promptService.resolveSystemPrompt(agent)
                 + buildLongTermMemoryText(conv)
-                + buildKbContext(agent, message)
+                + buildKbContext(ragOn(conv), agent, message)
                 + (paramBlock == null ? "" : paramBlock));
         return decorateRequest(chatClient.prompt()
                 .system(systemPrompt)
@@ -103,12 +104,13 @@ public class ChatComposer {
 
     /**
      * 通用助手兜底请求（无智能体绑定、不挂载工具）：用于规划模式回退、或规划目标与任何智能体无关时。
-     * 复用带记忆的 {@code chatClient}，保证用户原始目标被写入会话历史；知识库侧检索全局知识库。
+     * 复用带记忆的 {@code chatClient}，保证用户原始目标被写入会话历史；知识库侧同样跟随会话开关
+     * （conv.ragEnabled，此时无路由智能体 → 只检索全局库）。
      */
     public ChatClient.ChatClientRequestSpec buildDefaultRequest(Conversation conv, String conversationId, String message) {
         return chatClient.prompt()
                 .system(promptService.resolveSystemPrompt(null) + buildLongTermMemoryText(conv)
-                        + buildKbContext(null, message))
+                        + buildKbContext(ragOn(conv), null, message))
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
     }
@@ -119,12 +121,18 @@ public class ChatComposer {
     }
 
     /**
-     * 组装本轮请求的知识库资料文本（RAG，透传 KbService）：供 {@link #buildRequest}/{@link #buildDefaultRequest}
+     * 组装本轮请求的知识库资料文本（RAG，透传 KbSearchService）：供 {@link #buildRequest}/{@link #buildDefaultRequest}
      * 拼接，也暴露给规划执行（PlannerRoundHandler 手拼 system 的步骤）复用，保证所有路径的知识库注入
-     * 逻辑收敛在 KbService 一处。失败/无命中返回空串，不影响主流程。
+     * 逻辑收敛在 KbSearchService 一处。开关关闭（ragEnabled=false）返回空串 = 不使用 RAG；
+     * 开启后按路由到的 agent 自动多库检索（全局库 + 该 agent 专属库）；失败/无命中同样返回空串，不影响主流程。
      */
-    public String buildKbContext(Agent agent, String query) {
-        return kbService.buildKbContext(agent, query);
+    public String buildKbContext(Boolean ragEnabled, Agent agent, String query) {
+        return kbSearchService.buildKbContext(ragEnabled, agent, query);
+    }
+
+    /** 会话级 RAG 开关取值（null 视为关闭）。 */
+    public boolean ragOn(Conversation conv) {
+        return conv != null && Boolean.TRUE.equals(conv.getRagEnabled());
     }
 
     /**

@@ -67,6 +67,13 @@
             <artifactId>antlr-runtime</artifactId>
             <version>3.5.3</version>
         </dependency>
+        <!-- Spring AI Chroma 向量库客户端（模块本体而非 starter：starter 的自动配置会在启动时就连接 Chroma，
+             服务未就绪会挡应用启动；改由本项目的 ChromaVectorStoreService 自行 lazy 构建并做降级）。
+             Chroma 服务端需单独运行（本机 127.0.0.1:8000）。 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-chroma-store</artifactId>
+        </dependency>
         <!-- MyBatis-Plus（Spring Boot 4 专用 starter） -->
         <dependency>
             <groupId>com.baomidou</groupId>
@@ -88,6 +95,18 @@
             <groupId>cn.hutool</groupId>
             <artifactId>hutool-all</artifactId>
             <version>5.8.38</version>
+        </dependency>
+        <!-- 文档解析（知识库文件上传）：PDF 文本抽取。2.0.30 的 bouncycastle 为 optional，不传递 -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>2.0.30</version>
+        </dependency>
+        <!-- 文档解析：docx / xlsx（poi-ooxml 会传递 poi、poi-ooxml-schemas、xmlbeans、commons-compress、curvesapi） -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>4.1.2</version>
         </dependency>
     </dependencies>
 

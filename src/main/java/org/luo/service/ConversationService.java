@@ -8,6 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.constant.AgentBindSource;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
+import org.luo.exception.AiBusinessException;
+import org.luo.exception.AiErrorCode;
 import org.luo.mapper.ChatMessageMapper;
 import org.luo.mapper.ConversationMapper;
 import org.springframework.stereotype.Service;
@@ -137,6 +139,48 @@ public class ConversationService {
                 .eq(Conversation::getId, conversationId)
                 .set(Conversation::getPlanner, planner));
         log.debug("更新会话规划标记：id={}，planner={}", conversationId, planner);
+    }
+
+    /**
+     * 更新会话的智能规划开关（输入框「🧭 智能规划」开关写回，拨动即持久化，与 RAG 开关对称）。
+     * 仅更新 planner 单列。planner 与 agentId 互斥：开启规划且会话已绑定智能体时拒绝。
+     *
+     * @param conversationId 会话 ID
+     * @param enabled        true=规划模式，false=普通对话；null 按 false 处理
+     * @throws AiBusinessException 开启规划但会话已绑定智能体（planner 与 agentId 互斥）
+     */
+    @Transactional
+    public void updatePlannerSwitch(String conversationId, Boolean enabled) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        boolean on = Boolean.TRUE.equals(enabled);
+        if (on) {
+            Conversation c = conversationMapper.selectById(conversationId);
+            if (c == null) return;   // 不存在的会话静默（更新 0 行无副作用）
+            if (c.getAgentId() != null) {
+                throw new AiBusinessException(AiErrorCode.BAD_REQUEST,
+                        "绑定智能体的会话不支持规划模式（planner 与 agentId 互斥）");
+            }
+        }
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getPlanner, on));
+        log.debug("更新会话规划开关：id={}，enabled={}", conversationId, on);
+    }
+
+    /**
+     * 更新会话的 RAG 开关（输入框「📚 RAG」开关写回会话，刷新后保持上次选择）。
+     * 仅更新 rag_enabled 单列；true=开启自动检索（通用知识库 + 路由到智能体时其专属库）。
+     * 不校验库是否存在：库/智能体被删除后检索侧查不到库自动降级为不带资料。
+     *
+     * @param conversationId 会话 ID
+     * @param enabled        true=开启 RAG；false=关闭
+     */
+    public void updateRagEnabled(String conversationId, Boolean enabled) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getRagEnabled, Boolean.TRUE.equals(enabled)));
+        log.debug("更新会话 RAG 开关：id={}，enabled={}", conversationId, Boolean.TRUE.equals(enabled));
     }
 
     /**

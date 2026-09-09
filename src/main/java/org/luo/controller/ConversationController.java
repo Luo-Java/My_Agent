@@ -5,6 +5,8 @@ import org.luo.dto.CreateConversationRequest;
 import org.luo.dto.HistoryResponse;
 import org.luo.dto.MessageDto;
 import org.luo.dto.NewConversationResponse;
+import org.luo.dto.PlannerEnabledRequest;
+import org.luo.dto.RagEnabledRequest;
 import org.luo.dto.RenameConversationRequest;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
@@ -30,6 +32,8 @@ import java.util.List;
  * <p>
  * POST   /api/chat/conversation      - 开启新会话，返回会话 ID
  * PUT    /api/chat/conversation/{id} - 重命名会话
+ * PUT    /api/chat/conversation/{id}/planner - 更新会话智能规划开关（enabled=true/false，绑定智能体的会话不可开启）
+ * PUT    /api/chat/conversation/{id}/rag - 更新会话 RAG 开关（enabled=true/false）
  * DELETE /api/chat/conversation/{id} - 删除会话及其全部消息
  * GET    /api/chat/conversations     - 会话列表（按最近更新倒序）
  * GET    /api/chat/history           - 读取某会话的历史消息
@@ -51,7 +55,7 @@ public class ConversationController {
      * 可绑定某个智能体或标记为规划模式（二者互斥）：绑定时以其名称作为会话初始标题。
      *
      * @param req 可选：{@code agentId} 绑定的智能体 ID；{@code planner} 规划模式
-     * @return 新会话信息（id / title / createdAt / agentId / planner）
+     * @return 新会话信息（id / title / createdAt / agentId / planner / ragEnabled）
      */
     @PostMapping("/conversation")
     public NewConversationResponse createConversation(@RequestBody(required = false) CreateConversationRequest req) {
@@ -59,7 +63,7 @@ public class ConversationController {
         if (Boolean.TRUE.equals(planner)) {
             // 规划模式会话：由 ChatService 交给动态规划器，运行时由 LLM 规划多智能体步骤
             Conversation c = conversationService.createPlannerConversation();
-            return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), null, true);
+            return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), null, true, c.getRagEnabled());
         }
         Long agentId = (req == null) ? null : req.agentId();
         String agentName = null;
@@ -68,7 +72,7 @@ public class ConversationController {
             agentName = a != null ? a.getName() : null;
         }
         Conversation c = conversationService.createConversation(agentId, agentName);
-        return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), c.getAgentId(), false);
+        return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), c.getAgentId(), false, c.getRagEnabled());
     }
 
     /**
@@ -81,6 +85,30 @@ public class ConversationController {
     public void renameConversation(@PathVariable String conversationId,
                                    @RequestBody RenameConversationRequest request) {
         conversationService.renameConversation(conversationId, request.title());
+    }
+
+    /**
+     * 更新会话的 RAG 开关（输入框「📚 RAG」开关 = 是否使用知识库检索，写回会话，刷新后保持上次选择）。
+     * 开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，无需手动选库；关闭则不使用 RAG。
+     *
+     * @param conversationId 会话 ID
+     * @param request        {enabled: true=开启 / false=关闭}
+     */
+    @PutMapping("/conversation/{conversationId}/rag")
+    public void updateRagEnabled(@PathVariable String conversationId, @RequestBody(required = false) RagEnabledRequest request) {
+        conversationService.updateRagEnabled(conversationId, (request == null) ? null : request.enabled());
+    }
+
+    /**
+     * 更新会话的智能规划开关（输入框「🧭 智能规划」开关写回，与 RAG 开关对称、拨动即持久化）。
+     * planner 与 agentId 互斥：会话已绑定智能体时开启规划会被拒绝（前端置灰，后端防御校验）。
+     *
+     * @param conversationId 会话 ID
+     * @param request        {enabled: true=开启规划模式 / false=普通对话}
+     */
+    @PutMapping("/conversation/{conversationId}/planner")
+    public void updatePlannerEnabled(@PathVariable String conversationId, @RequestBody(required = false) PlannerEnabledRequest request) {
+        conversationService.updatePlannerSwitch(conversationId, (request == null) ? null : request.enabled());
     }
 
     /**
@@ -102,7 +130,7 @@ public class ConversationController {
     public List<ConversationSummary> listConversations() {
         return conversationService.listConversations().stream()
                 .map(c -> new ConversationSummary(c.getId(), c.getTitle(), c.getUpdatedAt(),
-                        c.getAgentId(), c.getPlanner()))
+                        c.getAgentId(), c.getPlanner(), c.getRagEnabled()))
                 .toList();
     }
 

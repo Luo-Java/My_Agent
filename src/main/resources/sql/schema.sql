@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS conversation (
     agent_id   BIGINT       DEFAULT NULL               COMMENT '绑定的智能体ID，关联 agent.id（自增主键），为空表示默认助手',
     planner        TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否规划模式会话：1=动态规划器（运行时由 LLM 规划多智能体步骤），0=普通/智能体会话',
     agent_bind_source VARCHAR(16) DEFAULT NULL          COMMENT '智能体绑定来源：EXPLICIT=用户显式选择（保持粘住），CLARIFY=追问流程临时绑定（允许话题切换时解绑）；空=未绑定',
+    rag_enabled  TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '会话级 RAG 开关：1=每轮对话自动检索资料库（通用知识库 + 路由到智能体时其专属库）并把命中内容注入上下文；0=不使用 RAG（仅靠模型自身知识）',
     created_at DATETIME                                 COMMENT '会话创建时间',
     updated_at DATETIME                                 COMMENT '最后更新时间，用于会话列表倒序排序',
     summary           TEXT        DEFAULT NULL               COMMENT '较早对话的滚动摘要（长期记忆），超出最近窗口的历史由LLM压缩写入',
@@ -22,7 +23,6 @@ CREATE TABLE IF NOT EXISTS chat_message (
     content         TEXT                                 COMMENT '消息内容（用户提问或AI回复文本）',
     created_at      DATETIME                             COMMENT '消息写入时间（同一轮用户与助手相差纳秒级以保证顺序）',
     PRIMARY KEY (id),
-    INDEX idx_conversation (conversation_id),
     -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
     INDEX idx_conv_created (conversation_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '会话消息表：存储每个会话下的多轮对话明细';
@@ -45,18 +45,18 @@ CREATE TABLE IF NOT EXISTS agent (
     UNIQUE KEY uk_agent_code (agent_code)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '智能体表：可创建的各类 AI 角色，绑定到会话后决定对话人设';
 
--- 知识库表：每个智能体可维护一个专属知识库（agent_id 唯一）；agent_id 为 NULL 的是最外层全局知识库（所有对话通用）。
--- 注意：MySQL 唯一索引对 NULL 不生效，全局库唯一性由服务层（KbService.getOrCreateGlobal）保证。
+-- 知识库表：每个智能体可维护一个专属知识库（agent_id 唯一）；agent_id 为 NULL 的是全局知识库（「通用知识库」，可被任意会话的资料库选择器选用）。
 CREATE TABLE IF NOT EXISTS kb (
     id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '知识库ID',
     name        VARCHAR(128) NOT NULL                   COMMENT '知识库名称',
-    agent_id    BIGINT       DEFAULT NULL               COMMENT '归属智能体ID（关联 agent.id）；NULL=全局知识库（所有对话通用）',
+    agent_id    BIGINT       DEFAULT NULL               COMMENT '归属智能体ID（关联 agent.id）；NULL=全局知识库（可被任意会话选用）',
     description VARCHAR(512) DEFAULT NULL               COMMENT '知识库说明',
     doc_count   INT          NOT NULL DEFAULT 0         COMMENT '知识块数量（冗余，便于列表展示，由增删操作维护）',
+    chunk_strategy VARCHAR(20) NOT NULL DEFAULT 'recursive' COMMENT '默认分片策略 key：fixed/paragraph/recursive/markdown（新上传文件未指定时继承）',
+    chunk_overlap  INT          NOT NULL DEFAULT 60     COMMENT '默认相邻块重叠字符数（0=不重叠，默认60；新上传文件未指定时继承）',
     created_at  DATETIME                                 COMMENT '创建时间',
     updated_at  DATETIME                                 COMMENT '最后更新时间（含知识块变更）',
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_kb_agent (agent_id)
+    PRIMARY KEY (id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识库表：智能体专属库（agent_id 非空）+ 全局库（agent_id 为 NULL）';
 
 -- 知识块表：知识库的最小检索单元（一段文本 + 它的向量，向量由 Embedding API 生成，存 JSON float 数组）
@@ -70,3 +70,22 @@ CREATE TABLE IF NOT EXISTS kb_chunk (
     PRIMARY KEY (id),
     INDEX idx_kb (kb_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识块表：知识库内容的分块与向量存储';
+
+-- 知识库文件表：每个知识库维护的文件列表（文件是知识的上传与管理单元）
+-- file_name 与 kb_chunk.source 保持一致（同一库内文件名唯一），删除文件时按 kb_id+file_name 级联删除其知识块
+CREATE TABLE IF NOT EXISTS kb_file (
+    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '文件ID',
+    kb_id       BIGINT       NOT NULL                COMMENT '所属知识库ID（关联 kb.id）',
+    file_name   VARCHAR(200) NOT NULL                COMMENT '文件名（含扩展名，同一库内唯一，与 kb_chunk.source 一致）',
+    file_type   VARCHAR(20)  DEFAULT NULL            COMMENT '文件类型（扩展名小写，如 pdf/docx/xlsx/txt/md）',
+    chunk_strategy VARCHAR(20) NOT NULL DEFAULT 'recursive' COMMENT '分片策略 key：fixed/paragraph/recursive/markdown',
+    chunk_overlap INT          NOT NULL DEFAULT 60    COMMENT '相邻知识块重叠字符数（0=不重叠，默认60，供重新分片沿用）',
+    size_bytes  BIGINT       NOT NULL DEFAULT 0      COMMENT '文件大小（字节）',
+    chunk_count INT          NOT NULL DEFAULT 0      COMMENT '解析出的知识块数量（冗余，由上传/删块操作维护）',
+    raw_text    LONGTEXT     DEFAULT NULL            COMMENT '入库时的解析原文（用于不重传文件直接切换分片策略）',
+    created_at  DATETIME                              COMMENT '上传时间',
+    updated_at  DATETIME                              COMMENT '最后更新时间（同名重传时刷新）',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_kb_file (kb_id, file_name),
+    INDEX idx_kb_file_kb (kb_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识库文件表：每个知识库维护的文件列表（文件是知识的上传与管理单元）';

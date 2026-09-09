@@ -10,6 +10,7 @@ import java.time.LocalDateTime;
  * @param updatedAt 最近更新时间
  * @param agentId   绑定的智能体 ID（未绑定则为 null）
  * @param planner   是否规划模式会话（true=动态规划器）
+ * @param ragEnabled 会话级 RAG 开关（true=开启自动检索，false=不使用 RAG）
  */
-public record ConversationSummary(String id, String title, LocalDateTime updatedAt, Long agentId, Boolean planner) {
+public record ConversationSummary(String id, String title, LocalDateTime updatedAt, Long agentId, Boolean planner, Boolean ragEnabled) {
 }

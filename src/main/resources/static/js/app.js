@@ -101,15 +101,74 @@ createApp({
         // 随会话切换同步（规划会话默认勾选），发送时随请求写回会话（刷新后保持）。
         const planMode = ref(false);
 
+        // 输入框「📚 RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
+        // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
+        const ragEnabled = ref(false);
+
+        // ===== 多模态附件 =====
+        // 待发送的附件列表，每项 {file, previewUrl, caption, filename}。
+        // 选图后立刻 push 一项（previewUrl 用 URL.createObjectURL 走本地浏览零开销）；
+        // 发送时若 caption 仍为 null，先调 /api/chat/vision/describe 串行识别补齐，
+        // 再把 caption（纯文本）随 ChatRequest.attachments 发给后端，原始二进制不进会话存储。
+        // 上限 5 张 × 10MB（与后端 VisionProperties.maxImageBytes 对齐）；单次超过会拒绝发送。
+        const attachments = ref([]);
+        const imageInput = ref(null);  // hidden file input，用于 JS 触发文件选择
+        const MAX_ATTACHMENTS = 5;
+        const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+        function triggerImagePicker() {
+            if (loading.value) return;
+            if (imageInput.value) imageInput.value.click();
+        }
+        function onImagePicked(event) {
+            const files = event.target.files;
+            if (!files || !files.length) return;
+            const incoming = Array.from(files);
+            for (const f of incoming) {
+                if (attachments.value.length >= MAX_ATTACHMENTS) {
+                    alert(`最多 ${MAX_ATTACHMENTS} 张图片，后续未选择`);
+                    break;
+                }
+                if (!f.type || !f.type.startsWith('image/')) {
+                    alert(`跳过非图片文件：${f.name}`);
+                    continue;
+                }
+                if (f.size > MAX_ATTACHMENT_SIZE) {
+                    alert(`图片 ${f.name} 超过 ${(MAX_ATTACHMENT_SIZE / 1024 / 1024)}MB，已跳过`);
+                    continue;
+                }
+                attachments.value.push({
+                    file: f,
+                    previewUrl: URL.createObjectURL(f),
+                    caption: null,
+                    filename: f.name || 'image'
+                });
+            }
+            // 重置 input.value 以便重复选同一文件
+            event.target.value = '';
+        }
+        function removeAttachment(i) {
+            const a = attachments.value[i];
+            if (a && a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+            attachments.value.splice(i, 1);
+        }
+
         // 主区域视图：chat=聊天 | agents=智能体管理 | kbs=知识库管理
         const mainView = ref('chat');
 
         // ===== 知识库（RAG）状态 =====
         const kbs = ref([]);   // 知识库列表（全局库置顶；列表来自后端，含 docCount/agentId）
-        // 新建 / 重命名弹窗：mode=create 为某智能体建专属库；mode=rename 改名与说明
-        const kbModal = reactive({ open: false, mode: 'create', id: null, agentId: null, name: '', description: '', saving: false });
-        // 库详情视图：kb=当前库；chunks/total=知识块分页；source/text=添加知识表单
-        const kbDetail = reactive({ open: false, kb: null, chunks: [], total: 0, source: '', text: '', adding: false });
+        // 新建 / 重命名弹窗：mode=create 为某智能体建专属库；mode=rename 改设置（名称/说明/默认分片策略/默认重叠）
+        const kbModal = reactive({ open: false, mode: 'create', id: null, agentId: null, name: '', description: '',
+            chunkStrategy: 'recursive', chunkOverlap: 60, saving: false });
+        // 库详情视图：kb=当前库；chunks/total=知识块分页；files=已选待上传文件；uploading/msg=上传过程与结果
+        const kbFileInput = ref(null);
+        const kbDetail = reactive({
+            open: false, kb: null, chunks: [], total: 0, files: [], fileList: [],
+            uploading: false, drag: false, msg: '', msgOk: true,
+            strategies: [], uploadStrategy: 'recursive',
+            uploadOverlap: 60, defaultOverlap: 60,
+            rechunk: null   // { file, strategy, overlap, busy }：正在切换分片策略 / 重叠的文件
+        });
 
         // 尚无专属知识库的智能体（新建知识库下拉只列这些，一个智能体至多一个库）
         const availableAgents = computed(() =>
@@ -185,6 +244,51 @@ createApp({
             return !!(conv && conv.planner);
         });
 
+        // 当前会话是否开启 RAG（顶部 📚 徽标 / 输入框开关回显依据）
+        const currentRagOn = computed(() => {
+            const conv = conversations.value.find(c => c.id === currentId.value);
+            return !!(conv && conv.ragEnabled);
+        });
+
+        // 📚 RAG 开关变更 → 即时写回会话（纯开关，不选库），刷新后保持上次选择。
+        // 开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，由后端 KbService 决定目标库。
+        async function onRagEnabledChange() {
+            if (!currentId.value) return;
+            try {
+                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/rag', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: ragEnabled.value })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                // 同步侧边栏会话对象：顶部徽标即时更新、切走再切回也能回显
+                const conv = conversations.value.find(c => c.id === currentId.value);
+                if (conv) conv.ragEnabled = ragEnabled.value;
+            } catch (e) {
+                alert('保存 RAG 开关失败：' + e.message);
+            }
+        }
+
+        // 🧭 智能规划开关变更 → 即时写回会话（与 RAG 开关对称，拨动即持久化），刷新后保持上次选择。
+        // planner 与 agentId 互斥：绑定智能体的会话开关已置灰，后端另有防御校验拒绝越权开启。
+        async function onPlannerChange() {
+            if (!currentId.value) { planMode.value = false; return; }
+            try {
+                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/planner', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: planMode.value })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                // 同步侧边栏会话对象：顶部 🧭 徽标与会话列表「🧭 规划」标记即时更新
+                const conv = conversations.value.find(c => c.id === currentId.value);
+                if (conv) conv.planner = planMode.value;
+            } catch (e) {
+                planMode.value = !planMode.value;   // 保存失败回滚开关，避免 UI 与后端形态脱节
+                alert('保存智能规划开关失败：' + e.message);
+            }
+        }
+
         // 新建对话（总是创建新会话；无论当前是否已有会话）
         async function goChat() {
             mainView.value = 'chat';
@@ -230,11 +334,12 @@ createApp({
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled },
                     ...conversations.value
                 ];
                 input.value = '';
                 planMode.value = false; // 新建普通会话：规划开关默认关闭
+                ragEnabled.value = false;   // 新建会话默认关闭 RAG；需要时在输入框自行开启
                 mainView.value = 'chat';
                 scrollToBottom();
             } catch (e) {
@@ -255,11 +360,12 @@ createApp({
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled },
                     ...conversations.value
                 ];
                 input.value = '';
                 planMode.value = false; // 智能体会话不支持规划（planner 与 agentId 互斥），开关强制关闭
+                ragEnabled.value = false;   // 新会话默认关闭 RAG；需要时在输入框自行开启
                 agentView.open = false; // 从查看弹窗发起对话后关闭弹窗
                 mainView.value = 'chat'; // 切回聊天视图
                 scrollToBottom();
@@ -275,6 +381,8 @@ createApp({
             // 规划开关跟随会话形态：规划会话默认勾选（写回机制保证刷新后仍保持上次选择）
             const conv = conversations.value.find(c => c.id === id);
             planMode.value = !!(conv && conv.planner);
+            // RAG 开关跟随会话：上次的开关状态回显（false=关闭）
+            ragEnabled.value = !!(conv && conv.ragEnabled);
             try {
                 const resp = await fetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
                 if (resp.ok) {
@@ -549,15 +657,95 @@ createApp({
             return String(s).replace('T', ' ').slice(0, 16);
         }
 
-        // 打开「新建知识库」弹窗：预选第一个暂无库的智能体，名称自动填充
-        function openCreateKb() {
+        // 字节数转可读大小（B / KB / MB）
+        function fmtSize(n) {
+            const v = Number(n) || 0;
+            if (v < 1024) return v + ' B';
+            if (v < 1024 * 1024) return (v / 1024).toFixed(1).replace(/\.0$/, '') + ' KB';
+            return (v / 1024 / 1024).toFixed(2).replace(/\.?0+$/, '') + ' MB';
+        }
+
+        // 按文件类型给出图标（用于文件列表展示）
+        function typeIcon(type) {
+            const t = String(type || '').toLowerCase();
+            if (t === 'pdf') return '📕';
+            if (t === 'docx' || t === 'doc') return '📘';
+            if (t === 'xlsx' || t === 'xls' || t === 'csv') return '📗';
+            if (t === 'md' || t === 'markdown' || t === 'txt') return '📄';
+            return '🗂️';
+        }
+
+        // 分片策略：key → 展示名（未知 key 原样返回，兼容历史数据缺省 recursive 前的文件）
+        function strategyLabel(key) {
+            const hit = (kbDetail.strategies || []).find(s => s.key === key);
+            return hit ? hit.label : (key || 'recursive');
+        }
+
+        // 重叠候选值（0 = 不重叠；受后端 maxOverlap=200 约束，列表内均合法）
+        const overlapOptions = [0, 40, 60, 100, 150, 200];
+
+        // 重叠值 → 下拉选项文本
+        function overlapText(ov) {
+            const n = Number(ov);
+            return n === 0 ? '不重叠' : n + ' 字';
+        }
+
+        // 重叠值 → 文件行标签（null/空 = 老数据，视为「默认」）
+        function overlapLabel(ov) {
+            if (ov == null || ov === '') return '默认';
+            const n = Number(ov);
+            return n === 0 ? '不重叠' : n + ' 字';
+        }
+
+        // 拉取分片策略元数据与重叠默认值（key/label/desc + defaultOverlap），供设置弹窗与展示使用
+        async function loadChunkStrategies() {
+            try {
+                const resp = await fetch('/api/kb/chunk-strategies');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    kbDetail.strategies = (data && data.strategies) || [];
+                    if (data && data.defaultOverlap != null) {
+                        kbDetail.defaultOverlap = data.defaultOverlap;
+                        kbDetail.uploadOverlap = data.defaultOverlap;
+                    }
+                    if (kbDetail.strategies.length && !kbDetail.strategies.some(s => s.key === kbDetail.uploadStrategy)) {
+                        kbDetail.uploadStrategy = kbDetail.strategies[0].key;
+                    }
+                }
+            } catch (e) { /* 忽略：保持默认策略 */ }
+        }
+
+        // 确保策略元数据已加载（打开设置弹窗 / 库详情时调用一次；接口失败则保持默认）
+        async function ensureChunkStrategies() {
+            if (!kbDetail.strategies.length) await loadChunkStrategies();
+        }
+
+        // 用当前库（kbDetail.kb）的设置刷新「上传默认分片 / 默认重叠」展示值（kb 来自列表，含 chunkStrategy/chunkOverlap）
+        function syncKbDefaults() {
+            const kb = kbDetail.kb;
+            if (!kb) return;
+            if (kb.chunkStrategy && kbDetail.strategies.some(s => s.key === kb.chunkStrategy)) {
+                kbDetail.uploadStrategy = kb.chunkStrategy;
+            }
+            if (kb.chunkOverlap != null) kbDetail.uploadOverlap = Number(kb.chunkOverlap);
+        }
+
+        // 打开「新建知识库」弹窗：预选第一个暂无库的智能体，名称自动填充（分片配置取后端默认）
+        async function openCreateKb() {
+            await ensureChunkStrategies();
             const first = availableAgents.value[0];
-            Object.assign(kbModal, { open: true, mode: 'create', id: null, agentId: first ? first.id : null, name: '', description: '', saving: false });
+            Object.assign(kbModal, { open: true, mode: 'create', id: null, agentId: first ? first.id : null, name: '', description: '',
+                chunkStrategy: 'recursive', chunkOverlap: kbDetail.defaultOverlap, saving: false });
             autoKbName();
         }
 
-        function openRenameKb(kb) {
-            Object.assign(kbModal, { open: true, mode: 'rename', id: kb.id, agentId: kb.agentId, name: kb.name, description: kb.description || '', saving: false });
+        async function openRenameKb(kb) {
+            await ensureChunkStrategies();
+            Object.assign(kbModal, { open: true, mode: 'rename', id: kb.id, agentId: kb.agentId,
+                name: kb.name, description: kb.description || '',
+                chunkStrategy: kb.chunkStrategy || 'recursive',
+                chunkOverlap: kb.chunkOverlap != null ? Number(kb.chunkOverlap) : kbDetail.defaultOverlap,
+                saving: false });
         }
 
         // 切换归属智能体后自动带出默认库名
@@ -582,7 +770,9 @@ createApp({
                     body: JSON.stringify({
                         name: kbModal.name,
                         description: kbModal.description || null,
-                        agentId: kbModal.mode === 'create' ? kbModal.agentId : null
+                        agentId: kbModal.mode === 'create' ? kbModal.agentId : null,
+                        chunkStrategy: kbModal.chunkStrategy || 'recursive',
+                        chunkOverlap: kbModal.chunkOverlap != null ? kbModal.chunkOverlap : kbDetail.defaultOverlap
                     })
                 });
                 if (!resp.ok) {
@@ -593,8 +783,11 @@ createApp({
                 const saved = await resp.json();
                 kbModal.open = false;
                 await loadKbs();
-                // 详情视图打开时同步库名（改名的正是当前详情库）
-                if (kbDetail.open && kbDetail.kb && kbDetail.kb.id === saved.id) kbDetail.kb = saved;
+                // 详情视图打开时同步库对象（改名/默认分片配置可能正属当前详情库），并刷新上传默认展示
+                if (kbDetail.open && kbDetail.kb && kbDetail.kb.id === saved.id) {
+                    kbDetail.kb = saved;
+                    syncKbDefaults();
+                }
             } catch (e) {
                 alert('保存失败：' + e.message);
             } finally {
@@ -619,15 +812,107 @@ createApp({
             }
         }
 
-        // 打开库详情（知识块列表态清零后加载第一页）
+        // 打开库详情（文件列表与知识块列表态清零后加载）
         async function openKbDetail(kb) {
             kbDetail.kb = kb;
             kbDetail.chunks = [];
             kbDetail.total = 0;
-            kbDetail.source = '';
-            kbDetail.text = '';
+            kbDetail.files = [];
+            kbDetail.fileList = [];
+            kbDetail.uploading = false;
+            kbDetail.msg = '';
+            kbDetail.rechunk = null;
             kbDetail.open = true;
+            await loadChunkStrategies();
+            syncKbDefaults();      // 上传按该库默认分片策略 / 重叠执行（知识库设置）
+            await loadFiles();
             await loadChunks(false);
+        }
+
+        // 加载该库已登记的文件列表
+        async function loadFiles() {
+            if (!kbDetail.kb) return;
+            try {
+                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files');
+                if (resp.ok) kbDetail.fileList = (await resp.json()) || [];
+            } catch (e) { /* 忽略 */ }
+        }
+
+        // 删除库内文件（连带删除其全部知识块）
+        async function deleteKbFile(f) {
+            if (!f || !f.id) return;
+            const tip = '确定删除文件「' + f.fileName + '」及其 ' + (f.chunkCount || 0)
+                    + ' 个知识块吗？\n删除后对话将不再检索到该文件的内容，且无法恢复。';
+            if (!confirm(tip)) return;
+            try {
+                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files/' + f.id, { method: 'DELETE' });
+                let data = null;
+                try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
+                if (!resp.ok) {
+                    const msg = data && data.message ? data.message : ('HTTP ' + resp.status);
+                    throw new Error(msg);
+                }
+                kbDetail.fileList = kbDetail.fileList.filter(x => x.id !== f.id);
+                const removed = (data && data.removed) || 0;
+                if (removed > 0) {
+                    kbDetail.total = Math.max(0, kbDetail.total - removed);
+                    await loadChunks(false);   // 分页数据可能已被删空，刷新第一页
+                }
+                if (kbDetail.kb && kbDetail.kb.docCount) {
+                    kbDetail.kb.docCount = Math.max(0, (kbDetail.kb.docCount || 0) - removed);
+                }
+                await loadKbs();               // 同步卡片上的知识块计数
+            } catch (e) {
+                alert('删除失败：' + e.message);
+            }
+        }
+
+        // 打开某文件的「重新分片」交互（在文件行下展开策略 + 重叠选择条）
+        function openRechunk(f) {
+            kbDetail.rechunk = {
+                file: f,
+                strategy: f.chunkStrategy || kbDetail.uploadStrategy,
+                overlap: f.chunkOverlap != null ? f.chunkOverlap : kbDetail.defaultOverlap,
+                busy: false
+            };
+        }
+
+        // 确认重新分片：按所选新策略 + 重叠重切该文件（读后端保存的原文，无需重传）
+        async function doRechunk() {
+            const r = kbDetail.rechunk;
+            if (!r || !r.file || r.busy) return;
+            const curOv = r.file.chunkOverlap != null ? r.file.chunkOverlap : kbDetail.defaultOverlap;
+            const newOv = Number(r.overlap);
+            if (r.strategy === (r.file.chunkStrategy || 'recursive') && newOv === Number(curOv)) {
+                alert('该文件当前已是「' + strategyLabel(r.strategy) + '」分片、重叠 ' + overlapText(curOv) + '，无需重复操作');
+                return;
+            }
+            r.busy = true;
+            try {
+                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files/' + r.file.id + '/rechunk', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ strategy: r.strategy, overlap: newOv })
+                });
+                let data = null;
+                try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
+                if (!resp.ok) {
+                    const msg = data && data.message ? data.message : ('HTTP ' + resp.status);
+                    throw new Error(msg);
+                }
+                kbDetail.msgOk = true;
+                kbDetail.msg = '文件「' + r.file.fileName + '」已按「' + strategyLabel(r.strategy) + '」分片、重叠 '
+                        + overlapText(data && data.chunkOverlap != null ? data.chunkOverlap : newOv)
+                        + ' 重新切块，现有 ' + (data && data.chunkCount != null ? data.chunkCount : '') + ' 个知识块';
+                kbDetail.rechunk = null;
+                await loadFiles();       // 刷新策略标签与块数
+                await loadChunks(false); // 刷新右侧知识块列表
+                await loadKbs();         // 同步卡片计数
+            } catch (e) {
+                kbDetail.msgOk = false;
+                kbDetail.msg = '重新分片失败：' + e.message;
+                kbDetail.rechunk = null;
+            }
         }
 
         // 加载知识块：append=false 覆盖当前页（从第 0 块），append=true 追加（加载更多）
@@ -648,40 +933,83 @@ createApp({
             loadChunks(true);
         }
 
-        // 预计分块数（与服务端分块策略一致：按 600 字粗估）
-        const estimateBlocks = computed(() => {
-            const t = (kbDetail.text || '').trim();
-            return t ? Math.max(1, Math.ceil(t.length / 600)) : 0;
-        });
+        // ===== 文件上传导入知识 =====
 
-        // 添加知识：整段文本交后端分块 + 向量化入库
-        async function addChunks() {
-            const text = (kbDetail.text || '').trim();
-            if (!text || kbDetail.adding) return;
-            kbDetail.adding = true;
+        // 点击上传区 → 触发隐藏的 file input
+        function pickFiles() {
+            if (!kbDetail.uploading && kbFileInput.value) kbFileInput.value.click();
+        }
+
+        // 拖拽释放：接收 dataTransfer.files
+        function onDropFiles(e) {
+            kbDetail.drag = false;
+            if (e && e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+        }
+
+        // 文件选择框 change：合并到待上传列表（同名去重，避免重复导入）
+        function onFilesChosen(e) {
+            if (e && e.target && e.target.files) addFiles(e.target.files);
+            if (e && e.target) e.target.value = '';   // 允许再次选择同一文件
+        }
+
+        function addFiles(fileList) {
+            if (kbDetail.uploading) return;
+            for (const f of Array.from(fileList || [])) {
+                if (!kbDetail.files.some(x => x.name === f.name && x.size === f.size)) {
+                    kbDetail.files.push(f);
+                }
+            }
+            kbDetail.msg = '';
+        }
+
+        function removeFile(idx) {
+            kbDetail.files.splice(idx, 1);
+        }
+
+        // 上传全部已选文件：不指定分片策略与重叠，后端按该库「知识库设置」的默认配置切块入库
+        async function uploadFiles() {
+            if (kbDetail.uploading || kbDetail.files.length === 0 || !kbDetail.kb) return;
+            kbDetail.uploading = true;
+            kbDetail.msg = '';
             try {
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/chunks', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ source: (kbDetail.source || '').trim() || null, texts: [text] })
-                });
+                const fd = new FormData();
+                for (const f of kbDetail.files) fd.append('files', f);
+                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/upload', { method: 'POST', body: fd });
+                let data = null;
+                try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
                 if (!resp.ok) {
-                    let msg = 'HTTP ' + resp.status;
-                    try { const e = await resp.json(); if (e && e.message) msg = e.message; } catch (_) { /* 忽略 */ }
+                    const msg = data && data.message ? data.message : ('HTTP ' + resp.status);
                     throw new Error(msg);
                 }
-                const d = await resp.json();
-                kbDetail.text = '';
-                kbDetail.source = '';
+                const list = (data && data.results) || [];
+                const okList = list.filter(r => r.status === 'ok');
+                const errList = list.filter(r => r.status === 'error');
+                let totalAdded = 0;
+                for (const r of okList) totalAdded += r.added || 0;
+                let text = '';
+                if (okList.length) text += '成功导入 ' + okList.length + ' 个文件，新增 ' + totalAdded + ' 个知识块';
+                if (errList.length) {
+                    text += (text ? '；' : '') + errList.length + ' 个文件失败：'
+                            + errList.map(r => r.fileName + (r.message ? '（' + r.message + '）' : '')).join('；');
+                }
+                kbDetail.msgOk = errList.length === 0;
+                kbDetail.msg = text || '没有处理任何文件';
+                kbDetail.files = [];
+                await loadFiles();     // 刷新库内文件列表（登记的文件与块数）
                 await loadChunks(false);
                 await loadKbs();   // 同步卡片上的知识块计数
-                if (kbDetail.kb && d && typeof d.added === 'number') {
-                    kbDetail.kb.docCount = (kbDetail.kb.docCount || 0) + d.added;
+                if (kbDetail.kb) {
+                    // 成功后刷新库计数（后端返回 updated 库信息最准，这里按结果累加并随后续 loadKbs 校正）
+                    const old = kbDetail.kb.docCount || 0;
+                    const fresh = kbs.value.find(k => k.id === kbDetail.kb.id);
+                    if (fresh) kbDetail.kb.docCount = fresh.docCount;
+                    else kbDetail.kb.docCount = old + totalAdded;
                 }
             } catch (e) {
-                alert('添加失败：' + e.message);
+                kbDetail.msgOk = false;
+                kbDetail.msg = '上传失败：' + e.message;
             } finally {
-                kbDetail.adding = false;
+                kbDetail.uploading = false;
             }
         }
 
@@ -694,6 +1022,7 @@ createApp({
                 kbDetail.total = Math.max(0, kbDetail.total - 1);
                 if (kbDetail.kb && kbDetail.kb.docCount) kbDetail.kb.docCount = Math.max(0, kbDetail.kb.docCount - 1);
                 await loadKbs();
+                await loadFiles();   // 同步所属文件的分块计数
             } catch (e) {
                 alert('删除失败：' + e.message);
             }
@@ -702,11 +1031,57 @@ createApp({
         // ===== 发送消息（流式） =====
         async function send() {
             const text = input.value.trim();
-            if (!text || loading.value) return;
+            // 允许「只有图片没有文字」的场景（如「这张图是什么」）；两者都空才拒绝
+            if (loading.value) return;
+            if (!text && attachments.value.length === 0) return;
             if (!currentId.value) await newConversation();
             const convId = currentId.value;
 
-            messages.value.push({ role: 'user', content: text, html: '', version: 0 });
+            // 1) 若有未识别图片，先串行上传 /api/chat/vision/describe 拿 caption
+            //    （不并发：避免请求次序错乱、单图失败导致整批混乱；超时仍能保证至少已识别部分可用）
+            const pending = attachments.value.filter(a => !a.caption);
+            if (pending.length) {
+                try {
+                    const fd = new FormData();
+                    pending.forEach(a => fd.append('files', a.file));
+                    const resp = await fetch('/api/chat/vision/describe', { method: 'POST', body: fd });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    const data = await resp.json();
+                    const captions = data.captions || [];
+                    const filenames = data.filenames || [];
+                    let pi = 0;
+                    for (const a of attachments.value) {
+                        if (a.caption == null && pi < captions.length) {
+                            a.caption = captions[pi];
+                            if ((!a.filename || a.filename === 'image') && filenames[pi]) {
+                                a.filename = filenames[pi];
+                            }
+                            pi++;
+                        }
+                    }
+                } catch (e) {
+                    alert('图片识别失败：' + e.message + '\n已取消本次发送，请稍后重试');
+                    return;
+                }
+            }
+
+            // 2) 组装本轮消息：用户原文 + 已识别附件 caption（纯文本），附预览用于消息气泡展示
+            const userText = text;
+            const attMeta = attachments.value
+                .filter(a => a.caption != null)
+                .map(a => ({
+                    type: 'image',
+                    caption: a.caption,
+                    filename: a.filename || 'image',
+                    previewUrl: a.previewUrl
+                }));
+            // 用户气泡显示：文本优先；若只有图片则显示「[图片 ×N]」+ 缩略图（attachments 渲染时使用）
+            const displayContent = userText || (attMeta.length ? `[图片 ×${attMeta.length}]` : '');
+
+            messages.value.push({
+                role: 'user', content: displayContent, html: '', version: 0,
+                attachments: attMeta.length ? attMeta : undefined
+            });
             // steps：本次运行的执行过程（规划与逐步进展）。仅前端临时展示，后端不写入会话记忆，
             // 因此刷新页面或重新打开会话时不会出现（历史消息只有最终结果）。
             messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true });
@@ -720,7 +1095,13 @@ createApp({
                 const resp = await fetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ conversationId: convId, message: text, planner: planMode.value })
+                    body: JSON.stringify({
+                        conversationId: convId,
+                        message: userText,
+                        planner: planMode.value,
+                        // 发给后端的 attachments 不带 previewUrl（只服务端用 caption/filename/type）
+                        attachments: attMeta.length ? attMeta.map(a => ({ type: a.type, caption: a.caption, filename: a.filename })) : undefined
+                    })
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
@@ -800,6 +1181,11 @@ createApp({
             } finally {
                 loading.value = false;
                 scrollToBottom();
+                // 释放预览 URL 并清空待发送附件（用户消息气泡已带 previewUrl 引用，可继续显示）
+                for (const a of attachments.value) {
+                    if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+                }
+                attachments.value = [];
             }
         }
 
@@ -810,11 +1196,14 @@ createApp({
         });
 
         return {
-            conversations, agents, messages, input, loading, currentId, planMode,
+            conversations, agents, messages, input, loading, currentId, planMode, ragEnabled,
+            onRagEnabledChange, onPlannerChange,
+            // 多模态附件
+            attachments, imageInput, triggerImagePicker, onImagePicked, removeAttachment,
             editingId, editingTitle, agentModal, agentView,
-            currentAgentName, currentAgentIcon, currentAgentId, currentPlanner,
+            currentAgentName, currentAgentIcon, currentAgentId, currentPlanner, currentRagOn,
             mainView, iconPresets,
-            kbs, kbModal, kbDetail, availableAgents, estimateBlocks,
+            kbs, kbModal, kbDetail, availableAgents, kbFileInput,
             send, newConversation, startAgentChat, selectConversation,
             startEdit, commitEdit, deleteConversation,
             goChat, goAgents, goKbs,
@@ -822,8 +1211,12 @@ createApp({
             viewAgent, genPrompt, autoFillCode,
             addParam, removeParam, parseParamSchema,
             agentName, agentIcon, renderMd, scroll,
-            loadKbs, kbIconStyle, fmtTime, openCreateKb, openRenameKb, autoKbName,
-            saveKb, deleteKb, openKbDetail, loadMoreChunks, addChunks, deleteChunk
+            loadKbs, kbIconStyle, fmtTime, fmtSize, typeIcon, openCreateKb, openRenameKb, autoKbName,
+            saveKb, deleteKb, openKbDetail, loadMoreChunks, deleteChunk,
+            loadFiles, deleteKbFile,
+            strategyLabel, overlapOptions, overlapText, overlapLabel,
+            openRechunk, doRechunk,
+            pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles
         };
     }
 }).mount('#app');

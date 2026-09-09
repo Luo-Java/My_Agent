@@ -38,6 +38,16 @@ spring:
         # 通义千问兼容模式的向量模型（text-embedding-v3/v2/v1）；OpenAI 官方用 text-embedding-3-small
         model: text-embedding-v3
 
+  # 多模态视觉识别：图片上传后由 VisionService 单独调此模型把图片转成文本 caption，再注入对话上下文。
+  # 复用 spring.ai.openai.api-key / base-url，不重复配置 key 与端点。
+  # dashscope OpenAI 兼容 /chat/completions 端点支持的模型：qwen-vl-plus（通用）/ qwen-vl-ocr（OCR 专用）等。
+#  agent.vision.model 默认 qwen-vl-plus（见 VisionProperties），可通过如下键覆盖：
+#  agent:
+#    vision:
+#      model: qwen-vl-plus
+#      max-image-bytes: 10485760   # 单图 10MB 上限，超出返回「图片过大」占位
+#      timeout-seconds: 30
+
 # MyBatis-Plus 配置
 mybatis-plus:
   mapper-locations: classpath*:/mapper/**/*.xml
@@ -47,6 +57,18 @@ mybatis-plus:
   global-config:
     db-config:
       id-type: auto
+
+# Chroma 向量库（加速副本，与 MySQL 双写留存；服务不可用时自动降级 MySQL 余弦检索）
+chroma:
+  base-url: http://127.0.0.1:8000
+  collection-name: kb_chunks
+
+# 接口访问控制（可选）：留空 = 不校验（本地开发默认，行为与原先一致）；
+# 配置后所有 /api/** 请求必须带 X-Api-Key 头且与值一致才放行（静态前端页面不受影响），
+# 用于把服务暴露到局域网/公网时防他人直接调用 SQL 工具或白嫖 LLM Key。
+# 推荐通过环境变量注入：set APP_API_KEY=your-key（PowerShell）/ export APP_API_KEY=your-key（bash）
+app:
+  api-key: ${APP_API_KEY:}
 
 server:
   port: 8080

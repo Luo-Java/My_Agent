@@ -5,12 +5,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.dto.UpsertAgentRequest;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
+import org.luo.entity.KbFile;
 import org.luo.entity.KnowledgeBase;
 import org.luo.entity.KnowledgeChunk;
 import org.luo.exception.AiBusinessException;
 import org.luo.exception.AiErrorCode;
 import org.luo.mapper.AgentMapper;
 import org.luo.mapper.ConversationMapper;
+import org.luo.mapper.KbFileMapper;
 import org.luo.mapper.KnowledgeBaseMapper;
 import org.luo.mapper.KnowledgeChunkMapper;
 import org.springframework.stereotype.Service;
@@ -38,16 +40,19 @@ public class AgentService {
 
     private final AgentMapper agentMapper;
     private final ConversationMapper conversationMapper;
-    /** 以下两个 Mapper 仅用于删除智能体时级联清理其专属知识库（避免引入 service 循环依赖，直接操作数据层）。 */
+    /** 以下三个 Mapper 仅用于删除智能体时级联清理其专属知识库（避免引入 service 循环依赖，直接操作数据层）。 */
     private final KnowledgeBaseMapper kbMapper;
     private final KnowledgeChunkMapper chunkMapper;
+    private final KbFileMapper fileMapper;
 
     public AgentService(AgentMapper agentMapper, ConversationMapper conversationMapper,
-                        KnowledgeBaseMapper kbMapper, KnowledgeChunkMapper chunkMapper) {
+                        KnowledgeBaseMapper kbMapper, KnowledgeChunkMapper chunkMapper,
+                        KbFileMapper fileMapper) {
         this.agentMapper = agentMapper;
         this.conversationMapper = conversationMapper;
         this.kbMapper = kbMapper;
         this.chunkMapper = chunkMapper;
+        this.fileMapper = fileMapper;
     }
 
     /**
@@ -119,10 +124,11 @@ public class AgentService {
             c.setAgentBindSource(null);   // 一并清除来源标记，避免残留 EXPLICIT/CLARIFY 指向已删除的 agent
             conversationMapper.updateById(c);
         }
-        // 级联清理专属知识库（删除逻辑与 KbService.deleteKb 保持一致：先删块再删库）
+        // 级联清理专属知识库（删除逻辑与 KbService.deleteKb 保持一致：先删块、再删文件登记、最后删库）
         KnowledgeBase kb = kbMapper.selectOne(new QueryWrapper<KnowledgeBase>().eq("agent_id", id).last("LIMIT 1"));
         if (kb != null) {
             chunkMapper.delete(new QueryWrapper<KnowledgeChunk>().eq("kb_id", kb.getId()));
+            fileMapper.delete(new QueryWrapper<KbFile>().eq("kb_id", kb.getId()));
             kbMapper.deleteById(kb.getId());
             log.info("删除智能体：级联删除其专属知识库 id={}（{} 个知识块）", kb.getId(), kb.getDocCount());
         }

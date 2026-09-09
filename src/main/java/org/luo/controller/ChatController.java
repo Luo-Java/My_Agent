@@ -1,5 +1,6 @@
 package org.luo.controller;
 
+import org.luo.dto.ChatAttachment;
 import org.luo.dto.ChatRequest;
 import org.luo.dto.StreamEvent;
 import org.luo.service.ChatService;
@@ -13,6 +14,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -42,7 +44,8 @@ public class ChatController {
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
         String conversationId = resolveConversationId(request.conversationId());
-        String reply = chatService.chat(conversationId, request.message(), request.planner());
+        String composed = composeWithAttachments(request.message(), request.attachments());
+        String reply = chatService.chat(conversationId, composed, request.planner());
         return Map.of("content", reply);
     }
 
@@ -56,14 +59,15 @@ public class ChatController {
      *       不属于消息正文、不写入会话记忆，刷新会话后不再出现。</li>
      * </ul>
      *
-     * @param request 会话 ID（可空，空则用默认会话）+ 用户消息
+     * @param request 会话 ID（可空，空则用默认会话）+ 用户消息（可带 attachments）
      * @return SSE 事件流
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@RequestBody ChatRequest request) {
         SseEmitter emitter = new SseEmitter(0L);
         String conversationId = resolveConversationId(request.conversationId());
-        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(), request.planner());
+        String composed = composeWithAttachments(request.message(), request.attachments());
+        Flux<StreamEvent> flux = chatService.stream(conversationId, composed, request.planner());
 
         Disposable subscription = flux.doOnNext(event -> {
                     try {
@@ -84,6 +88,29 @@ public class ChatController {
         emitter.onCompletion(subscription::dispose);
         emitter.onTimeout(subscription::dispose);
         return emitter;
+    }
+
+    /**
+     * 把附件 caption 拼到用户消息前面（仅当轮注入，不进会话记忆；详见 {@link ChatAttachment}）。
+     * 这样下游 ChatService / ChatComposer / RoundHandler 全链路零改动，附件概念只留在 controller 层。
+     * <p>
+     * 拼接格式：先列所有 caption，再附用户原文，让 LLM 先看「素材」再回答。
+     */
+    private String composeWithAttachments(String message, List<ChatAttachment> attachments) {
+        if (message == null) message = "";
+        if (attachments == null || attachments.isEmpty()) return message;
+        StringBuilder sb = new StringBuilder(message.length() + 256);
+        sb.append("【以下为用户上传的图片识别内容，仅作为本轮参考，不写入长期记忆】\n");
+        for (int i = 0; i < attachments.size(); i++) {
+            ChatAttachment a = attachments.get(i);
+            sb.append("图片").append(i + 1);
+            if (a.filename() != null && !a.filename().isBlank()) {
+                sb.append("（").append(a.filename()).append("）");
+            }
+            sb.append("：\n").append(a.caption() == null ? "" : a.caption()).append("\n\n");
+        }
+        sb.append("【用户消息】\n").append(message);
+        return sb.toString();
     }
 
     /** 会话 ID 为空时回退到默认会话，避免前端首次对话未建会话。 */

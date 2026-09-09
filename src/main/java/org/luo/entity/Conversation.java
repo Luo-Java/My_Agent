@@ -26,11 +26,15 @@ public class Conversation {
      */
     private Boolean planner;
 
-    /**
-     * 智能体绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；
-     * CLARIFY=追问流程临时绑定（用户转向别的话题时自动解绑）；为空表示未绑定。
-     */
+    /** 智能体绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定（用户转向别的话题时自动解绑）；为空表示未绑定。 */
     private String agentBindSource;
+
+    /**
+     * 会话级 RAG 开关（纯开关，不选库）：true=每轮对话自动检索资料库——目标库 =「通用知识库（全局）」
+     * + 本轮路由/绑定到的智能体的专属库（存在才查），多库命中合并注入；false = 不检索（不使用 RAG）。
+     * 由前端输入框「📚 RAG」开关维护，发送时随请求覆盖写回。库/智能体被删除后检索侧查不到库自动降级。
+     */
+    private Boolean ragEnabled;
 
     /** 较早对话的滚动摘要（长期记忆），超出最近窗口的历史会被 LLM 压缩进这里。 */
     private String summary;

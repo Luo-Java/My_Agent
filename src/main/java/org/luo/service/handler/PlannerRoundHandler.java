@@ -152,7 +152,9 @@ public class PlannerRoundHandler implements RoundHandler {
                 // 已确认参数只在第一步注入（后续步骤以上一步产物为输入，无关参数只会造成干扰）；
                 // 最后一步追加近期窗口历史，保持与单智能体对话一致的上下文连贯性。
                 String system = composer.applyRealtimeRule(composer.buildSystemPrompt(s.agent())
-                        + composer.buildKbContext(s.agent(), userInput)
+                        // 知识库检索跟随会话级 RAG 开关：开启后自动查「全局库 + 本步骤 agent 的专属库」，
+                        // 未开启则不检索（用户选择的「纯开关 + 自动多库」语义，见 KbSearchService.buildKbContext）
+                        + composer.buildKbContext(composer.ragOn(conv), s.agent(), userInput)
                         + composer.buildLongTermMemoryText(conv)
                         + (i == 0 && paramBlock != null ? paramBlock : "")
                         + (isLast && !historyContext.isBlank() ? historyContext : ""));

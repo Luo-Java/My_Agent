@@ -405,6 +405,91 @@ header {
     background: var(--panel);
 }
 
+/* ===== 多模态附件预览区：紧贴文本框上方，缩略图横排，识别中显示加载蒙层 ===== */
+.input-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 4px 2px 0;
+}
+.img-thumb {
+    position: relative;
+    width: 72px;
+    height: 72px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: #f3f4f6;
+    flex-shrink: 0;
+}
+.img-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.img-thumb-del {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 20px;
+    height: 20px;
+    line-height: 18px;
+    text-align: center;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, .55);
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0;
+}
+.img-thumb-del:hover { background: rgba(220, 38, 38, .85); }
+.img-thumb-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, .45);
+    color: #fff;
+    font-size: 12px;
+    letter-spacing: 0;
+    pointer-events: none;
+}
+
+/* 用户消息气泡内的附件缩略图：左对齐横排，超出换行，不超过消息气泡宽度 */
+.msg-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 6px;
+}
+.msg-attach-thumb {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: #f3f4f6;
+}
+.user-msg { display: flex; flex-direction: column; align-items: flex-end; }
+
+/* 图片按钮：胶囊样式，融入 input-foot 一行（与开关同高），主色描边示意「可点击」 */
+.attach-btn {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s ease;
+    line-height: 1;
+}
+.attach-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.attach-btn:disabled { opacity: .45; cursor: not-allowed; }
+
 /* 输入区第一行：文本域 + 发送按钮 */
 .input-row {
     display: flex;
@@ -489,6 +574,50 @@ header {
 .planner-toggle.disabled:hover { border-color: var(--border); background: #fff; }
 
 .input-hint { font-size: 12px; color: var(--text-soft); }
+
+/* 📚 RAG 开关：iOS 滑块胶囊（结构同「智能规划」，绿色主题标识检索增强）。
+   开启后每轮自动检索「通用知识库 + 路由智能体专属库」，命中内容注入上下文作回答依据 */
+.rag-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 12px 4px 10px;
+    border-radius: 999px;
+    border: 1.5px solid var(--border);
+    background: #fff;
+    transition: background .2s, color .2s, border-color .2s, box-shadow .2s;
+}
+.rag-toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    pointer-events: none;
+}
+.rag-toggle input:focus-visible + .toggle-switch { box-shadow: 0 0 0 3px rgba(16, 185, 129, .35); }
+.rag-toggle:hover { border-color: #10b981; background: rgba(16, 185, 129, .06); }
+.rag-toggle.on {
+    background: #10b981;
+    border-color: #10b981;
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 0 2px 10px rgba(16, 185, 129, .4);
+}
+.rag-toggle.on .toggle-switch { background: rgba(255, 255, 255, .4); }
+.rag-toggle.on .toggle-switch::after { left: 16px; }
+.toggle-text { font-size: 13px; line-height: 1; }
+
+/* 顶部 RAG 徽标（绿色系，与智能体蓝 / 规划紫区分） */
+.rag-badge {
+    color: #0f7a5f;
+    background: rgba(16, 185, 129, .14);
+}
 
 textarea {
     flex: 1;
@@ -1305,6 +1434,115 @@ button {
 .kb-add-foot .btn-primary { padding: 8px 18px; font-size: 13px; border: none; cursor: pointer; }
 .kb-add-foot .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
 .kb-add-foot .field-hint { margin: 0; }
+
+/* ===== 知识库：文件上传区（替代手动粘贴添加知识块） ===== */
+.kb-upload-zone {
+    border: 1.5px dashed var(--border);
+    border-radius: 12px;
+    padding: 22px 12px;
+    text-align: center;
+    cursor: pointer;
+    background: #fbfcfe;
+    transition: border-color .2s, background .2s;
+    user-select: none;
+}
+.kb-upload-zone:hover,
+.kb-upload-zone.drag { border-color: var(--primary); background: var(--primary-soft); }
+.kb-upload-icon { font-size: 30px; line-height: 1.2; }
+.kb-upload-main { margin-top: 6px; font-size: 13px; font-weight: 500; color: var(--text); }
+.kb-upload-exts { margin-top: 4px; font-size: 12px; color: var(--text-soft); }
+
+/* 已选文件列表 */
+.kb-files { display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto; }
+.kb-file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+    font-size: 12.5px;
+}
+.kb-file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.kb-file-size { color: var(--text-soft); flex: none; }
+.kb-file-del { flex: none; padding: 0 4px; }
+.kb-file-rechunk { flex: none; padding: 0 5px; font-size: 12px; }
+
+/* 库内文件列表（kb_file 登记的文件：上传/删除的管理单元） */
+.kb-empty-tip { font-size: 12.5px; color: var(--text-soft); padding: 10px 2px; line-height: 1.6; }
+.kb-file-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+    font-size: 13px;
+}
+.kb-file-ico { font-size: 18px; flex: none; }
+.kb-file-meta { font-size: 11.5px; color: var(--text-soft); margin-top: 2px; }
+.kb-upload-divider {
+    margin: 12px 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.kb-upload-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* 分片策略选择（知识库设置弹窗 + 重新分片确认条共用）；上传区现跟随库默认，仅作展示 */
+.kb-upload-strategy {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+.kb-strategy-select {
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12.5px;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+    max-width: 220px;
+}
+.kb-overlap-select { max-width: 110px; }
+
+/* 知识库设置弹窗：默认分片策略 / 重叠下拉占满整行；详情头设置按钮紧凑 */
+.kb-settings-select { width: 100%; box-sizing: border-box; padding: 7px 10px; font-size: 13px; }
+.kb-settings-select.kb-overlap-select { max-width: 110px; }
+.kb-detail-set { flex: none; margin: 0 4px; }
+.kb-rechunk-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px dashed var(--primary);
+    background: var(--primary-soft);
+    border-radius: 8px;
+    font-size: 12.5px;
+}
+.kb-rechunk-bar .field-hint { margin: 0; }
+.btn-sm { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
+
+/* 上传结果汇总提示 */
+.kb-msg {
+    font-size: 12.5px;
+    line-height: 1.5;
+    padding: 8px 10px;
+    border-radius: 8px;
+    word-break: break-all;
+}
+.kb-msg.ok { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+.kb-msg.err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
 
 .kb-chunk-list {
     flex: 1;

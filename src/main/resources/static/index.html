@@ -27,7 +27,7 @@
             </button>
         </div>
 
-        <!-- 知识库入口（RAG：全局库所有对话通用 + 每个智能体一个专属库） -->
+        <!-- 知识库入口（RAG：会话开启 📚 RAG 开关后自动检索通用知识库 + 路由智能体的专属库） -->
         <div class="sidebar-section kb-section">
             <button class="agent-entry" @click="goKbs" :class="{ active: mainView === 'kbs' }">
                 <span class="agent-entry-icon">📚</span>
@@ -76,6 +76,7 @@
                 <span>Spring AI 智能对话</span>
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
                 <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
+                <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
             </header>
             <div class="messages" ref="scroll">
                 <div class="empty" v-if="messages.length === 0">
@@ -100,10 +101,14 @@
                                      v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
                             </div>
                         </div>
-                        <!-- 用户消息：纯文本；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
+                        <!-- 用户消息：纯文本 + 可选附件缩略图；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
                         <template v-if="m.content">
-                            <span v-if="m.role === 'user'">{{ m.content }}</span>
-                            <!-- :key 绑定 m.version：流式更新时强制重建该节点，确保 Markdown 渲染始终刷新 -->
+                            <div v-if="m.role === 'user'" class="user-msg">
+                                <div v-if="m.attachments && m.attachments.length" class="msg-attachments">
+                                    <img v-for="(a, ai) in m.attachments" :key="ai" :src="a.previewUrl" :alt="a.filename" class="msg-attach-thumb" />
+                                </div>
+                                <span>{{ m.content }}</span>
+                            </div>
                             <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
                         </template>
                         <span v-else-if="loading && i === messages.length - 1" class="typing">
@@ -113,6 +118,15 @@
                 </div>
             </div>
             <div class="input-bar">
+                <!-- 多模态图片预览：附件由后端 VisionService 转 caption 后注入对话，本轮结束随附件清除。
+                     原始二进制不进会话存储，刷新/重开会话后不再出现（保持对话存储轻量）。 -->
+                <div v-if="attachments.length" class="input-attachments">
+                    <div v-for="(a, i) in attachments" :key="i" class="img-thumb">
+                        <img :src="a.previewUrl" :alt="a.filename || '图片'" />
+                        <button class="img-thumb-del" @click="removeAttachment(i)" title="删除附件">×</button>
+                        <div v-if="!a.caption" class="img-thumb-loading">识别中…</div>
+                    </div>
+                </div>
                 <div class="input-row">
                     <textarea v-model="input" @keydown.enter.exact.prevent="send"
                               placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
@@ -122,13 +136,29 @@
                      取消 = 普通对话（智能路由 / 追问）。选择会写回会话，刷新后保持上次选择。
                      绑定智能体的会话不支持规划（planner 与 agentId 互斥），置灰并提示。 -->
                 <div class="input-foot">
+                    <!-- 🖼 多模态图片按钮：点击触发文件选择（多选）；选完后图片转 base64 上传到 /api/chat/vision/describe
+                         拿 caption，发送时随 attachments 一起注入对话上下文（不进会话记忆）。 -->
+                    <button type="button" class="attach-btn" @click="triggerImagePicker"
+                            title="添加图片：选择后由视觉模型转 caption 注入本轮对话；最多 5 张，单张 ≤10MB">
+                        🖼 图片
+                    </button>
+                    <input ref="imageInput" type="file" accept="image/*" multiple style="display:none"
+                           @change="onImagePicked" />
                     <label class="planner-toggle" :class="{ on: planMode && !currentAgentId, disabled: !!currentAgentId }">
-                        <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId"
+                        <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId" @change="onPlannerChange"
                                title="勾选后按规划模式执行：AI 自动编排多个智能体协同完成你的目标" />
                         <span class="toggle-switch"></span>
                         <span class="toggle-text">🧭 智能规划</span>
                     </label>
+                    <!-- 📚 RAG 开关（会话级）：开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，
+                         命中内容注入上下文作回答依据；关闭=不使用 RAG（仅靠模型知识）。写回会话，刷新后保持。 -->
+                    <label class="rag-toggle" :class="{ on: ragEnabled }" title="开启后自动检索资料库（通用知识库 + 当前智能体专属库），命中内容会作为回答依据；关闭则仅靠模型自身知识">
+                        <input type="checkbox" v-model="ragEnabled" @change="onRagEnabledChange" />
+                        <span class="toggle-switch"></span>
+                        <span class="toggle-text">📚 RAG</span>
+                    </label>
                     <span v-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
+                    <span v-else-if="!ragEnabled" class="input-hint">未开启 RAG，本轮不使用知识库</span>
                 </div>
             </div>
         </template>
@@ -171,7 +201,7 @@
                 <div class="agent-manage-head">
                     <div class="agent-manage-title-wrap">
                         <div class="agent-manage-title">📚 知识库管理</div>
-                        <div class="agent-manage-sub">RAG 检索增强：全局库（🌐）所有对话通用；每个智能体可维护一个专属库，仅对话交给它时检索</div>
+                        <div class="agent-manage-sub">RAG 检索增强：对话时开启输入框「📚 RAG」开关后自动检索「通用知识库 + 路由到智能体时的专属库」；这里管理各库的文件与分片</div>
                     </div>
                     <button class="new-chat-btn agent-manage-new" :disabled="availableAgents.length === 0"
                             :title="availableAgents.length === 0 ? '所有智能体都已有专属知识库' : '为智能体创建专属知识库'"
@@ -188,7 +218,7 @@
                         <div class="agent-card-body">
                             <div class="agent-card-name">{{ kb.name }}</div>
                             <div class="agent-card-code">
-                                {{ kb.agentId ? '专属库 · ' + (agentName(kb.agentId) || 'agent#' + kb.agentId) : '全局库 · 所有对话通用' }}
+                                {{ kb.agentId ? '专属库 · ' + (agentName(kb.agentId) || 'agent#' + kb.agentId) : '全局库 · 通用资料（会话可选）' }}
                             </div>
                             <div class="agent-card-desc">{{ kb.description || '暂无说明' }}</div>
                             <div class="kb-meta">{{ kb.docCount || 0 }} 个知识块 · {{ fmtTime(kb.updatedAt) }} 更新</div>
@@ -209,27 +239,85 @@
                     <div class="kb-detail-head-left">
                         <button class="btn-ghost kb-back" @click="kbDetail.open = false">‹ 返回</button>
                         <div class="kb-detail-title">{{ kbDetail.kb.name }}</div>
-                        <span class="agent-card-code">{{ kbDetail.kb.agentId ? '专属库' : '全局库 · 所有对话通用' }}</span>
+                        <button class="card-btn kb-detail-set" title="知识库设置：默认分片策略与相邻块重叠字数（新上传文件按此切块）"
+                                @click="openRenameKb(kbDetail.kb)">⚙</button>
+                        <span class="agent-card-code">{{ kbDetail.kb.agentId ? '专属库' : '全局库 · 会话可选' }}</span>
                     </div>
                     <div class="agent-manage-sub">共 {{ kbDetail.total }} 个知识块 · 对话时会自动语义检索最相关的若干块，作为参考资料注入提示词</div>
                 </div>
                 <div class="kb-detail-body">
-                    <!-- 左：添加知识 -->
+                    <!-- 左：库内文件列表 + 上传 -->
                     <div class="kb-add-panel">
-                        <div class="kb-panel-title">添加知识</div>
-                        <input v-model="kbDetail.source" placeholder="来源标注（可选）如：产品手册.pdf / 2026 校历" />
-                        <textarea v-model="kbDetail.text" rows="9"
-                                  placeholder="粘贴知识内容，可多行（多条）&#10;系统会自动分块（单块约 600 字）并向量化，之后对话即可语义检索到它"></textarea>
-                        <div class="kb-add-foot">
-                            <span class="field-hint">预计分块 {{ estimateBlocks }} 个</span>
-                            <button class="btn-primary" :disabled="kbDetail.adding || !kbDetail.text.trim()"
-                                    @click="addChunks">{{ kbDetail.adding ? '向量化中…' : '添加' }}</button>
+                        <div class="kb-panel-title">库内文件（{{ kbDetail.fileList.length }}）</div>
+                        <div v-if="kbDetail.fileList.length === 0" class="kb-empty-tip">
+                            还没有文件，上传 txt / md / pdf / docx / xlsx 后自动解析入库
                         </div>
+                        <div v-for="f in kbDetail.fileList" :key="f.id" class="kb-file-row">
+                            <span class="kb-file-ico">{{ typeIcon(f.fileType) }}</span>
+                            <div class="kb-file-info">
+                                <div class="kb-file-name" :title="f.fileName">{{ f.fileName }}</div>
+                                <div class="kb-file-meta">{{ fmtSize(f.sizeBytes) }} · {{ f.chunkCount || 0 }} 块 · {{ strategyLabel(f.chunkStrategy) }} · 重叠 {{ overlapLabel(f.chunkOverlap) }} · {{ fmtTime(f.updatedAt) }} 更新</div>
+                            </div>
+                            <button class="card-btn kb-file-rechunk" title="更换分片策略，重新切块入库（无需重传）"
+                                    @click="openRechunk(f)">🔄</button>
+                            <button class="card-btn card-btn-del kb-file-del" title="删除文件（连同其知识块）"
+                                    @click="deleteKbFile(f)">🗑</button>
+                        </div>
+
+                        <!-- 重新分片确认条（选择新策略 / 重叠后整文件重切） -->
+                        <div v-if="kbDetail.rechunk" class="kb-rechunk-bar">
+                            <span class="field-hint">重新分片「{{ kbDetail.rechunk.file.fileName }}」：</span>
+                            <select class="kb-strategy-select" v-model="kbDetail.rechunk.strategy"
+                                    :disabled="kbDetail.rechunk.busy">
+                                <option v-for="s in kbDetail.strategies" :key="s.key" :value="s.key">{{ s.label }}</option>
+                            </select>
+                            <select class="kb-strategy-select kb-overlap-select" v-model="kbDetail.rechunk.overlap"
+                                    title="相邻块间保留多少重复字符，避免边界内容被切断影响检索" :disabled="kbDetail.rechunk.busy">
+                                <option v-for="o in overlapOptions" :key="o" :value="o">{{ overlapText(o) }}</option>
+                            </select>
+                            <button class="btn-primary btn-sm" :disabled="kbDetail.rechunk.busy"
+                                    @click="doRechunk">{{ kbDetail.rechunk.busy ? '重分中…' : '确定重分' }}</button>
+                            <button class="btn-ghost btn-sm" :disabled="kbDetail.rechunk.busy"
+                                    @click="kbDetail.rechunk = null">取消</button>
+                        </div>
+
+                        <div class="kb-upload-divider">＋ 上传新文件</div>
+                        <div class="kb-upload-strategy">
+                            <span class="field-hint">按知识库默认分片：<b>{{ strategyLabel(kbDetail.uploadStrategy) }}</b> · 相邻重叠 <b>{{ overlapText(kbDetail.uploadOverlap) }}</b></span>
+                            <button class="btn-ghost btn-sm" title="调整该库的默认分片策略与重叠字数"
+                                    @click="openRenameKb(kbDetail.kb)">⚙ 修改设置</button>
+                        </div>
+                        <div class="field-hint" style="margin-bottom: 8px;">上传后自动切块并向量化入库；个别文件想用不同策略，可在文件行点 🔄 重新分片</div>
+                        <div class="kb-upload-zone" :class="{ drag: kbDetail.drag && !kbDetail.uploading }"
+                             @click="pickFiles" @dragover.prevent="kbDetail.drag = true"
+                             @dragleave="kbDetail.drag = false" @drop.prevent="onDropFiles">
+                            <input type="file" ref="kbFileInput" multiple hidden
+                                   accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx"
+                                   @change="onFilesChosen" />
+                            <div class="kb-upload-icon">📄</div>
+                            <div class="kb-upload-main">{{ kbDetail.uploading ? '解析并向量化中，请稍候…' : '点击选择文件，或将文件拖拽到此处' }}</div>
+                            <div class="kb-upload-exts">支持 txt / md / csv / pdf / docx / xlsx · 单个文件 ≤ 15MB · 同名文件将覆盖替换</div>
+                        </div>
+                        <!-- 待上传文件队列 -->
+                        <div v-if="kbDetail.files.length" class="kb-files">
+                            <div v-for="(f, i) in kbDetail.files" :key="i" class="kb-file-item">
+                                <span class="kb-file-name" :title="f.name">📎 {{ f.name }}</span>
+                                <span class="kb-file-size">{{ fmtSize(f.size) }}</span>
+                                <button class="card-btn card-btn-del kb-file-del" title="移除该文件" @click="removeFile(i)">✕</button>
+                            </div>
+                        </div>
+                        <div class="kb-add-foot">
+                            <span class="field-hint">解析后自动分块（单块约 600 字）并向量化入库</span>
+                            <button class="btn-primary" :disabled="kbDetail.uploading || kbDetail.files.length === 0"
+                                    @click="uploadFiles">{{ kbDetail.uploading ? '导入中…' : '上传导入' }}</button>
+                        </div>
+                        <!-- 上传结果汇总 -->
+                        <div v-if="kbDetail.msg" class="kb-msg" :class="kbDetail.msgOk ? 'ok' : 'err'">{{ kbDetail.msg }}</div>
                     </div>
                     <!-- 右：已有知识块列表 -->
                     <div class="kb-chunk-list">
                         <div class="kb-panel-title">已有知识块（{{ kbDetail.total }}）</div>
-                        <div v-if="kbDetail.chunks.length === 0" class="agent-grid-empty">还没有知识块，在左侧粘贴内容添加</div>
+                        <div v-if="kbDetail.chunks.length === 0" class="agent-grid-empty">还没有知识块，在左侧上传文件导入</div>
                         <div v-for="c in kbDetail.chunks" :key="c.id" class="kb-chunk-item">
                             <div class="kb-chunk-head">
                                 <span class="agent-card-code" v-if="c.source">{{ c.source }}</span>
@@ -415,7 +503,7 @@
                 </template>
                 <template v-else>
                     <label>归属</label>
-                    <div class="view-text">{{ kbModal.agentId ? '专属库 · ' + (agentName(kbModal.agentId) || 'agent#' + kbModal.agentId) : '全局库（所有对话通用）' }}</div>
+                    <div class="view-text">{{ kbModal.agentId ? '专属库 · ' + (agentName(kbModal.agentId) || 'agent#' + kbModal.agentId) : '全局库（会话可选）' }}</div>
                 </template>
 
                 <label>知识库名称 <span class="req">*</span></label>
@@ -423,6 +511,19 @@
 
                 <label>说明（可选）</label>
                 <input v-model="kbModal.description" placeholder="这个库主要放什么资料" />
+
+                <label>默认分片策略</label>
+                <select class="kb-strategy-select kb-settings-select" v-model="kbModal.chunkStrategy"
+                        title="上传文件时按哪种规则切块：固定长度 / 按段落 / 递归字符 / Markdown 标题">
+                    <option v-for="s in kbDetail.strategies" :key="s.key" :value="s.key" :title="s.desc">{{ s.label }} — {{ s.desc }}</option>
+                </select>
+
+                <label>相邻块重叠字数</label>
+                <select class="kb-strategy-select kb-settings-select kb-overlap-select" v-model.number="kbModal.chunkOverlap"
+                        title="相邻知识块间保留多少重复字符：语义跨过切分边界也能完整命中（向量检索更精准）">
+                    <option v-for="o in overlapOptions" :key="o" :value="o">{{ overlapText(o) }}</option>
+                </select>
+                <div class="field-hint">上传新文件、手动添加知识默认按此配置分块入库；已入库文件仍可在文件行用 🔄 单独重切。</div>
             </div>
             <div class="modal-foot">
                 <button class="btn-ghost" @click="kbModal.open = false">取消</button>

@@ -176,10 +176,16 @@ public class ChatService {
      * <p>
      * 请求级 planner 标志（前端输入框「智能规划」开关）在此统一处理：非空且与会话当前形态不同时，
      * 写回会话（刷新后保持），并同步到内存实体供本轮选择策略使用。
+     * 注意：绑定智能体的会话（agentId 非空）不会被写回为规划形态——planner 与 agentId 互斥，
+     * 本轮规划请求仅临时生效，不持久化（详见方法内守卫条件）。
      */
     private RoundResult runRound(Conversation conv, String conversationId, String message,
                                  Consumer<String> progress, Boolean planner) {
-        if (planner != null && conv != null && !planner.equals(conv.getPlanner())) {
+        // 请求级 planner 写回会话（刷新后保持）。planner 与 agentId 互斥：绑定智能体的会话
+        // 不持久化规划形态——本轮仍按请求执行规划，但会话保持普通/智能体形态，与 PUT /planner 的防御校验一致
+        // （避免绕过 UI 直调 API 造成 agentId + planner 并存的脏状态）。
+        if (planner != null && conv != null && !planner.equals(conv.getPlanner())
+                && !(Boolean.TRUE.equals(planner) && conv.getAgentId() != null)) {
             conversationService.updatePlanner(conversationId, planner);
             conv.setPlanner(planner);
         }

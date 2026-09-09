@@ -26,6 +26,11 @@ import java.util.concurrent.RejectedExecutionException;
  * <p>
  * 使用裸 {@link ChatModel} 直接调用（不走 advisor），否则 advisor 会把摘要指令当作对话消息写入记忆造成污染。
  * 失败一律回退到已有记忆，保证主流程不被打断、长期记忆不丢。
+ * <p>
+ * <b>数据保留契约</b>：合并只把窗口外消息<b>排除出主模型上下文</b>并回写摘要/关键事实，
+ * <b>不删除 chat_message 行</b>（历史仍可全量回放）。{@link ParamFillingService} 的澄清重放
+ * （追问计数 / 参数抽取）依赖该保留语义——若未来改为物理归档旧消息，需同步其实现，
+ * 否则跨轮参数补全会静默断裂。
  */
 @Slf4j
 @Service
