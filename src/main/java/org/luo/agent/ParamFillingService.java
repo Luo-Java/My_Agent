@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.config.PromptProperties;
@@ -17,6 +17,11 @@ import java.util.stream.Collectors;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import org.luo.agent.handler.AgentRoundHandler;
+import org.luo.entity.Conversation;
+import org.luo.memory.DbChatMemory;
+import org.luo.service.ChatService;
+import org.luo.service.ConversationService;
 
 /**
  * 参数补全与追问服务。

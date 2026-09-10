@@ -23,6 +23,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import org.luo.service.ChatService;
 
 /**
  * 会话管理接口（与对话业务分离）。

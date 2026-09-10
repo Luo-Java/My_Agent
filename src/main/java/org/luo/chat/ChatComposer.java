@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.chat;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.advisor.ToolUsageLoggingAdvisor;
@@ -16,6 +16,10 @@ import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import org.luo.agent.PromptService;
+import org.luo.agent.handler.AgentRoundHandler;
+import org.luo.agent.handler.PlannerRoundHandler;
+import org.luo.service.KbSearchService;
 
 /**
  * LLM 请求组装器：所有「把智能体 / 记忆 / 工具组装成一次 ChatClient 请求」的公共逻辑集中在这里，
@@ -76,7 +80,7 @@ public class ChatComposer {
         return chatClient;
     }
 
-    /** 无记忆的 ChatClient：动态规划中间步骤专用（见 {@link #executeStep} 调用方）。 */
+    /** 无记忆的 ChatClient：动态规划中间步骤专用。 */
     public ChatClient internalChatClient() {
         return internalChatClient;
     }

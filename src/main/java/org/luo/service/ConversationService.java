@@ -18,6 +18,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
+import org.luo.entity.Agent;
+import org.luo.memory.DbChatMemory;
 
 /**
  * 会话与消息业务服务：负责 conversation 与 chat_message 两张表的持久化。

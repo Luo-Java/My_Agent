@@ -8,6 +8,8 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
+import org.luo.enums.ChunkStrategy;
+import org.luo.service.KbService;
 
 /**
  * 知识块（Chunk）：知识库的最小检索单元。

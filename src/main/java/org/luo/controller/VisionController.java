@@ -1,7 +1,7 @@
 package org.luo.controller;
 
 import lombok.extern.slf4j.Slf4j;
-import org.luo.service.VisionService;
+import org.luo.infrastructure.vision.VisionService;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.luo.dto.ChatRequest;
 
 /**
  * 多模态视觉识别接口：上传图片 → VisionService 识别为文本描述 caption。

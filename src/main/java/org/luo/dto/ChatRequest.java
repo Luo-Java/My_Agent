@@ -1,6 +1,8 @@
 package org.luo.dto;
 
 import java.util.List;
+import org.luo.infrastructure.vision.VisionService;
+import org.luo.service.ChatService;
 
 /**
  * 对话请求体。

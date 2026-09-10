@@ -1,18 +1,20 @@
-package org.luo.service.handler;
+package org.luo.agent.handler;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.constant.AgentBindSource;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
-import org.luo.service.AgentRouter;
+import org.luo.agent.AgentRouter;
 import org.luo.service.AgentService;
-import org.luo.service.ChatComposer;
+import org.luo.chat.ChatComposer;
 import org.luo.service.ConversationService;
-import org.luo.service.ParamFillingService;
+import org.luo.agent.ParamFillingService;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.function.Consumer;
+import org.luo.agent.AgentRouter.RouteDecision;
+import org.luo.service.ChatService;
 
 /**
  * 普通对话策略（非规划模式）：智能路由 → 话题切换预检 → 参数补全/追问 → 正式回答。

@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.infrastructure.document;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -29,6 +29,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import org.luo.service.KbService;
 
 /**
  * 知识库文件解析：把上传的文档（txt/md/csv 等纯文本 + pdf/docx/xlsx）抽取为纯文本，

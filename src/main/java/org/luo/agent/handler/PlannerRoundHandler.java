@@ -1,12 +1,12 @@
-package org.luo.service.handler;
+package org.luo.agent.handler;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
 import org.luo.service.AgentService;
-import org.luo.service.ChatComposer;
-import org.luo.service.PlannerService;
-import org.luo.service.PlannerService.PlanStep;
+import org.luo.chat.ChatComposer;
+import org.luo.agent.PlannerService;
+import org.luo.agent.PlannerService.PlanStep;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
+import org.luo.service.KbSearchService;
 
 /**
  * 规划模式会话策略：由动态规划器（PlannerService）在运行时根据用户目标产出多智能体步骤，

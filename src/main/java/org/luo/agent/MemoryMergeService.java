@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.config.PromptProperties;
@@ -19,6 +19,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import org.luo.service.ConversationService;
 
 /**
  * 会话记忆合并服务：对话结束后，将「溢出窗口的旧消息」与「已有摘要/关键事实」合并，

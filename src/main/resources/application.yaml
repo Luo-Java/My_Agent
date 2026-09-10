@@ -31,12 +31,14 @@ spring:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
       chat:
         # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
-        model: qwen3.7-plus
+        model: kimi-k2.7-code
       # 知识库（RAG）向量化：与 chat 共用上方的 api-key / base-url（OpenAI 兼容的 /embeddings 端点）。
       # 未配置/调用失败时对话不受影响（知识库检索静默降级），仅「添加知识」会明确报错。
       embedding:
-        # 通义千问兼容模式的向量模型（text-embedding-v3/v2/v1）；OpenAI 官方用 text-embedding-3-small
-        model: text-embedding-v3
+        # 向量模型（OpenAI 兼容 /embeddings 端点）。当前用 qwen3.7-text-embedding；
+        # 换模型后需确认其输出维度与 Chroma 集合一致（本集合建为 1024 维），并同步调整
+        # ChromaVectorStoreService 的相似度还原逻辑（注：Chroma 0.5 cosine 的 score = 2·cos − 1，非真实余弦）
+        model: qwen3.7-text-embedding
 
   # 多模态视觉识别：图片上传后由 VisionService 单独调此模型把图片转成文本 caption，再注入对话上下文。
   # 复用 spring.ai.openai.api-key / base-url，不重复配置 key 与端点。
@@ -62,6 +64,17 @@ mybatis-plus:
 chroma:
   base-url: http://127.0.0.1:8000
   collection-name: kb_chunks
+  # 命名空间：必须用 Chroma 原生命名空间（默认 default_tenant/default_database）。
+  # 不要用 Spring AI 默认的 SpringAiTenant —— 它在本地 Chroma 0.5.x 上不存在，
+  # 且 Spring AI 初始化时的 getCollection 不认 Chroma 的 400 InvalidCollection，会导致初始化必失败。
+  tenant: default_tenant
+  database: default_database
+  # 连接失败后的重试冷却秒数：冷却期内直接降级（不拖慢对话），冷却结束自动重连，
+  # 「先起应用、后起 Chroma」无需重启应用即可自愈
+  retry-interval-seconds: 60
+  # 单批写入 Chroma 的文档数：受 Embedding 模型单次批量上限约束（DashScope text-embedding-v3 单次 ≤ 20 条，
+  # 超了会 400 "batch size ... larger than 20"），不是 Chroma 的请求体积限制。默认 10 留一倍余量
+  upsert-batch-size: 10
 
 # 接口访问控制（可选）：留空 = 不校验（本地开发默认，行为与原先一致）；
 # 配置后所有 /api/** 请求必须带 X-Api-Key 头且与值一致才放行（静态前端页面不受影响），

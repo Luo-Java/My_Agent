@@ -1,4 +1,4 @@
-package org.luo.service.handler;
+package org.luo.agent.handler;
 
 /**
  * 一轮对话的统一产出契约（各会话形态共用）。

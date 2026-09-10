@@ -12,6 +12,7 @@ import org.springframework.ai.chat.messages.UserMessage;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import org.luo.service.ChatService;
 
 /**
  * 基于 MySQL 的 {@link ChatMemory} 实现：把 Spring AI 标准会话记忆接口接到现有 chat_message 表。

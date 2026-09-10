@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.config.PromptProperties;
@@ -15,6 +15,7 @@ import cn.hutool.json.JSONUtil;
 
 import java.util.List;
 import java.util.Map;
+import org.luo.service.AgentService;
 
 /**
  * 智能路由服务：对「未绑定智能体的普通会话」，根据消息内容判断是否应交给某个专属智能体（agent）处理。

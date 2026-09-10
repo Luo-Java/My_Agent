@@ -7,7 +7,7 @@ import org.luo.entity.KbFile;
 import org.luo.entity.KnowledgeBase;
 import org.luo.enums.ChunkStrategy;
 import org.luo.exception.AiBusinessException;
-import org.luo.service.DocumentParserService;
+import org.luo.infrastructure.document.DocumentParserService;
 import org.luo.service.ChunkingService;
 import org.luo.service.KbService;
 import org.springframework.http.MediaType;
@@ -26,6 +26,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.luo.exception.AiErrorCode;
+import org.luo.service.KbService.FileIngestResult;
 
 /**
  * 知识库管理接口（RAG 知识库：全局库 + 每个智能体一个专属库）。
@@ -53,6 +55,8 @@ import java.util.Map;
  *                                           缺省沿用文件当前值；读保存的原文重切，不要求重新上传）
  * POST   /api/kb/chroma/sync              - Chroma 幂等回填（body.kbId 缺省=全部库；按 chunk id 覆盖，
  *                                           首次启用 / Chroma 故障恢复后把 MySQL 存量块同步到副本）
+ * GET    /api/kb/chroma/status            - Chroma 状态自检（连接状态 / 命名空间 / collection 文档数，
+ *                                           用于确认上传的文件是否真的进到了向量副本）
  */
 @RestController
 @RequestMapping("/api/kb")
@@ -153,12 +157,16 @@ public class KnowledgeBaseController {
             r.put("fileName", fileName);
             try {
                 String text = documentParser.parse(file);
-                KbFile saved = kbService.registerFile(id, fileName, file.getSize(), text, chunkStrategy, overlap);
+                KbService.FileIngestResult res =
+                        kbService.registerFileWithStatus(id, fileName, file.getSize(), text, chunkStrategy, overlap);
+                KbFile saved = res.file();
                 r.put("status", "ok");
                 r.put("fileId", saved.getId());
                 r.put("added", saved.getChunkCount());
                 r.put("chunkStrategy", saved.getChunkStrategy());
                 r.put("chunkOverlap", saved.getChunkOverlap());
+                // false = 只进了 MySQL（源），向量副本未同步：前端应提示可用「同步到 Chroma」回填
+                r.put("chromaSynced", res.chromaSynced());
             } catch (AiBusinessException e) {
                 r.put("status", "error");
                 r.put("message", e.getMessage());
@@ -234,6 +242,17 @@ public class KnowledgeBaseController {
         }
         int synced = kbService.syncToChroma(kbId);
         return Map.of("synced", synced);
+    }
+
+    /**
+     * Chroma 状态自检：确认向量副本是否可用、collection 里到底有多少条向量。
+     * 排查「上传的文件有没有进 Chroma」时先看这里：connected=true 且 documentCount 与 MySQL 知识块数接近即正常。
+     *
+     * @return {connected, documentCount(-1=未知), baseUrl, tenant, database, collection, lastError}
+     */
+    @GetMapping("/chroma/status")
+    public Map<String, Object> chromaStatus() {
+        return kbService.chromaStatus();
     }
 
     private void logError(String prefix, Long kbId, String fileName, String msg) {

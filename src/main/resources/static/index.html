@@ -245,6 +245,24 @@
                     </div>
                     <div class="agent-manage-sub">共 {{ kbDetail.total }} 个知识块 · 对话时会自动语义检索最相关的若干块，作为参考资料注入提示词</div>
                 </div>
+                <!-- 向量副本（Chroma）状态条：确认知识块是否同步进了向量库；未同步可一键回填 -->
+                <div class="kb-chroma-bar">
+                    <span class="kb-chroma-dot" :class="chroma.connected ? 'on' : 'off'"></span>
+                    <span class="field-hint">
+                        向量副本：
+                        <template v-if="chroma.connected">
+                            <b>Chroma 已连接</b> · {{ chroma.collection }}
+                            共 {{ chroma.documentCount >= 0 ? chroma.documentCount : '未知' }} 条向量
+                        </template>
+                        <template v-else>
+                            <b>Chroma 未连接</b>（{{ chroma.lastError || '服务不可用' }}）· 检索已降级为 MySQL 余弦
+                        </template>
+                    </span>
+                    <button class="btn-ghost btn-sm" :disabled="chroma.syncing"
+                            title="把本库 MySQL 存量知识块幂等回填到 Chroma（按块 id 覆盖，可重复执行）"
+                            @click="syncChroma">{{ chroma.syncing ? '同步中…' : '🔄 同步本库' }}</button>
+                    <span v-if="chroma.msg" class="field-hint">{{ chroma.msg }}</span>
+                </div>
                 <div class="kb-detail-body">
                     <!-- 左：库内文件列表 + 上传 -->
                     <div class="kb-add-panel">

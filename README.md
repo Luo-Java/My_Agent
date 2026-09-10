@@ -11,7 +11,7 @@
 - **双层记忆**：短期窗口（`chat_message` 多轮原文）+ 长期滚动摘要（`summary` / `core_facts`），超出窗口的历史自动压缩、异步合并，先返回数据再处理记忆。
 - **流式输出**：SSE 推送 `token`（正文，进记忆）与 `progress`（执行过程，不进记忆）两类事件，前端逐字渲染。
 - **知识库 RAG（会话级纯开关 + 自动多库）**：会话开启「📚 RAG」开关后，每轮自动检索「通用知识库（agent 为空）＋路由/绑定智能体时其专属库」并注入上下文（开关关闭=完全不检索）；支持文件上传（txt/md/csv/pdf/docx/xlsx）、多分片策略与重叠、重新分片、同名替换。向量存储为 **MySQL 留档（源）+ Chroma 加速副本双写**：检索优先 Chroma（余弦 TopK），不可用/无命中自动降级 MySQL；`POST /api/kb/chroma/sync` 幂等回填副本。
-- **多模态图片理解**：输入框左下「🖼 图片」按钮支持多选（≤5 张/单张 ≤10MB），选中后由 `qwen-vl-plus`（可配）把图片识别成中文 caption 拼入本轮上下文；识别走 dashscope OpenAI 兼容 `/chat/completions` 视觉端点，**原始二进制不进会话存储**——caption 仅当轮注入，刷新/重开会话后不再出现（保持对话存储轻量）。适用于上传工资条/聊天截图做分析、教育题目照片进 RAG 等场景。
+- **多模态图片理解**：输入框左下「🖼 图片」按钮支持多选（≤5 张/单张 ≤10MB），选中后由 `qwen-vl-plus`（可配）把图片识别成中文 caption 拼入本轮上下文；识别走 **Spring AI 原生多模态**（裸 `ChatModel` + `UserMessage.media(Media)`，per-request 覆盖 model，多图并发识别），**原始二进制不进会话存储**——caption 仅当轮注入，刷新/重开会话后不再出现（保持对话存储轻量）。适用于上传工资条/聊天截图做分析、教育题目照片进 RAG 等场景。
 - **工具调用**：全局能力池（天气查询、日期解析、SQL 安全查询、图表生成等）随请求挂载，AI 自主决定是否调用；工具使用日志可追踪。
 
 ## 技术栈
@@ -34,7 +34,10 @@
 - JDK 17+
 - Maven 3.9+（本机开发环境见「开发备注」）
 - MySQL 8.x（连接串会自动建库）
-- Chroma 服务（可选，`chroma run` 后监听 8000；未启动时知识库检索自动降级 MySQL，功能不受阻）
+- Chroma 服务（可选，`chroma run` 后监听 8000；未启动时知识库检索自动降级 MySQL，功能不受阻）。**命名空间**：Spring AI 2.0 默认的 `SpringAiTenant/SpringAiDatabase` 在本地 Chroma 0.5.x 上不存在，且其 `getCollection` 不认 Chroma 的 `400 InvalidCollection`，会导致初始化必失败；本项目固定使用 Chroma 原生的 `default_tenant/default_database`（`chroma.tenant`/`chroma.database` 可配），collection 首次使用时自动创建，无需手工建库。
+  - **连接失败自动重试**：失败后进入 `chroma.retry-interval-seconds`（默认 60 秒）冷却，冷却结束自动重连，「先起应用后起 Chroma」无需重启。
+  - **集合空间必须是 cosine**：Chroma 0.5.x 已不从 metadata 的 `hnsw:space` 读取空间（会建成 l2，导致 `1-distance` 相似度普遍偏低、命中被阈值滤掉），因此建库走原生 HTTP 的 `configuration.hnsw_configuration.space=cosine`；检测到存量 l2 集合**且为空**时会自动删除重建为 cosine，非空则保留并换算阈值（日志会 warn）。
+  - **状态自检**：`GET /api/kb/chroma/status` 返回连接状态、空间、向量条数；`POST /api/kb/chroma/sync` 幂等回填副本。前端知识库详情顶部也有状态条与「同步本库」按钮。
 
 ### 2. 初始化数据库
 

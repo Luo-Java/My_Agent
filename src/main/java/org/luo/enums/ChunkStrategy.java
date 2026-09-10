@@ -1,4 +1,5 @@
 package org.luo.enums;
+import org.luo.service.KbService;
 
 /**
  * 知识库文件的分片策略（决定一篇文档切成多少个知识块、在哪些边界切）。

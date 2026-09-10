@@ -8,7 +8,7 @@ import org.luo.exception.AiBusinessException;
 import org.luo.exception.AiErrorCode;
 import org.luo.service.AgentService;
 import org.luo.service.ChatService;
-import org.luo.service.PromptService;
+import org.luo.agent.PromptService;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;

@@ -169,6 +169,9 @@ createApp({
             uploadOverlap: 60, defaultOverlap: 60,
             rechunk: null   // { file, strategy, overlap, busy }：正在切换分片策略 / 重叠的文件
         });
+        // 向量副本（Chroma）状态条：connected=是否连上；documentCount=collection 内向量条数（-1=未知）
+        const chroma = ref({ connected: false, baseUrl: '', collection: '', documentCount: -1,
+            lastError: '', syncing: false, msg: '' });
 
         // 尚无专属知识库的智能体（新建知识库下拉只列这些，一个智能体至多一个库）
         const availableAgents = computed(() =>
@@ -827,6 +830,41 @@ createApp({
             syncKbDefaults();      // 上传按该库默认分片策略 / 重叠执行（知识库设置）
             await loadFiles();
             await loadChunks(false);
+            await loadChromaStatus();   // 顶部展示向量副本（Chroma）连接状态与向量条数
+        }
+
+        // Chroma 向量副本状态：确认上传的知识块是否真的同步进了向量库（MySQL 是源，Chroma 是加速副本）
+        async function loadChromaStatus() {
+            try {
+                const resp = await fetch('/api/kb/chroma/status');
+                if (resp.ok) Object.assign(chroma.value, await resp.json());
+            } catch (e) { /* 忽略：状态条保持上一次结果 */ }
+        }
+
+        // 把本库（MySQL 存量）知识块幂等回填到 Chroma：副本缺失 / 故障恢复后用
+        async function syncChroma() {
+            if (!kbDetail.kb || chroma.value.syncing) return;
+            chroma.value.syncing = true;
+            chroma.value.msg = '';
+            try {
+                const resp = await fetch('/api/kb/chroma/sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ kbId: kbDetail.kb.id })
+                });
+                let data = null;
+                try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
+                if (!resp.ok) {
+                    const msg = data && data.message ? data.message : ('HTTP ' + resp.status);
+                    throw new Error(msg);
+                }
+                chroma.value.msg = '已回填 ' + ((data && data.synced) || 0) + ' 个知识块到向量副本';
+                await loadChromaStatus();
+            } catch (e) {
+                chroma.value.msg = '同步失败：' + e.message;
+            } finally {
+                chroma.value.syncing = false;
+            }
         }
 
         // 加载该库已登记的文件列表
@@ -992,12 +1030,19 @@ createApp({
                     text += (text ? '；' : '') + errList.length + ' 个文件失败：'
                             + errList.map(r => r.fileName + (r.message ? '（' + r.message + '）' : '')).join('；');
                 }
+                // 向量副本（Chroma）未同步：MySQL 已入库、检索会回退 MySQL 余弦，但要让用户看见
+                const unsynced = okList.filter(r => r.chromaSynced === false);
+                if (unsynced.length) {
+                    text += (text ? '；' : '') + '⚠ ' + unsynced.length
+                            + ' 个文件仅写入 MySQL，向量副本（Chroma）未同步，可点上方「同步」回填';
+                }
                 kbDetail.msgOk = errList.length === 0;
                 kbDetail.msg = text || '没有处理任何文件';
                 kbDetail.files = [];
                 await loadFiles();     // 刷新库内文件列表（登记的文件与块数）
                 await loadChunks(false);
                 await loadKbs();   // 同步卡片上的知识块计数
+                await loadChromaStatus();   // 刷新向量副本状态与向量条数
                 if (kbDetail.kb) {
                     // 成功后刷新库计数（后端返回 updated 库信息最准，这里按结果累加并随后续 loadKbs 校正）
                     const old = kbDetail.kb.docCount || 0;
@@ -1203,7 +1248,7 @@ createApp({
             editingId, editingTitle, agentModal, agentView,
             currentAgentName, currentAgentIcon, currentAgentId, currentPlanner, currentRagOn,
             mainView, iconPresets,
-            kbs, kbModal, kbDetail, availableAgents, kbFileInput,
+            kbs, kbModal, kbDetail, availableAgents, kbFileInput, chroma, loadChromaStatus, syncChroma,
             send, newConversation, startAgentChat, selectConversation,
             startEdit, commitEdit, deleteConversation,
             goChat, goAgents, goKbs,

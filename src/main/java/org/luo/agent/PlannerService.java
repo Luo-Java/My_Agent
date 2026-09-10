@@ -1,4 +1,4 @@
-package org.luo.service;
+package org.luo.agent;
 
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
@@ -12,6 +12,9 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import org.luo.chat.ChatComposer;
+import org.luo.service.AgentService;
+import org.luo.service.ChatService;
 
 /**
  * 动态规划器（Dynamic Planner）服务。

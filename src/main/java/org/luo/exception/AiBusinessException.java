@@ -1,6 +1,7 @@
 package org.luo.exception;
 
 import lombok.Getter;
+import org.luo.config.GlobalExceptionHandler;
 
 /**
  * AI 应用业务异常：业务校验/流程失败时统一抛出。

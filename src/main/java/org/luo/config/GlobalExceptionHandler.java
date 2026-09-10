@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import org.luo.controller.ChatController;
+import org.luo.exception.AiErrorCode;
 
 /**
  * 全局异常处理：统一把异常转成 {@code {code, message}} JSON，避免裸 500 / 堆栈泄露给客户端。

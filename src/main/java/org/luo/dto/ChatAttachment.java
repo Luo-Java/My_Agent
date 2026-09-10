@@ -1,4 +1,6 @@
 package org.luo.dto;
+import org.luo.infrastructure.vision.VisionService;
+import org.luo.service.ChatService;
 
 /**
  * 对话附件元数据（描述形式，非原始二进制）。

@@ -12,11 +12,16 @@ import org.luo.mapper.KnowledgeChunkMapper;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import org.luo.infrastructure.chroma.ChromaClient.ChromaHit;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.luo.agent.handler.PlannerRoundHandler;
+import org.luo.chat.ChatComposer;
+import org.luo.infrastructure.chroma.ChromaClient;
+import org.luo.infrastructure.chroma.ChromaVectorStoreService;
 
 /**
  * 知识库检索服务（RAG 检索收敛点，从 KbService 拆出）。
@@ -159,11 +164,11 @@ public class KbSearchService {
         List<Long> kbIds = new ArrayList<>(byId.keySet());
 
         // —— Chroma 优先：跨库一次查，候选放大到 库数×topK，Java 侧统一排序截断 ——
-        List<ChromaVectorStoreService.ChromaHit> chromaHits =
+        List<ChromaHit> chromaHits =
                 chromaStore.search(kbIds, query, kbIds.size() * TOP_K_RAG, MIN_SCORE);
         if (!chromaHits.isEmpty()) {
             List<Hit> hits = new ArrayList<>(chromaHits.size());
-            for (ChromaVectorStoreService.ChromaHit h : chromaHits) {
+            for (ChromaHit h : chromaHits) {
                 KnowledgeBase kb = byId.get(h.kbId());
                 if (kb == null) {
                     continue;   // 归属库不在本次目标内（理论上不可能），防御跳过

@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.luo.infrastructure.chroma.ChromaVectorStoreService;
 
 /**
  * 知识库（RAG）管理服务：建库 / 文件上传解析分块入库 / 删除 / Chroma 双写同步（只写不读检索）。
@@ -50,6 +51,15 @@ public class KbService {
 
     /** 批量向量化的单批条数（一次 HTTP 请求的条数上限，避免超限）。 */
     private static final int EMBED_BATCH = 16;
+
+    /**
+     * 文件入库结果：文件登记记录 + Chroma 向量副本是否已同步。
+     * <p>
+     * 副本未同步<b>不影响</b> MySQL 源数据（检索自动回退 MySQL 余弦），但接口层应把该状态回传前端，
+     * 避免「上传显示成功、实际只进了 MySQL」被误认为数据丢失。
+     */
+    public record FileIngestResult(KbFile file, boolean chromaSynced) {
+    }
 
 
     private final KnowledgeBaseMapper kbMapper;
@@ -257,6 +267,18 @@ public class KbService {
     @Transactional
     public KbFile registerFile(Long kbId, String fileName, long sizeBytes, String fullText,
                                String strategyKey, Integer overlap) {
+        return registerFileWithStatus(kbId, fileName, sizeBytes, fullText, strategyKey, overlap).file();
+    }
+
+    /**
+     * 同 {@link #registerFile}，额外返回 <b>Chroma 副本同步结果</b>，供接口层回传给前端
+     * （避免「MySQL 入库成功但向量副本没写」时前端毫无感知）。
+     *
+     * @return 文件记录 + chromaSynced（true = 本批知识块已写入 Chroma 副本）
+     */
+    @Transactional
+    public FileIngestResult registerFileWithStatus(Long kbId, String fileName, long sizeBytes, String fullText,
+                                                   String strategyKey, Integer overlap) {
         KnowledgeBase kb = requireKb(kbId);
         if (fullText == null || fullText.isBlank()) {
             throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "未能从文件中提取到可入库的文本");
@@ -283,7 +305,7 @@ public class KbService {
             chromaStore.deleteByChunkIds(oldIds);
         }
         List<KnowledgeChunk> inserted = insertChunks(kbId, src, blocks, vectors, now);
-        chromaStore.upsertChunks(kbId, inserted);   // Chroma 失败仅 warn（MySQL 已留档，可用 sync 回填）
+        boolean chromaOk = chromaStore.upsertChunks(kbId, inserted);   // Chroma 失败仅 warn（MySQL 已留档，可用 sync 回填）
 
         // 文件登记：首次上传插入，同名重传仅刷新（保留首次上传时间）；保存策略与原文（供重新分片）
         KbFile file = fileMapper.selectOne(new QueryWrapper<KbFile>()
@@ -311,9 +333,10 @@ public class KbService {
         kb.setDocCount(old - oldIds.size() + blocks.size());
         kb.setUpdatedAt(now);
         kbMapper.updateById(kb);
-        log.info("知识库上传文件：kbId={}，文件={}（{} 字节），分片策略={}，重叠={}，分块={}，替换旧块={}，总计={}",
-                kbId, src, sizeBytes, strategy.getKey(), ov, blocks.size(), oldIds.size(), kb.getDocCount());
-        return file;
+        log.info("知识库上传文件：kbId={}，文件={}（{} 字节），分片策略={}，重叠={}，分块={}，替换旧块={}，总计={}，Chroma 副本={}",
+                kbId, src, sizeBytes, strategy.getKey(), ov, blocks.size(), oldIds.size(), kb.getDocCount(),
+                chromaOk ? "已同步" : "未同步（服务不可用，可稍后 POST /api/kb/chroma/sync 回填）");
+        return new FileIngestResult(file, chromaOk);
     }
 
     /** 某知识库的文件列表（按最近更新时间倒序，最新在前；rawText 大字段不查询不回传，避免流量浪费）。 */
@@ -372,7 +395,7 @@ public class KbService {
         }
         LocalDateTime now = LocalDateTime.now();
         List<KnowledgeChunk> inserted = insertChunks(kbId, src, blocks, vectors, now);
-        chromaStore.upsertChunks(kbId, inserted);   // Chroma 失败仅 warn（MySQL 已留档，可用 sync 回填）
+        boolean chromaOk = chromaStore.upsertChunks(kbId, inserted);   // Chroma 失败仅 warn（MySQL 已留档，可用 sync 回填）
         file.setChunkStrategy(strategy.getKey());
         file.setChunkOverlap(ov);
         file.setChunkCount(blocks.size());
@@ -386,8 +409,9 @@ public class KbService {
             kb.setUpdatedAt(now);
             kbMapper.updateById(kb);
         }
-        log.info("知识库重新分片：kbId={}，文件={}，{}@重叠{} → {}@重叠{}，分块 {} → {}",
-                kbId, src, oldStrategy, oldOverlap, strategy.getKey(), ov, oldIds.size(), blocks.size());
+        log.info("知识库重新分片：kbId={}，文件={}，{}@重叠{} → {}@重叠{}，分块 {} → {}，Chroma 副本={}",
+                kbId, src, oldStrategy, oldOverlap, strategy.getKey(), ov, oldIds.size(), blocks.size(),
+                chromaOk ? "已同步" : "未同步（可稍后 POST /api/kb/chroma/sync 回填）");
         return blocks.size();
     }
 
@@ -477,12 +501,13 @@ public class KbService {
         List<float[]> vectors = embedAll(blocks);   // 失败抛异常 → 事务回滚，不落半截数据
         LocalDateTime now = LocalDateTime.now();
         List<KnowledgeChunk> inserted = insertChunks(kb.getId(), source, blocks, vectors, now);
-        chromaStore.upsertChunks(kb.getId(), inserted);   // Chroma 失败仅 warn（MySQL 已留档）
+        boolean chromaOk = chromaStore.upsertChunks(kb.getId(), inserted);   // Chroma 失败仅 warn（MySQL 已留档）
         int old = kb.getDocCount() == null ? 0 : kb.getDocCount();
         kb.setDocCount(old + blocks.size());
         kb.setUpdatedAt(now);
         kbMapper.updateById(kb);
-        log.info("知识库添加知识：kbId={}，来源={}，分块={}，总计={}", kb.getId(), source, blocks.size(), kb.getDocCount());
+        log.info("知识库添加知识：kbId={}，来源={}，分块={}，总计={}，Chroma 副本={}",
+                kb.getId(), source, blocks.size(), kb.getDocCount(), chromaOk ? "已同步" : "未同步");
         return blocks.size();
     }
 
@@ -579,6 +604,16 @@ public class KbService {
         }
         log.info("Chroma 幂等回填完成：kbId={}，成功回填={} 块", kbId, synced);
         return synced;
+    }
+
+    /**
+     * Chroma 运行状态自检（GET /api/kb/chroma/status）：连接状态、命名空间、collection 文档数。
+     * 用于排查「上传的文件到底有没有进 Chroma」——MySQL 是源，副本条数可与此对比确认是否缺失。
+     *
+     * @return 状态 map（connected / documentCount / lastError 等，见 ChromaVectorStoreService#status）
+     */
+    public Map<String, Object> chromaStatus() {
+        return chromaStore.status();
     }
 
     // ==================== 向量化 ====================

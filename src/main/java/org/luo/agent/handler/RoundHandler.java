@@ -1,8 +1,9 @@
-package org.luo.service.handler;
+package org.luo.agent.handler;
 
 import org.luo.entity.Conversation;
 
 import java.util.function.Consumer;
+import org.luo.service.ChatService;
 
 /**
  * 一轮对话的处理策略：不同会话形态（规划 / 普通）各自实现差异化编排。

@@ -3,10 +3,10 @@ package org.luo.service;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.dto.StreamEvent;
 import org.luo.entity.Conversation;
-import org.luo.service.handler.AgentRoundHandler;
-import org.luo.service.handler.PlannerRoundHandler;
-import org.luo.service.handler.RoundHandler;
-import org.luo.service.handler.RoundResult;
+import org.luo.agent.handler.AgentRoundHandler;
+import org.luo.agent.handler.PlannerRoundHandler;
+import org.luo.agent.handler.RoundHandler;
+import org.luo.agent.handler.RoundResult;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
@@ -14,6 +14,10 @@ import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.function.Consumer;
+import org.luo.agent.MemoryMergeService;
+import org.luo.agent.PromptService;
+import org.luo.chat.ChatComposer;
+import org.luo.memory.DbChatMemory;
 
 /**
  * 对话编排服务（门面 / 协调者）。
