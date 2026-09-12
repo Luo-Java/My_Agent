@@ -258,6 +258,40 @@ public class ConversationService {
     }
 
     /**
+     * 把本轮 RAG 引用来源 JSON 写到「{@code id > afterId} 的最新一条助手消息」上。
+     * <p>
+     * 与 {@link #attachToLatestUserMessage} 完全对称（后者挂 user 消息的附件、本方法挂 assistant 消息的引用），
+     * 落库时机都在本轮回复产出之后：助手消息由记忆 Advisor / 规划补写插入，因此用「水位」限定范围，
+     * 避免本轮在插入助手消息前就失败时，把引用错误地挂到上一条历史回复上。
+     * <p>
+     * 该列同样<b>不参与记忆读取</b>（DbChatMemory.get 只取 content），仅供前端渲染 [n] 角标与来源列表。
+     *
+     * @param conversationId 会话 ID
+     * @param afterId        水位：只更新 id 大于该值的助手消息；null 表示不限（更新最新一条）
+     * @param citationsJson  引用来源 JSON 数组；空则不处理
+     */
+    @Transactional
+    public void attachCitationsToLatestAssistantMessage(String conversationId, Long afterId, String citationsJson) {
+        if (conversationId == null || conversationId.isBlank()
+                || citationsJson == null || citationsJson.isBlank()) {
+            return;
+        }
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId).eq("role", "assistant");
+        if (afterId != null) qw.gt("id", afterId);
+        qw.orderByDesc("id").last("LIMIT 1");
+        ChatMessage last = chatMessageMapper.selectOne(qw);
+        if (last == null) {
+            log.warn("引用来源未找到可挂载的助手消息：会话={}", conversationId);
+            return;
+        }
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getId, last.getId())
+                .set(ChatMessage::getCitationsJson, citationsJson));
+        log.debug("引用来源写入：会话={}，消息={}", conversationId, last.getId());
+    }
+
+    /**
      * 读取某会话的历史消息，按时间正序。
      *
      * @param conversationId 会话 ID

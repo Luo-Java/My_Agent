@@ -1,6 +1,7 @@
 package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.config.MemoryProperties;
 import org.luo.config.PromptProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
@@ -50,6 +51,12 @@ public class MemoryMergeService {
     private final String memoryMergeSystem;
     /** 记忆合并专用线程池：与对话主链路（Reactor boundedElastic）隔离，合并再慢也不挤占对话执行线程。 */
     private final Executor memoryMergeExecutor;
+    /**
+     * 记忆窗口配置：与 {@code DbChatMemory} 共用同一份参数计算窗口边界。
+     * 必须注入而非各写一份默认值——两处参数一旦不一致，「被摘要掉的区间」就会与实际
+     * 上下文窗口错位（重复摘要或静默丢记忆）。
+     */
+    private final MemoryProperties memoryProperties;
 
     /**
      * 正在合并中的会话集合：同一会话的记忆合并互斥，避免用户连发消息时并发触发多次 LLM 合并、
@@ -59,11 +66,13 @@ public class MemoryMergeService {
 
     public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
                               @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor,
-                              PromptProperties promptProperties) {
+                              PromptProperties promptProperties,
+                              MemoryProperties memoryProperties) {
         this.conversationService = conversationService;
         this.chatModel = chatModel;
         this.memoryMergeExecutor = memoryMergeExecutor;
         this.memoryMergeSystem = promptProperties.memoryMergeSystem();
+        this.memoryProperties = memoryProperties;
     }
 
     /**
@@ -109,7 +118,7 @@ public class MemoryMergeService {
     public void maybeMergeMemory(String conversationId) {
         try {
             List<ChatMessage> history = conversationService.getHistory(conversationId);
-            int windowStart = DbChatMemory.computeWindowStart(history);
+            int windowStart = DbChatMemory.computeWindowStart(history, memoryProperties);
             if (windowStart <= 0) {
                 return; // 全部历史都在 token 预算内，无需合并
             }

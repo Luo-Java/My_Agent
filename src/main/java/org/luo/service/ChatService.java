@@ -1,18 +1,22 @@
 package org.luo.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.luo.dto.KbCitation;
 import org.luo.dto.StreamEvent;
 import org.luo.entity.Conversation;
 import org.luo.agent.handler.AgentRoundHandler;
 import org.luo.agent.handler.PlannerRoundHandler;
 import org.luo.agent.handler.RoundHandler;
 import org.luo.agent.handler.RoundResult;
+import org.luo.trace.RoundTrace;
+import org.luo.trace.TraceService;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.function.Consumer;
 import org.luo.agent.MemoryMergeService;
 import org.luo.agent.PromptService;
@@ -28,30 +32,43 @@ import org.luo.memory.DbChatMemory;
  *   <li>{@link PlannerRoundHandler} —— 规划模式策略（动态规划 / 多步顺序执行）；</li>
  *   <li>{@link ChatComposer} —— 两条路径共用的 LLM 请求组装（记忆 / 工具 / 模型参数）；</li>
  *   <li>{@link MemoryMergeService} —— 对话结束后的滚动摘要合并；</li>
- *   <li>{@link ConversationService} —— 会话/消息持久化与窗口记忆读取（由 DbChatMemory 提供）。</li>
+ *   <li>{@link ConversationService} —— 会话/消息持久化与窗口记忆读取（由 DbChatMemory 提供）；</li>
+ *   <li>{@link TraceService} —— 本轮链路追踪的异步落库（可观测，纯旁路）。</li>
  * </ul>
  * 一轮对话统一走 {@link #runRound}：按会话形态（planner 或普通）选择 RoundHandler 策略执行，
  * 产出统一为 {@link RoundResult}，再由本类的 {@code chat}/{@code doStream} 统一输出并收尾。
  * 公共入口：{@link #chat}、{@link #stream}——两者都支持按请求指定 planner 模式
  * （见 {@link #chat(String, String, Boolean)}）。
+ * <p>
+ * <b>收尾顺序（勿乱）</b>：<i>推完回复 → 推引用事件 → 落库附件/引用 → 异步落库追踪 → 异步合并记忆</i>。
+ * 一切旁路数据（附件元数据、引用来源、追踪、摘要）都排在用户看到答案<b>之后</b>，
+ * 既是「数据优先于记忆」，也是「可观测不能挡在体验之前」。
  */
 @Slf4j
 @Service
 public class ChatService {
 
+    /** 本轮形态：普通/智能体对话。 */
+    private static final String MODE_AGENT = "agent";
+    /** 本轮形态：规划模式。 */
+    private static final String MODE_PLANNER = "planner";
+
     private final ConversationService conversationService;
     private final MemoryMergeService memoryMergeService;
     private final AgentRoundHandler agentRoundHandler;
     private final PlannerRoundHandler plannerRoundHandler;
+    private final TraceService traceService;
 
     public ChatService(ConversationService conversationService,
                        MemoryMergeService memoryMergeService,
                        AgentRoundHandler agentRoundHandler,
-                       PlannerRoundHandler plannerRoundHandler) {
+                       PlannerRoundHandler plannerRoundHandler,
+                       TraceService traceService) {
         this.conversationService = conversationService;
         this.memoryMergeService = memoryMergeService;
         this.agentRoundHandler = agentRoundHandler;
         this.plannerRoundHandler = plannerRoundHandler;
+        this.traceService = traceService;
     }
 
     /**
@@ -97,26 +114,40 @@ public class ChatService {
         log.info("同步对话：会话={}，planner={}，有附件={}", conversationId, planner,
                 material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId);
-        // 落库前记录水位：附件元数据只写到本轮新增的用户消息，避免早期失败时误挂历史消息
-        Long watermark = hasAttachments(attachmentsJson) ? conversationService.maxMessageId(conversationId) : null;
-        // 统一编排入口：规划模式 / 普通对话 / 闲聊都由 runRound 按会话形态分发处理，
-        // 追问与正式回答的文本都在返回值里，收尾统一由 afterReply 完成（同步接口无事件通道，
-        // 执行过程只记日志，进度展示仅流式接口支持，见 stream）。
-        RoundResult out = runRound(conv, conversationId, message, material, NO_PROGRESS, planner);
+        // 落库前记录水位：附件/引用只写到本轮新增的消息，避免早期失败时误挂历史消息
+        Long watermark = needsWatermark(conv, attachmentsJson)
+                ? conversationService.maxMessageId(conversationId) : null;
+        RoundTrace trace = startTrace(conversationId, message);
+        RoundResult out;
+        try {
+            // 统一编排入口：规划模式 / 普通对话 / 闲聊都由 runRound 按会话形态分发处理，
+            // 追问与正式回答的文本都在返回值里，收尾统一由 afterReply 完成（同步接口无事件通道，
+            // 执行过程只记日志，进度展示仅流式接口支持，见 stream）。
+            out = runRound(conv, conversationId, message, material, NO_PROGRESS, planner, trace);
+        } catch (RuntimeException | Error e) {
+            // 异常路径也要留下追踪（最需要排查的恰恰是失败轮次），随后原样抛出交由上层错误处理
+            trace.markError(e.getMessage());
+            traceService.saveAsync(trace);
+            throw e;
+        }
         persistAttachments(conversationId, watermark, attachmentsJson);
-        log.info("同步对话完成：回复长度={}", out.reply() != null ? out.reply().length() : 0);
+        persistCitations(conversationId, watermark, out.citations());
+        log.info("同步对话完成：回复长度={}，引用={}", out.reply() != null ? out.reply().length() : 0,
+                out.citations().size());
         afterReply(conversationId, message);
+        traceService.saveAsync(trace);
         return out.reply();
     }
 
     /**
      * 流式对话：以事件流返回本轮结果。
      * <p>
-     * 事件分三类（见 {@link StreamEvent}）：
+     * 事件分四类（见 {@link StreamEvent}）：
      * <ul>
      *   <li>{@code progress} —— 执行过程（规划出的步骤、每步开始/完成/失败），<b>仅运行期实时展示，
      *       不写入会话记忆</b>，因此刷新或重新打开会话都不会看到；</li>
      *   <li>{@code token} —— 最终回复的分片，前端累加成消息气泡，<b>只有它计入会话记忆</b>；</li>
+     *   <li>{@code citations} —— 本轮 RAG 引用来源（JSON），正文推完后发一次，前端渲染 [n] 角标与来源列表；</li>
      *   <li>{@code error} —— 本轮出错，前端红字提示、不进正文、不进记忆。</li>
      * </ul>
      * 整个执行体放在 {@link Schedulers#boundedElastic()} 上跑：让 HTTP 处理线程立刻返回、
@@ -127,7 +158,7 @@ public class ChatService {
      *
      * @param conversationId 会话 ID
      * @param message        当前用户输入
-     * @return 事件流（progress / token）
+     * @return 事件流（progress / token / citations）
      */
     public Flux<StreamEvent> stream(String conversationId, String message) {
         return stream(conversationId, message, "", "", null);
@@ -136,11 +167,12 @@ public class ChatService {
     /**
      * 流式对话：以事件流返回本轮结果。
      * <p>
-     * 事件分三类（见 {@link StreamEvent}）：
+     * 事件分四类（见 {@link StreamEvent}）：
      * <ul>
-     *   <li>{@code progress} —— 执行过程（规划出的步骤、每步开始/完成/失败），<b>仅运行期实时展示，
-     *       不写入会话记忆</b>，因此刷新或重新打开会话都不会看到；</li>
-     *   <li>{@code token} —— 最终回复的分片，前端累加成消息气泡，<b>只有它计入会话记忆</b>；</li>
+     *   <li>{@code progress} —— 执行过程（规划步骤、每步的开始/完成/失败等），
+     *       仅在本次运行期间实时展示给用户，<b>绝不写入会话记忆</b>：刷新或重新打开会话后不会出现；</li>
+     *   <li>{@code token} —— 正文分片，前端累加进消息气泡，且是唯一写入会话记忆的内容；</li>
+     *   <li>{@code citations} —— 本轮 RAG 引用来源，正文推完后发一次；</li>
      *   <li>{@code error} —— 本轮出错，前端红字提示、不进正文、不进记忆。</li>
      * </ul>
      * 整个执行体放在 {@link Schedulers#boundedElastic()} 上跑：让 HTTP 处理线程立刻返回、
@@ -152,7 +184,7 @@ public class ChatService {
      * @param conversationId 会话 ID
      * @param message        当前用户输入（纯提问，不含附件内容）
      * @param planner        本轮是否按规划模式处理（null=跟随会话默认形态；非空=覆盖并写回会话）
-     * @return 事件流（progress / token）
+     * @return 事件流（progress / token / citations）
      */
     public Flux<StreamEvent> stream(String conversationId, String message, Boolean planner) {
         return stream(conversationId, message, "", "", planner);
@@ -167,7 +199,7 @@ public class ChatService {
      * @param material        本轮附件材料（图片 caption / 文档解析文本），空串表示无附件
      * @param attachmentsJson 本轮附件展示元数据（JSON 数组，不含正文），空串表示无附件
      * @param planner         本轮是否按规划模式处理
-     * @return 事件流（progress / token）
+     * @return 事件流（progress / token / citations）
      */
     public Flux<StreamEvent> stream(String conversationId, String message, String material, String attachmentsJson,
                                     Boolean planner) {
@@ -189,33 +221,65 @@ public class ChatService {
 
     /**
      * 流式对话的实际执行体（在弹性线程上运行，可以放心阻塞调用 LLM）。
-     * 结果通过 sink 以事件形式推送：进度用 {@code progress}、正文用 {@code token}。
+     * 结果通过 sink 以事件形式推送：进度用 {@code progress}、正文用 {@code token}、引用用 {@code citations}。
      */
     private void doStream(String conversationId, String message, String material, String attachmentsJson,
                           FluxSink<StreamEvent> sink, Boolean planner) {
         log.info("流式对话：会话={}，planner={}，有附件={}", conversationId, planner,
                 material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId);
-        // 落库前记录水位：附件元数据只写到本轮新增的用户消息，避免早期失败时误挂历史消息
-        Long watermark = hasAttachments(attachmentsJson) ? conversationService.maxMessageId(conversationId) : null;
+        // 落库前记录水位：附件/引用只写到本轮新增的消息，避免早期失败时误挂历史消息
+        Long watermark = needsWatermark(conv, attachmentsJson)
+                ? conversationService.maxMessageId(conversationId) : null;
         Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
-        // 统一编排入口：规划模式 / 普通对话都由 runRound 分发处理，执行过程通过 progress
-        // 事件实时推送（只展示、不进记忆）。追问返回澄清文本（整段推）、正式回答返回正文（切片模拟打字机）。
-        RoundResult out = runRound(conv, conversationId, message, material, progress, planner);
+        RoundTrace trace = startTrace(conversationId, message);
+        RoundResult out;
+        try {
+            // 统一编排入口：规划模式 / 普通对话都由 runRound 分发处理，执行过程通过 progress
+            // 事件实时推送（只展示、不进记忆）。追问返回澄清文本（整段推）、正式回答返回正文（切片模拟打字机）。
+            out = runRound(conv, conversationId, message, material, progress, planner, trace);
+        } catch (RuntimeException | Error e) {
+            trace.markError(e.getMessage());
+            traceService.saveAsync(trace);
+            throw e;
+        }
         if (out.clarified()) {
             sink.next(StreamEvent.token(out.reply()));
         } else {
             emitChunks(sink, out.reply());
         }
-        // 附件展示元数据写入本轮用户消息（仅历史回看用，不进 LLM 上下文）
+        // 引用来源：正文推完后单独发一次（不进正文、不进记忆），前端渲染 [n] 角标与来源列表
+        String citationsJson = KbCitation.toJson(out.citations());
+        if (!citationsJson.isEmpty()) {
+            sink.next(StreamEvent.citations(citationsJson));
+        }
+        // 附件展示元数据 / RAG 引用写入本轮消息（仅历史回看用，不进 LLM 上下文）
         persistAttachments(conversationId, watermark, attachmentsJson);
+        persistCitations(conversationId, watermark, out.citations());
         // 数据优先于记忆：正文推完后再做收尾（touch + 异步摘要合并），见 afterReply
         afterReply(conversationId, message);
+        traceService.saveAsync(trace);
     }
 
     /** 是否有附件展示元数据（空串/null 视为无）。 */
     private static boolean hasAttachments(String attachmentsJson) {
         return attachmentsJson != null && !attachmentsJson.isBlank();
+    }
+
+    /**
+     * 本轮是否需要「落库前水位」。
+     * <p>
+     * 只有会产生「事后补写」的两类数据才需要水位：附件元数据（挂 user 消息）与 RAG 引用（挂 assistant 消息）。
+     * 引用只在 RAG 开启的会话才可能出现，故以 {@code conv.ragEnabled} 作为廉价预判——
+     * 常规路径（无附件、未开 RAG）因此不产生任何额外查询，与改造前的开销一致。
+     */
+    private static boolean needsWatermark(Conversation conv, String attachmentsJson) {
+        return hasAttachments(attachmentsJson) || (conv != null && Boolean.TRUE.equals(conv.getRagEnabled()));
+    }
+
+    /** 建本轮追踪上下文（纯内存对象，失败不影响对话）。 */
+    private static RoundTrace startTrace(String conversationId, String message) {
+        return new RoundTrace(conversationId, message);
     }
 
     /**
@@ -232,6 +296,21 @@ public class ChatService {
     }
 
     /**
+     * 把本轮 RAG 引用来源写入本轮助手消息（见
+     * {@link ConversationService#attachCitationsToLatestAssistantMessage}）。
+     * 与附件元数据完全对称：仅服务前端溯源展示，不参与记忆读取；失败只记日志，不影响本轮回复。
+     */
+    private void persistCitations(String conversationId, Long watermark, List<KbCitation> citations) {
+        String json = KbCitation.toJson(citations);
+        if (json.isEmpty()) return;
+        try {
+            conversationService.attachCitationsToLatestAssistantMessage(conversationId, watermark, json);
+        } catch (Exception e) {
+            log.error("引用来源写入失败：会话={}", conversationId, e);
+        }
+    }
+
+    /**
      * 统一编排入口：所有对话（规划 / 普通 / 闲聊）都先经这里按会话形态选择处理策略，
      * 再由调用方统一输出结果（追问整段推、正式回答切片）并调用 {@link #afterReply} 收尾。
      * 替代原先 chat/doStream 中各自重复的 if(planner) 分叉；新增会话形态只需新增 RoundHandler 实现。
@@ -242,7 +321,7 @@ public class ChatService {
      * 本轮规划请求仅临时生效，不持久化（详见方法内守卫条件）。
      */
     private RoundResult runRound(Conversation conv, String conversationId, String message, String material,
-                                Consumer<String> progress, Boolean planner) {
+                                Consumer<String> progress, Boolean planner, RoundTrace trace) {
         // 请求级 planner 写回会话（刷新后保持）。planner 与 agentId 互斥：绑定智能体的会话
         // 不持久化规划形态——本轮仍按请求执行规划，但会话保持普通/智能体形态，与 PUT /planner 的防御校验一致
         // （避免绕过 UI 直调 API 造成 agentId + planner 并存的脏状态）。
@@ -251,10 +330,13 @@ public class ChatService {
             conversationService.updatePlanner(conversationId, planner);
             conv.setPlanner(planner);
         }
-        RoundResult r = selectHandler(conv, planner).handle(conv, conversationId, message, material, progress);
+        RoundHandler handler = selectHandler(conv, planner);
+        trace.mode(handler == plannerRoundHandler ? MODE_PLANNER : MODE_AGENT);
+        RoundResult r = handler.handle(conv, conversationId, message, material, progress, trace);
         // 规划策略返回回退信号（fallback，reply 为 null）：转普通对话策略兜底
         if (r == null || r.isFallback()) {
-            r = agentRoundHandler.handle(conv, conversationId, message, material, progress);
+            trace.mode(MODE_AGENT);
+            r = agentRoundHandler.handle(conv, conversationId, message, material, progress, trace);
         }
         return r;
     }

@@ -36,8 +36,9 @@ import org.luo.service.ConversationService;
  * 而 agent.paramSchema 配置用 Hutool 的 {@code JSONUtil} 解析（规避 ObjectMapper，与智能路由解析风格一致）。
  * <p>
  * <b>跨 turn 一致性契约</b>：本服务<b>无显式状态</b>（不新增 Conversation 字段），每轮从
- * DB 全量历史重放推导——追问计数（{@link #countClarifyStreak}）与参数抽取
+ * DB 历史重放推导——追问计数（{@link #countClarifyStreak}）与参数抽取
  * （{@link #clarifyScopedHistory} 最近 12 条）都以历史消息为准，天然跨请求、跨重启、多实例一致。
+ * 读取只取最近的 {@value #HISTORY_SCAN_LIMIT} 条（见该常量），长会话下开销恒定、不随历史增长而变慢。
  * 该推导依赖「历史消息全量保留」：{@link MemoryMergeService} 的滚动摘要只把窗口外消息排除出
  * 主模型上下文、<b>不物理删除 chat_message 行</b>（见其类注释）。若未来改为物理归档旧消息，
  * 必须先同步本服务的重放逻辑（否则追问计数与已确认参数会静默丢失）。
@@ -51,6 +52,17 @@ public class ParamFillingService {
 
     /** 追问消息的固定前缀：既是友好提示，也用于从历史中识别并统计连续追问段。 */
     private static final String CLARIFY_PREFIX = "🔎 还需补充信息";
+
+    /**
+     * 历史读取条数上限：本服务所有历史读取都只取最近这么多条。
+     * <p>
+     * 为什么不做全量：本服务只需要「尾部」信息——连续追问计数从末尾向前回溯到最近一次正式回答即止
+     * （追问段最长 {@link #MAX_CLARIFY} 轮 = 至多 6 条消息），参数抽取只看最近 12 条
+     * （见 {@link #clarifyScopedHistory}），「最近一条追问」也一定落在尾部。故 50 条对上述全部用途
+     * 都是充分覆盖。反过来，全量读取会让长会话（数百条）每轮都做一次无界 selectList——
+     * 而 AI 记忆本身只按 token 预算读最近窗口，全量拉取属于纯浪费。
+     */
+    private static final int HISTORY_SCAN_LIMIT = 50;
 
     private final ChatModel chatModel;
     private final ConversationService conversationService;
@@ -95,7 +107,8 @@ public class ParamFillingService {
             return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
         }
         // 历史（不含本轮用户输入，由 advisor 在调用主模型时落库；追问分支由本方法手动落库）
-        List<ChatMessage> history = conversationService.getHistory(conversationId);
+        // 有界读取最近若干条即可覆盖全部用途（见 HISTORY_SCAN_LIMIT），长会话下开销恒定
+        List<ChatMessage> history = conversationService.getRecentHistory(conversationId, HISTORY_SCAN_LIMIT);
         int asked = countClarifyStreak(history);                       // 已连续追问次数（只看 assistant 消息，开销可忽略，用全量）
         // 参数抽取只取「当前这一次追问任务」的范围：从最后一次正式回答（非追问）之后的用户请求开始，
         // 到历史末尾。即「原始请求 + 至多 MAX_CLARIFY 轮问答」，天然有界，且跨任务自动隔离
@@ -157,7 +170,8 @@ public class ParamFillingService {
      * 让路由 LLM 区分「在回答追问」与「开启了新话题」。
      */
     public String lastClarifyQuestion(String conversationId) {
-        List<ChatMessage> history = conversationService.getHistory(conversationId);
+        // 最近一条追问一定落在尾部，有界读取即可（见 HISTORY_SCAN_LIMIT）
+        List<ChatMessage> history = conversationService.getRecentHistory(conversationId, HISTORY_SCAN_LIMIT);
         if (history == null || history.isEmpty()) return null;
         for (int i = history.size() - 1; i >= 0; i--) {
             ChatMessage m = history.get(i);

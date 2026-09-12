@@ -9,6 +9,7 @@ import org.luo.exception.AiErrorCode;
 import org.luo.service.AgentService;
 import org.luo.service.ChatService;
 import org.luo.agent.PromptService;
+import org.luo.tool.ToolRegistry;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -25,6 +26,7 @@ import java.util.List;
  * <p>
  * GET    /api/agent                 - 智能体列表（按最近更新倒序）
  * GET    /api/agent/{id}            - 单个智能体详情
+ * GET    /api/agent/tools           - 可用工具清单（供「工具装配」选择界面使用）
  * POST   /api/agent                 - 创建智能体
  * DELETE /api/agent/{id}            - 删除智能体（同时解除会话绑定）
  * POST   /api/agent/generate-prompt - 用 AI 根据名称/描述生成系统提示词
@@ -35,10 +37,12 @@ public class AgentController {
 
     private final AgentService agentService;
     private final PromptService promptService;
+    private final ToolRegistry toolRegistry;
 
-    public AgentController(AgentService agentService, PromptService promptService) {
+    public AgentController(AgentService agentService, PromptService promptService, ToolRegistry toolRegistry) {
         this.agentService = agentService;
         this.promptService = promptService;
+        this.toolRegistry = toolRegistry;
     }
 
     @GetMapping
@@ -64,6 +68,15 @@ public class AgentController {
         return a;
     }
 
+    /**
+     * 可用工具清单（供智能体编辑弹窗的「工具装配」区域展示，前端按 group 分组）。
+     * 注意：{@code /tools} 为字面量路径，Spring 匹配优先级高于 {@code /{id}}，不会被当作 ID 解析。
+     */
+    @GetMapping("/tools")
+    public List<ToolRegistry.ToolInfo> tools() {
+        return toolRegistry.getAvailableTools();
+    }
+
     @PostMapping
     public Agent create(@RequestBody UpsertAgentRequest req) {
         return agentService.createAgent(req);
@@ -76,7 +89,7 @@ public class AgentController {
         if (req.id() == null) {
             req = new UpsertAgentRequest(
                     id, req.name(), req.agentCode(), req.icon(), req.description(),
-                    req.systemPrompt(), req.paramSchema(),
+                    req.systemPrompt(), req.paramSchema(), req.toolsJson(),
                     req.model(), req.temperature(), req.avatarColor());
         }
         return agentService.updateAgent(req);

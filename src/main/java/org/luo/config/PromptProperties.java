@@ -59,6 +59,12 @@ public class PromptProperties {
     /** 数据实时性强制规则（追加到声明「数据实时性」原则的智能体提示词之后）。 */
     private List<String> realtimeRule = new ArrayList<>();
 
+    /** 知识库资料块模板（RAG 注入系统提示词；含 {items} 占位符，编号即引用序号）。 */
+    private List<String> kbContext = new ArrayList<>();
+
+    /** 检索查询改写提示词（RAG 多轮指代消解；纯静态，输入由调用方拼在 user 消息里）。 */
+    private List<String> queryRewriteSystem = new ArrayList<>();
+
     // ------------------------------------------------------------------
     // 便捷读取器：把 List<String> 拼接为带 \n 的完整文本
     // ------------------------------------------------------------------
@@ -97,6 +103,14 @@ public class PromptProperties {
 
     public String realtimeRule() {
         return join(realtimeRule);
+    }
+
+    public String kbContext() {
+        return join(kbContext);
+    }
+
+    public String queryRewriteSystem() {
+        return join(queryRewriteSystem);
     }
 
     /** 把行列表拼接为带换行的完整文本；空列表返回空串。 */

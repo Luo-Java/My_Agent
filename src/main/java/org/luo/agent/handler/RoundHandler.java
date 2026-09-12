@@ -1,6 +1,7 @@
 package org.luo.agent.handler;
 
 import org.luo.entity.Conversation;
+import org.luo.trace.RoundTrace;
 
 import java.util.function.Consumer;
 import org.luo.service.ChatService;
@@ -26,8 +27,12 @@ public interface RoundHandler {
      *                       空串表示无附件
      * @param progress       执行过程播报回调（流式接口推 progress 事件，同步接口传空回调），
      *                       这些文本只展示、不进记忆
+     * @param trace          本轮链路追踪上下文（可观测性）：实现类把本环节的事实写进去
+     *                       （路由结论 / 计划 / RAG 引用），工具调用与 token 由 Advisor 采集。
+     *                       纯旁路，写不进去也不影响对话，故允许为 null
      * @return 本轮结果；本策略无法处理时返回 {@link RoundResult#fallback()}（其 reply 为 null），
      *         由调用方回退到普通对话策略——请勿返回裸 {@code null}，以免与异常/未处理语义混淆
      */
-    RoundResult handle(Conversation conv, String conversationId, String message, String material, Consumer<String> progress);
+    RoundResult handle(Conversation conv, String conversationId, String message, String material,
+                       Consumer<String> progress, RoundTrace trace);
 }

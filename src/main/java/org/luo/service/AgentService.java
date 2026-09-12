@@ -227,6 +227,9 @@ public class AgentService {
         if (req.description() != null) a.setDescription(req.description().trim());
         if (req.systemPrompt() != null) a.setSystemPrompt(req.systemPrompt());
         if (req.paramSchema() != null) a.setParamSchema(req.paramSchema());
+        // toolsJson 与其余字段不同：null 是有意义取值（=不限制、挂全部工具），必须原样写入。
+        // 若按「跳过空值」处理，则无法把智能体从「白名单」改回「全部工具」（前端传 null 会被忽略）。
+        a.setToolsJson(req.toolsJson());
         a.setModel(req.model() != null && !req.model().isBlank() ? req.model().trim() : null);
         a.setTemperature(req.temperature());
         a.setAvatarColor(req.avatarColor() != null && !req.avatarColor().isBlank() ? req.avatarColor().trim() : null);

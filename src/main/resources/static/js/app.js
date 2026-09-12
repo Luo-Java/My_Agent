@@ -81,11 +81,14 @@ function escapeHtml(text) {
 
 /** 构造一条消息对象，预渲染 html 字段（v-html 直接绑定，避免流式突变不刷新）。
  *  version：每次内容更新自增，用作 v-html 所在 DOM 的 :key，强制 Vue 重建节点，
- *  规避流式高频更新下 v-html 未刷新（DOM 停留在中间态）导致的 Markdown 未渲染问题。 */
-function toMsg(role, content, attachments) {
+ *  规避流式高频更新下 v-html 未刷新（DOM 停留在中间态）导致的 Markdown 未渲染问题。
+ *  citations：AI 消息的 RAG 引用来源（[{index,kbName,source,score}]），来自历史接口或当轮 SSE citations 事件。 */
+function toMsg(role, content, attachments, citations) {
     return {
         role, content: content || '', html: renderMd(content || ''), version: 0,
-        attachments: (attachments && attachments.length) ? attachments : undefined
+        attachments: (attachments && attachments.length) ? attachments : undefined,
+        citations: (citations && citations.length) ? citations : undefined,
+        citesOpen: true
     };
 }
 
@@ -93,6 +96,8 @@ createApp({
     setup() {
         const conversations = ref([]);
         const agents = ref([]);
+        // 可用工具清单（GET /api/agent/tools）：供智能体弹窗「工具装配」区域选择，按 group 分组展示
+        const availableTools = ref([]);
         const messages = ref([]);
         const input = ref('');
         const loading = ref(false);
@@ -197,6 +202,10 @@ createApp({
             temperature: null,
             avatarColor: '',
             paramList: [],   // 参数补全列表（结构化，保存时序列化为 JSON 串写入 paramSchema）
+            // 工具装配：toolMode ∈ all（全部工具，存 null）/ none（不使用，存 "[]"）/ custom（白名单，存 JSON 数组）
+            toolMode: 'all',
+            toolNames: [],   // custom 模式下勾选的工具名（对应 ToolDefinition.name）
+            toolSearch: '',  // 工具列表搜索词（仅影响展示，不影响已勾选结果）
             saving: false,
             genLoading: false
         });
@@ -394,7 +403,7 @@ createApp({
                 const resp = await fetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
                 if (resp.ok) {
                     const data = await resp.json();
-                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments));
+                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations));
                 }
             } catch (e) { /* 忽略 */ }
             scrollToBottom();
@@ -459,12 +468,61 @@ createApp({
             } catch (e) { /* 忽略 */ }
         }
 
+        /** 拉取可用工具清单（工具集在应用启动时固定，拉一次即可）。失败静默，不影响智能体管理主流程。 */
+        async function loadTools() {
+            try {
+                const resp = await fetch('/api/agent/tools');
+                if (resp.ok) availableTools.value = await resp.json();
+            } catch (e) { /* 忽略 */ }
+        }
+
+        /** 工具清单按 group（所属 ToolProvider 类名）分组，用于弹窗里分块展示与勾选。
+         *  带搜索词时只保留「工具名或描述」命中的项（过滤仅作用展示层，已勾选结果不受影响）。 */
+        const toolGroups = computed(() => {
+            const q = (agentModal.toolSearch || '').trim().toLowerCase();
+            const map = new Map();
+            for (const t of availableTools.value) {
+                if (q && !((t.name || '') + ' ' + (t.description || '')).toLowerCase().includes(q)) continue;
+                const g = t.group || '其他';
+                if (!map.has(g)) map.set(g, []);
+                map.get(g).push(t);
+            }
+            return Array.from(map, ([group, tools]) => ({ group, tools }));
+        });
+
+        /** 工具分组显示名（后端 group 为 ToolProvider 类名，这里转为中文便于阅读）。 */
+        function toolGroupLabel(group) {
+            const s = String(group || '');
+            if (s.includes('Weather')) return '天气';
+            if (s.includes('Date')) return '日期';
+            if (s.includes('SqlQuery')) return '数据查询';
+            if (s.includes('SqlSchema')) return '数据表结构';
+            if (s.includes('Chart')) return '图表';
+            return s || '其他';
+        }
+
+        /** 全选：勾上「当前列表可见」的工具（有搜索词时只选命中的，无搜索词即全部）。
+         *  与已有勾选合并去重，不会取消先前搜别的词时勾上的工具。 */
+        function toolSelectAll() {
+            const set = new Set(agentModal.toolNames);
+            for (const g of toolGroups.value) {
+                for (const t of g.tools) set.add(t.name);
+            }
+            agentModal.toolNames = Array.from(set);
+        }
+
+        /** 清空：取消全部勾选（不受当前搜索词影响）。 */
+        function toolClearAll() {
+            agentModal.toolNames = [];
+        }
+
         function openCreateAgent() {
             Object.assign(agentModal, {
                 open: true, id: null,
                 name: '', agentCode: '', icon: '', description: '', systemPrompt: '',
                 model: '', temperature: null, avatarColor: '',
                 paramList: [],
+                toolMode: 'all', toolNames: [], toolSearch: '',
                 saving: false, genLoading: false
             });
         }
@@ -486,6 +544,7 @@ createApp({
         }
 
         function openEditAgent(a) {
+            const t = parseTools(a.toolsJson);
             Object.assign(agentModal, {
                 open: true, id: a.id,
                 name: a.name || '',
@@ -497,9 +556,40 @@ createApp({
                 temperature: a.temperature ?? null,
                 avatarColor: a.avatarColor || '',
                 paramList: parseParamSchema(a.paramSchema),
+                toolMode: t.mode, toolNames: t.names, toolSearch: '',
                 saving: false, genLoading: false
             });
             agentView.open = false; // 从查看弹窗进入编辑时关闭查看弹窗
+        }
+
+        /**
+         * 把后端 toolsJson（字符串）解析为前端三态编辑模型：
+         * null/空 → { mode:'all' }（不限制，挂全部工具）；"[]" → { mode:'none' }（不使用工具）；
+         * ["a","b"] → { mode:'custom', names:['a','b'] }。解析失败按 all 处理（与后端回退策略一致）。
+         */
+        function parseTools(str) {
+            if (str == null || String(str).trim() === '') return { mode: 'all', names: [] };
+            try {
+                const arr = JSON.parse(str);
+                if (!Array.isArray(arr) || arr.length === 0) return { mode: 'none', names: [] };
+                return { mode: 'custom', names: arr.map(String) };
+            } catch (e) {
+                return { mode: 'all', names: [] };
+            }
+        }
+
+        /**
+         * 把三态编辑模型序列化为后端 toolsJson：
+         * all → null（不限制，等价于存量智能体的默认行为）；none → "[]"；custom → JSON 数组字符串。
+         */
+        function buildToolsJson() {
+            const mode = agentModal.toolMode;
+            if (mode === 'none') return '[]';
+            if (mode === 'custom') {
+                const names = (agentModal.toolNames || []).filter(Boolean);
+                return JSON.stringify(names);
+            }
+            return null;   // all：不限制，挂全部工具
         }
 
         /**
@@ -606,7 +696,8 @@ createApp({
                 model: m.model || null,
                 temperature: (m.temperature === '' || m.temperature == null) ? null : Number(m.temperature),
                 avatarColor: m.avatarColor || null,
-                paramSchema: buildParamSchema()
+                paramSchema: buildParamSchema(),
+                toolsJson: buildToolsJson()
             };
             const url = m.id ? ('/api/agent/' + encodeURIComponent(m.id)) : '/api/agent';
             const method = m.id ? 'PUT' : 'POST';
@@ -1077,6 +1168,55 @@ createApp({
             }
         }
 
+        // ===== 链路追踪（可观测） =====
+        // 每轮对话在回复产出后由后端异步落库到 agent_trace，这里只读展示：
+        // 回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「调了哪些工具、花了多少 token、耗时多久」。
+        // items：追踪列表（按时间倒序）；expanded：按索引记录哪几条展开了明细。
+        const traceModal = reactive({ open: false, loading: false, items: [], expanded: {}, error: '' });
+        async function openTrace() {
+            traceModal.open = true;
+            traceModal.loading = true;
+            traceModal.items = [];
+            traceModal.expanded = {};
+            traceModal.error = '';
+            try {
+                const q = currentId.value ? ('?conversationId=' + encodeURIComponent(currentId.value)) : '';
+                const resp = await fetch('/api/trace' + q);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const list = await resp.json();
+                traceModal.items = Array.isArray(list) ? list : [];
+                if (!traceModal.items.length) {
+                    traceModal.error = '本会话暂无追踪记录（追踪在本轮回复产出后异步落库，可稍后重试）';
+                }
+            } catch (e) {
+                traceModal.error = '加载失败：' + e.message;
+            } finally {
+                traceModal.loading = false;
+            }
+        }
+        function toggleTrace(i) {
+            traceModal.expanded[i] = !traceModal.expanded[i];
+        }
+        /** 处理方来源 → 中文标签（与后端 agent_trace.route_source 取值对应）。 */
+        function routeLabel(src) {
+            return ({ BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排' })[src] || (src || '-');
+        }
+        /** 形态 → 中文标签。 */
+        function modeLabel(mode) {
+            return mode === 'planner' ? '规划模式' : '普通对话';
+        }
+        /** 耗时 → 可读文本。 */
+        function fmtElapsed(ms) {
+            if (!ms && ms !== 0) return '-';
+            return ms < 1000 ? (ms + ' ms') : ((ms / 1000).toFixed(2) + ' s');
+        }
+        /** 相关度分 → 百分比文本（精排分为 0~1，余弦也可能为负，负数一律显示 0%）。 */
+        function fmtScore(score) {
+            const n = Number(score);
+            if (!isFinite(n)) return '-';
+            return Math.round(Math.max(0, Math.min(1, n)) * 100) + '%';
+        }
+
         // ===== 发送消息（流式） =====
         async function send() {
             const text = input.value.trim();
@@ -1138,7 +1278,8 @@ createApp({
             });
             // steps：本次运行的执行过程（规划与逐步进展）。仅前端临时展示，后端不写入会话记忆，
             // 因此刷新页面或重新打开会话时不会出现（历史消息只有最终结果）。
-            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true });
+            // citesOpen：引用来源列表默认展开（有引用时才是视觉焦点）。
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true });
             input.value = '';
             loading.value = true;
             scrollToBottom();
@@ -1180,9 +1321,11 @@ createApp({
                         });
                         if (!data) continue;
                         // 后端按事件类型给字段名：token=正文分片（进记忆）；progress=执行过程（不进记忆）；
+                        // citations=RAG 引用来源（正文推完后发一次，不进记忆，单独落库供历史回看）；
                         // error=本轮出错（红字提示、不进正文）
                         let progress = '';
                         let error = '';
+                        let citations = '';
                         try {
                             const parsed = JSON.parse(data);
                             if (parsed && typeof parsed.error === 'string') {
@@ -1190,6 +1333,9 @@ createApp({
                                 data = '';
                             } else if (parsed && typeof parsed.progress === 'string') {
                                 progress = parsed.progress;
+                                data = '';
+                            } else if (parsed && typeof parsed.citations === 'string') {
+                                citations = parsed.citations;
                                 data = '';
                             } else {
                                 data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
@@ -1207,6 +1353,15 @@ createApp({
                             // 执行过程：只收集到 steps 单独展示，绝不混进正文
                             if (!m.steps) m.steps = [];
                             m.steps.push(progress);
+                        } else if (citations) {
+                            // 引用来源：解析为列表挂在当前消息上，气泡底部渲染「引用来源」区（永不进正文）
+                            try {
+                                const list = JSON.parse(citations);
+                                if (Array.isArray(list) && list.length) {
+                                    m.citations = list;
+                                    m.citesOpen = true;
+                                }
+                            } catch (e) { /* 引用解析失败不影响正文展示 */ }
                         } else if (data) {
                             // 正文首个分片到达：自动收起执行过程，让最终结果成为视觉焦点（仍可手动展开）
                             if (!m.content && m.steps && m.steps.length) m.stepsOpen = false;
@@ -1250,6 +1405,7 @@ createApp({
         onMounted(() => {
             loadConversations();
             loadAgents();
+            loadTools(); // 可用工具清单（智能体弹窗「工具装配」用）
             loadKbs(); // 侧边栏「知识库」计数
         });
 
@@ -1268,13 +1424,16 @@ createApp({
             openCreateAgent, openEditAgent, closeAgentModal, saveAgent, deleteAgent,
             viewAgent, genPrompt, autoFillCode,
             addParam, removeParam, parseParamSchema,
+            availableTools, toolGroups, parseTools, toolGroupLabel, toolSelectAll, toolClearAll,
             agentName, agentIcon, renderMd, scroll,
             loadKbs, kbIconStyle, fmtTime, fmtSize, typeIcon, openCreateKb, openRenameKb, autoKbName,
             saveKb, deleteKb, openKbDetail, loadMoreChunks, deleteChunk,
             loadFiles, deleteKbFile,
             strategyLabel, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
-            pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles
+            pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
+            // 链路追踪（可观测）：traceModal + 展示辅助函数
+            traceModal, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore
         };
     }
 }).mount('#app');

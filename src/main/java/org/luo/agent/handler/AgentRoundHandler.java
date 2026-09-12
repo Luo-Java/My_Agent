@@ -9,9 +9,11 @@ import org.luo.service.AgentService;
 import org.luo.chat.ChatComposer;
 import org.luo.service.ConversationService;
 import org.luo.agent.ParamFillingService;
+import org.luo.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import org.luo.agent.AgentRouter.RouteDecision;
 import org.luo.service.ChatService;
@@ -36,6 +38,11 @@ public class AgentRoundHandler implements RoundHandler {
     /** 智能路由上下文最多取的最近消息条数（路由 LLM 的 token 成本控制）。 */
     private static final int RECENT_TURNS = 6;
 
+    /** 追踪用：处理方来源枚举值（与 agent_trace.route_source 列注释一致）。 */
+    private static final String SRC_BOUND = "BOUND";
+    private static final String SRC_ROUTE = "ROUTE";
+    private static final String SRC_NONE = "NONE";
+
     private final ConversationService conversationService;
     private final AgentService agentService;
     private final ParamFillingService paramFillingService;
@@ -56,7 +63,13 @@ public class AgentRoundHandler implements RoundHandler {
 
     @Override
     public RoundResult handle(Conversation conv, String conversationId, String message, String material,
-                             Consumer<String> progress) {
+                             Consumer<String> progress, RoundTrace trace) {
+        // 检索问题预取：RAG 开启时立即异步启动「多轮查询改写」，与下面的智能路由 / 参数抽取并行。
+        // 前置链原本是「路由 → 参数抽取 → 改写」三个串行模型往返，而改写只看用户原话与会话历史、
+        // 与另外两段互不依赖，提前并发能把首字延迟压掉整整一个往返
+        // （详见 ChatComposer#prefetchRetrievalQuery）。未开 RAG 返回 null、不产生任何额外调用；
+        // 本轮若走追问分支则结果作废——刻意接受的轻微浪费。
+        CompletableFuture<String> prefetchedQuery = composer.prefetchRetrievalQuery(conversationId, message, conv);
         // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
         boolean explicitBinding = AgentBindSource.EXPLICIT.equals(conv.getAgentBindSource());
         Agent agent = determineAgent(conv, message);
@@ -82,6 +95,12 @@ public class AgentRoundHandler implements RoundHandler {
             }
         }
 
+        // 追踪：处理方来源以「本轮实际生效的绑定」为准——显式绑定=BOUND；路由/追问命中=ROUTE；其余=通用助手。
+        if (trace != null) {
+            trace.route(explicitBinding ? SRC_BOUND : (agent != null ? SRC_ROUTE : SRC_NONE),
+                    agent == null ? null : agent.getAgentCode());
+        }
+
         // 播报本轮由谁处理（同样属于「执行过程」，只展示、不进记忆）；普通闲聊无 agent，不打扰。
         if (agent != null) {
             progress.accept("🤖 已交由智能体「" + agent.getName() + "」处理");
@@ -99,12 +118,15 @@ public class AgentRoundHandler implements RoundHandler {
         }
         // 常规单智能体回答（动态规划由 planner 会话单独处理，见 PlannerRoundHandler）。
         // message 为纯提问（不含附件），附件材料走 material 注入 system，不进会话记忆。
-        ChatClient.ChatClientRequestSpec spec = composer.buildRequest(conversationId, message, conv, agent,
-                paramFillingService.buildParamBlock(decision), material);
+        // prefetchedQuery 在此被消费：正常情况下它早已完成，join 不产生等待（见方法开头）。
+        ChatComposer.ComposedRequest composed = composer.buildRequest(conversationId, message, conv, agent,
+                paramFillingService.buildParamBlock(decision), material, trace, prefetchedQuery);
+        ChatClient.ChatClientRequestSpec spec = composed.spec();
         String reply = spec.call().content();
         // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
         if (!explicitBinding) conversationService.unbindAgent(conversationId);
-        return RoundResult.answer(reply);
+        // 带上本轮 RAG 引用：由 ChatService 落库到本轮 assistant 消息（前端渲染角标用）
+        return RoundResult.answer(reply, composed.citations());
     }
 
     /**

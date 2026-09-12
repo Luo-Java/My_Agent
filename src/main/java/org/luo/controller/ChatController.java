@@ -6,6 +6,7 @@ import org.luo.dto.ChatAttachment;
 import org.luo.dto.ChatRequest;
 import org.luo.dto.StreamEvent;
 import org.luo.service.ChatService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -14,10 +15,13 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.luo.agent.handler.RoundHandler;
 import org.luo.chat.ChatComposer;
 
@@ -28,6 +32,16 @@ import org.luo.chat.ChatComposer;
  * <p>
  * POST /api/chat/send   - 同步返回完整回复
  * POST /api/chat/stream - SSE 流式返回（前端逐字渲染）
+ * <p>
+ * <b>传输层兜底</b>（与业务无关，纯粹防止连接被「静默挂死」）：
+ * <ul>
+ *   <li><b>有限超时</b>：{@code app.sse.timeout-seconds}（默认 300s）。原先传 {@code 0L} 表示永不超时，
+ *       一旦某次上游调用异常卡住，这条 SSE 连接与它占用的异步线程会一直挂着、永不自愈；</li>
+ *   <li><b>心跳</b>：{@code app.sse.heartbeat-seconds}（默认 15s）。一轮对话在
+ *       「路由 → 参数抽取 → 查询改写 → 检索」的前置链上完全没有字节流出，
+ *       反向代理（nginx 默认 {@code proxy_read_timeout 60s}）会把空闲长连接直接切断，
+ *       表现为「前端莫名其妙断开」。周期发 {@link StreamEvent#ping()} 即可保活。</li>
+ * </ul>
  */
 @RestController
 @RequestMapping("/api/chat")
@@ -35,8 +49,21 @@ public class ChatController {
 
     private final ChatService chatService;
 
-    public ChatController(ChatService chatService) {
+    /**
+     * SSE 连接最长存活时间（秒）。必须有限：{@code 0} 表示永不超时，
+     * 会把「上游卡死」变成「连接永久泄漏」。默认 300s，足够覆盖最长的规划 + 多轮工具调用。
+     */
+    private final long sseTimeoutSeconds;
+
+    /** 心跳间隔（秒），{@code <=0} 表示关闭心跳。 */
+    private final long heartbeatSeconds;
+
+    public ChatController(ChatService chatService,
+                          @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
+                          @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds) {
         this.chatService = chatService;
+        this.sseTimeoutSeconds = sseTimeoutSeconds;
+        this.heartbeatSeconds = heartbeatSeconds;
     }
 
     /**
@@ -70,12 +97,16 @@ public class ChatController {
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@RequestBody ChatRequest request) {
-        SseEmitter emitter = new SseEmitter(0L);
+        // 有限超时（而非 0L=永不超时）：上游卡死时连接与异步线程能自动释放，不会永久泄漏
+        SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
         String conversationId = resolveConversationId(request.conversationId());
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
         AttachmentBundle bundle = extractAttachments(request.attachments());
         Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(),
                 bundle.material(), bundle.metaJson(), request.planner());
+
+        // 流结束标记：心跳任务据此自停；同时保证「流结束后不再往已完成的 emitter 写」
+        AtomicBoolean finished = new AtomicBoolean(false);
 
         Disposable subscription = flux.doOnNext(event -> {
                     try {
@@ -87,14 +118,45 @@ public class ChatController {
                         emitter.completeWithError(e);
                     }
                 })
-                .doOnComplete(emitter::complete)
-                .doOnError(emitter::completeWithError)
+                .doOnComplete(() -> {
+                    finished.set(true);
+                    emitter.complete();
+                })
+                .doOnError(e -> {
+                    finished.set(true);
+                    emitter.completeWithError(e);
+                })
                 .subscribe();
 
-        // 客户端断开（或超时）时取消订阅：停止后续事件推送与延迟任务，
+        // 心跳：前置链（路由→参数抽取→改写→检索）期间没有任何字节流出，容易被反向代理判为空闲而切断。
+        // 用独立的周期任务推送 ping 事件保活，与业务流完全解耦（不动流的终止语义——
+        // 若改用 Flux.merge/interval，无限流会让 emitter 永不 complete）。
+        Disposable heartbeat = heartbeatSeconds > 0
+                ? Schedulers.parallel().schedulePeriodically(() -> {
+                    if (finished.get()) {
+                        return;
+                    }
+                    try {
+                        emitter.send(Map.of(StreamEvent.TYPE_PING, "1"));
+                    } catch (Exception e) {
+                        // 客户端已断开（IOException）：连接即将因 onCompletion 被清理，这里无需额外处理
+                        finished.set(true);
+                    }
+                }, heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS)
+                : null;
+
+        // 客户端断开（或超时）时取消订阅与心跳：停止后续事件推送与延迟任务，
         // 避免 LLM 侧已排队的调用继续空烧 token（SSE 连接关闭会触发 onCompletion）。
-        emitter.onCompletion(subscription::dispose);
-        emitter.onTimeout(subscription::dispose);
+        Runnable cleanup = () -> {
+            finished.set(true);
+            subscription.dispose();
+            if (heartbeat != null) {
+                heartbeat.dispose();
+            }
+        };
+        emitter.onCompletion(cleanup);
+        emitter.onTimeout(cleanup);
+        emitter.onError(e -> cleanup.run());
         return emitter;
     }
 

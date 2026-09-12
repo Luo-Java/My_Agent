@@ -1,6 +1,8 @@
 package org.luo;
 
+import org.luo.config.MemoryProperties;
 import org.luo.config.PromptProperties;
+import org.luo.config.RagProperties;
 import org.luo.config.VisionProperties;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
@@ -9,7 +11,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 
 @SpringBootApplication
 @MapperScan("org.luo.mapper")
-@EnableConfigurationProperties({PromptProperties.class, VisionProperties.class})
+@EnableConfigurationProperties({PromptProperties.class, VisionProperties.class, RagProperties.class,
+        MemoryProperties.class})
 public class MyAgentApplication {
 
     public static void main(String[] args) {

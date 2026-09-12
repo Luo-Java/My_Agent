@@ -29,6 +29,15 @@ spring:
       # 使用 DeepSeek / 通义千问 / 本地 Ollama 等兼容服务时，改成对应地址即可，
       # 例如 DeepSeek: https://api.deepseek.com   本地 Ollama: http://localhost:11434
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      # 客户端级超时与重试，**对所有 LLM 调用生效**（含路由 / 参数抽取 / 查询改写这些前置调用）——
+      # 它们在 Spring AI 里由 OpenAiSetup.setupSyncClient 在建客户端时固化，运行时改不了。
+      # Spring AI 默认 timeout=60s、max-retries=3：重试会放大失败代价，一次持续 429/5xx 最多尝试 4 次，
+      # 前置链上每个调用都可能各花掉数十秒，用户只能干等。这里把重试收紧到 1，让失败尽快暴露
+      # （前置链各自有降级：路由失败=不路由、改写失败=用原话，都不会中断对话）。
+      # 注意：OpenAiChatOptions 虽有 timeout 字段，但 OpenAiChatModel 全文未引用它（死字段），
+      # per-request 超时无法实现，只能在这里全局配置。
+      timeout: 60s
+      max-retries: 1
       chat:
         # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
         model: kimi-k2.7-code
@@ -40,15 +49,47 @@ spring:
         # ChromaVectorStoreService 的相似度还原逻辑（注：Chroma 0.5 cosine 的 score = 2·cos − 1，非真实余弦）
         model: qwen3.7-text-embedding
 
-  # 多模态视觉识别：图片上传后由 VisionService 单独调此模型把图片转成文本 caption，再注入对话上下文。
-  # 复用 spring.ai.openai.api-key / base-url，不重复配置 key 与端点。
-  # dashscope OpenAI 兼容 /chat/completions 端点支持的模型：qwen-vl-plus（通用）/ qwen-vl-ocr（OCR 专用）等。
-#  agent.vision.model 默认 qwen-vl-plus（见 VisionProperties），可通过如下键覆盖：
-#  agent:
-#    vision:
-#      model: qwen-vl-plus
-#      max-image-bytes: 10485760   # 单图 10MB 上限，超出返回「图片过大」占位
-#      timeout-seconds: 30
+# 智能体平台自身配置。
+# ⚠️ 这几个键必须写在**顶层**，不要缩进到 spring: 下面。
+# 踩过的坑：曾把 agent: 缩进 2 格写成 spring 的子键，于是实际属性名变成 spring.agent.rag.*，
+# 与 @ConfigurationProperties("agent.rag") 完全对不上 —— 整段配置静默失效、全部回落到 record 默认值。
+# 又因为「默认值」与「这里写的值」恰好相同，问题一直没暴露，直到改配置却不生效才会发现。
+agent:
+  # 多模态视觉识别：图片由 VisionService 转文本 caption 后注入对话上下文。
+  # 复用 spring.ai.openai.api-key / base-url；dashscope 兼容端点支持 qwen-vl-plus / qwen-vl-ocr 等。
+  # vision:
+  #   model: qwen-vl-plus
+  #   max-image-bytes: 10485760   # 单图 10MB 上限，超出返回「图片过大」占位
+  #   timeout-seconds: 30
+
+  # 会话记忆窗口（见 MemoryProperties / DbChatMemory）
+  memory:
+    recent-tokens: 4000       # 维持上下文的原文预算（按字符数近似）；超出部分由滚动摘要接管
+    min-keep-messages: 2      # 窗口「至少」保留的最近消息条数（防塌缩下限，0=关闭）。
+                              # 单条消息自己超预算时，缺这条下限会让整个历史窗口变空（模型「突然失忆」）
+    max-message-chars: 4000   # 单条消息进上下文前的字符上限，超出截断并标注（0=不截断）
+
+  # RAG 检索与精排（见 RagProperties）。三段式：粗排召回 → 精排 → 编号注入。
+  # 精排走 DashScope 原生 text-rerank（不在 OpenAI 兼容路径下），复用 spring.ai.openai.api-key；
+  # 未配置 key / 超时 / 报错时自动降级为「按向量分截断」，对话不受影响。
+  rag:
+    rerank-enabled: true
+    rerank-model: gte-rerank-v2
+    rerank-url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+    rerank-min-score: 0.20    # 精排相关度下限（0~1），低于此值的候选丢弃
+    recall-k: 20              # 粗排召回候选数（交给精排的量）
+    top-k: 3                  # 最终注入提示词的资料条数
+    recall-min-score: 0.10    # 召回阶段的向量余弦下限（放宽用）
+    min-score: 0.25           # 精排不可用时沿用的向量余弦下限（严格档）
+    timeout-seconds: 5
+    # Chroma 不可用时回退 MySQL 余弦检索的扫描上限。MySQL 里向量以 JSON 文本存储，
+    # 无界扫描会把整库向量读进堆（OOM 隐患）。超限会打 warn（含真实总数），命中可能不完整。
+    fallback-max-chunks: 2000
+    # 多轮查询改写（指代消解）：检索前用最近若干轮历史把追问补全为自包含问题。
+    # 精排只能重排已召回的候选，query 本身指代不清时正确答案压根召不回来，故改写是精排的前置。
+    # 首轮无历史 / 会话未开 RAG 时自动跳过，不产生额外模型调用。
+    query-rewrite-enabled: true
+    query-rewrite-history-size: 6   # 参与改写的最近历史条数上限（控制 token 成本）
 
 # MyBatis-Plus 配置
 mybatis-plus:
@@ -82,6 +123,15 @@ chroma:
 # 推荐通过环境变量注入：set APP_API_KEY=your-key（PowerShell）/ export APP_API_KEY=your-key（bash）
 app:
   api-key: ${APP_API_KEY:}
+  # SSE 传输层兜底（见 ChatController）
+  sse:
+    # 单条 SSE 连接最长存活时间（秒）。0=永不超时——会把「上游卡死」变成「连接与异步线程永久泄漏」，
+    # 故默认给一个足够覆盖最长规划 + 多轮工具调用的有限值。
+    timeout-seconds: 300
+    # 心跳间隔（秒）。一轮对话在「路由→参数抽取→改写→检索」前置链上没有任何字节流出，
+    # 反向代理（nginx 默认 proxy_read_timeout 60s）会当空闲连接切断，表现为「前端莫名断开」。
+    # 0=关闭心跳。
+    heartbeat-seconds: 15
   # 对话附件原文件落盘目录（图片 / 文档）：仅用于历史记录回看缩略图与下载，不进 LLM 上下文、不占 token。
   # 生产建议指向固定数据盘路径，例如 D:/data/my_agent/attachments
   attachment:

@@ -21,8 +21,8 @@ public class ChatMemoryConfig {
 
     @Bean
     @ConditionalOnMissingBean(ChatMemory.class)
-    public ChatMemory chatMemory(ConversationService conversationService) {
-        return new DbChatMemory(conversationService);
+    public ChatMemory chatMemory(ConversationService conversationService, MemoryProperties memoryProperties) {
+        return new DbChatMemory(conversationService, memoryProperties);
     }
 
     @Bean

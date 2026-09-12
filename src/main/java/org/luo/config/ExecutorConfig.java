@@ -58,4 +58,48 @@ public class ExecutorConfig {
         ex.initialize();
         return ex;
     }
+
+    /**
+     * 前置链预取专用线程池（多轮查询改写）。
+     * <p>
+     * 一轮对话在「正式回答」之前有三段彼此独立的模型往返：智能路由、参数抽取、检索问题改写。
+     * 前两者有数据依赖（参数抽取需要路由结果），只有改写完全独立——它只看用户原话与会话历史。
+     * 故把改写提交到本池异步执行，与调用方的前置链并行，把它的耗时整个藏到路由/参数抽取背后。
+     * <p>
+     * 池子按「并发对话数」配置：核心 4 / 最大 8 / 有界队列 256。任务本身很短（一次模型往返），
+     * 队列满时抛 {@link java.util.concurrent.RejectedExecutionException}，调用方捕获后回退为同步改写
+     * （退化成本次改造前的行为，不影响正确性）。
+     */
+    @Bean("roundPrefetchExecutor")
+    public Executor roundPrefetchExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(4);
+        ex.setMaxPoolSize(8);
+        ex.setQueueCapacity(256);
+        ex.setKeepAliveSeconds(60);
+        ex.setThreadNamePrefix("prefetch-");
+        ex.setWaitForTasksToCompleteOnShutdown(false);
+        ex.initialize();
+        return ex;
+    }
+
+    /**
+     * 链路追踪落库专用线程池。
+     * <p>
+     * 追踪是纯旁路数据，必须在回复产出<b>之后</b>异步写，绝不能挡在用户看到答案之前；
+     * 池子配得很小（核心 2 / 最大 4 / 队列 2000）——积压时宁可丢追踪记录，也不抢占对话资源。
+     * 队列满抛 {@link java.util.concurrent.RejectedExecutionException}，由 TraceService 捕获记 debug 日志。
+     */
+    @Bean("traceExecutor")
+    public Executor traceExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(2);
+        ex.setMaxPoolSize(4);
+        ex.setQueueCapacity(2000);
+        ex.setKeepAliveSeconds(60);
+        ex.setThreadNamePrefix("trace-");
+        ex.setWaitForTasksToCompleteOnShutdown(false);
+        ex.initialize();
+        return ex;
+    }
 }

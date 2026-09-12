@@ -52,6 +52,18 @@ public class Agent {
      */
     private String paramSchema;
 
+    /**
+     * 工具装配（JSON 数组）：声明该智能体可用的工具白名单，实现「按智能体装配工具」。
+     * <ul>
+     *   <li>{@code null} / 空 —— 不限制，挂载全部工具（默认值，兼容历史数据，行为与改造前一致）；</li>
+     *   <li>{@code "[]"} —— 不挂任何工具（纯聊天 / 文案类智能体，避免被无关工具干扰）；</li>
+     *   <li>{@code ["queryWeatherByDate","chart_echarts"]} —— 仅挂白名单内工具。</li>
+     * </ul>
+     * 元素为工具名，取 {@code ToolDefinition.name()}（{@code @Tool} 未指定 name 时即方法名），
+     * 可用值见 {@code GET /api/agent/tools}。解析与匹配见 {@code ToolRegistry#resolve(String)}。
+     */
+    private String toolsJson;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;

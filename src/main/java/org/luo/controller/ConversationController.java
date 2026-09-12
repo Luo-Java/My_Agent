@@ -8,6 +8,7 @@ import org.luo.dto.AttachmentDto;
 import org.luo.dto.ConversationSummary;
 import org.luo.dto.CreateConversationRequest;
 import org.luo.dto.HistoryResponse;
+import org.luo.dto.KbCitation;
 import org.luo.dto.MessageDto;
 import org.luo.dto.NewConversationResponse;
 import org.luo.dto.PlannerEnabledRequest;
@@ -146,8 +147,8 @@ public class ConversationController {
     /**
      * 读取某会话的历史消息（按时间正序）。
      * <p>
-     * 用户消息会附带本轮附件展示元数据（仅文件名/类型/缩略图 URL，不含正文）；该数据不参与记忆读取，
-     * 仅供前端渲染缩略图与下载链接，对 LLM 上下文与 token 零影响。
+     * 用户消息会附带本轮附件展示元数据（仅文件名/类型/缩略图 URL，不含正文）；助手消息会附带本轮
+     * RAG 引用来源（[n] 角标与来源列表）。两者都不参与记忆读取，仅供前端渲染，对 LLM 上下文与 token 零影响。
      *
      * @param conversationId 会话 ID
      * @return 会话 ID + 消息列表
@@ -155,7 +156,9 @@ public class ConversationController {
     @GetMapping("/history")
     public HistoryResponse history(@RequestParam String conversationId) {
         List<MessageDto> messages = conversationService.getHistory(conversationId).stream()
-                .map(m -> new MessageDto(m.getRole(), m.getContent(), parseAttachments(m.getAttachmentsJson())))
+                .map(m -> new MessageDto(m.getRole(), m.getContent(),
+                        parseAttachments(m.getAttachmentsJson()),
+                        KbCitation.parse(m.getCitationsJson())))
                 .toList();
         return new HistoryResponse(conversationId, messages);
     }

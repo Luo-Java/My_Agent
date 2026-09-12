@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
     role            VARCHAR(20)                          COMMENT '消息角色：user=用户，assistant=AI助手',
     content         TEXT                                 COMMENT '消息内容（用户提问或AI回复文本）',
     attachments_json TEXT        DEFAULT NULL            COMMENT '本轮附件元数据（JSON数组：type/filename/storedName/size）；仅用于历史展示，不参与记忆读取（DbChatMemory.get 不读此列，零 token 开销）',
+    citations_json   TEXT        DEFAULT NULL            COMMENT '本轮 RAG 引用来源（JSON数组：index/kbName/source/chunkId/score）；仅 assistant 消息、仅用于历史展示与前端角标，不参与记忆读取',
     created_at      DATETIME                             COMMENT '消息写入时间（同一轮用户与助手相差纳秒级以保证顺序）',
     PRIMARY KEY (id),
     -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS agent (
     description   VARCHAR(512) NOT NULL                   COMMENT '智能体描述（可选）',
     system_prompt TEXT         NOT NULL                   COMMENT '系统提示词/人设，作为该智能体对话的 SystemMessage 注入',
     param_schema  TEXT         DEFAULT NULL               COMMENT '参数清单（JSON）：声明执行所需参数，用于对话中的追问/参数补全；为空表示不启用',
+    tools_json    VARCHAR(1000) DEFAULT NULL              COMMENT '工具装配（JSON数组）：NULL=不限制（挂载全部工具，向后兼容）；[]=不挂任何工具；["工具名",...]=仅挂白名单内工具',
     model         VARCHAR(128) DEFAULT NULL               COMMENT '模型名称覆盖（可选），如 gpt-4o、deepseek-chat',
     temperature   DOUBLE        DEFAULT NULL              COMMENT '温度（可选），控制回复随机性，通常 0~2',
     avatar_color  VARCHAR(32)  DEFAULT NULL               COMMENT '主题色（可选），前端展示用，如 #3b82f6',
@@ -90,3 +92,33 @@ CREATE TABLE IF NOT EXISTS kb_file (
     UNIQUE KEY uk_kb_file (kb_id, file_name),
     INDEX idx_kb_file_kb (kb_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '知识库文件表：每个知识库维护的文件列表（文件是知识的上传与管理单元）';
+
+-- 智能体链路追踪表：一轮对话的全链路留痕（可观测性 / 调优依据）。
+-- 记录「本轮是谁处理的、有没有走 RAG、命中了什么、调了哪些工具、花了多少 token、耗时多少」，
+-- 用于回答「这轮为什么路由到 X」「规划器哪一步慢」「RAG 有没有命中」这类问题。
+-- 纯旁路数据：异步落库、失败只记日志，绝不参与对话主链路，也不被任何检索/记忆读取。
+CREATE TABLE IF NOT EXISTS agent_trace (
+    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '追踪记录ID',
+    trace_id          VARCHAR(64)  NOT NULL                COMMENT '本轮唯一追踪ID（UUID，同一轮内所有阶段共用一个）',
+    conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID，关联 conversation.id',
+    mode              VARCHAR(16)  DEFAULT NULL            COMMENT '本轮形态：agent=普通/智能体对话，planner=规划模式',
+    route_source      VARCHAR(24)  DEFAULT NULL            COMMENT '处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排',
+    agent_code        VARCHAR(64)  DEFAULT NULL            COMMENT '本轮实际处理/路由到的智能体编码（规划模式为最终步骤的智能体）',
+    user_message      VARCHAR(1000) DEFAULT NULL           COMMENT '用户本轮输入（截断）',
+    retrieval_query   VARCHAR(1000) DEFAULT NULL           COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）',
+    plan_json         TEXT         DEFAULT NULL            COMMENT '规划模式的步骤计划 JSON（mode=planner 时有值）',
+    tool_calls        TEXT         DEFAULT NULL            COMMENT '工具调用明细 JSON 数组：name/args/result（均截断）',
+    kb_hit_count      INT          NOT NULL DEFAULT 0      COMMENT 'RAG 命中条数（0=未命中或未开启）',
+    citations_json    TEXT         DEFAULT NULL            COMMENT 'RAG 引用来源 JSON（与 chat_message.citations_json 同构）',
+    prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本轮输入 token 合计（多次模型调用累加）',
+    completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本轮输出 token 合计',
+    total_tokens      INT          NOT NULL DEFAULT 0      COMMENT '本轮 token 合计',
+    elapsed_ms        BIGINT       NOT NULL DEFAULT 0      COMMENT '本轮总耗时（毫秒，从进入编排到产出回复）',
+    status            VARCHAR(16)  NOT NULL DEFAULT 'ok'   COMMENT '本轮结果：ok=正常产出，error=异常',
+    error_message     VARCHAR(1000) DEFAULT NULL           COMMENT '异常信息（status=error 时）',
+    created_at        DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_trace_id (trace_id),
+    INDEX idx_trace_conv (conversation_id, created_at),
+    INDEX idx_trace_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '智能体链路追踪表：一轮对话的路由/RAG/工具/token/耗时留痕';

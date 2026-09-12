@@ -23,7 +23,7 @@
 | Spring AI | 2.0.0（`spring-ai-starter-model-openai`，兼容 OpenAI 协议） |
 | MyBatis-Plus | 3.5.16（`mybatis-plus-spring-boot4-starter`） |
 | MySQL | 8.x（`mysql-connector-j`） |
-| Chroma | 0.5.x（向量加速副本，`spring-ai-chroma-store` 2.0.0；与 MySQL 双写，缺失自动降级） |
+| Chroma | 0.5.23（向量加速副本，`spring-ai-chroma-store` 2.0.0；与 MySQL 双写，缺失自动降级） |
 | Hutool | 5.8.38（JSON 解析统一用 `JSONUtil`，规避 Jackson ObjectMapper） |
 | 前端 | 内置静态页面（`static/index.html` + Vue3 + 原生 CSS） |
 
@@ -36,7 +36,7 @@
 - MySQL 8.x（连接串会自动建库）
 - Chroma 服务（可选，`chroma run` 后监听 8000；未启动时知识库检索自动降级 MySQL，功能不受阻）。**命名空间**：Spring AI 2.0 默认的 `SpringAiTenant/SpringAiDatabase` 在本地 Chroma 0.5.x 上不存在，且其 `getCollection` 不认 Chroma 的 `400 InvalidCollection`，会导致初始化必失败；本项目固定使用 Chroma 原生的 `default_tenant/default_database`（`chroma.tenant`/`chroma.database` 可配），collection 首次使用时自动创建，无需手工建库。
   - **连接失败自动重试**：失败后进入 `chroma.retry-interval-seconds`（默认 60 秒）冷却，冷却结束自动重连，「先起应用后起 Chroma」无需重启。
-  - **集合空间必须是 cosine**：Chroma 0.5.x 已不从 metadata 的 `hnsw:space` 读取空间（会建成 l2，导致 `1-distance` 相似度普遍偏低、命中被阈值滤掉），因此建库走原生 HTTP 的 `configuration.hnsw_configuration.space=cosine`；检测到存量 l2 集合**且为空**时会自动删除重建为 cosine，非空则保留并换算阈值（日志会 warn）。
+  - **集合空间必须是 cosine**：Chroma 0.5.23 已不从 metadata 的 `hnsw:space` 读取空间（会建成 l2，导致 `1-distance` 相似度普遍偏低、命中被阈值滤掉），因此建库走原生 HTTP 的 `configuration.hnsw_configuration.space=cosine`；检测到存量 l2 集合**且为空**时会自动删除重建为 cosine，非空则保留并换算阈值（日志会 warn）。
   - **状态自检**：`GET /api/kb/chroma/status` 返回连接状态、空间、向量条数；`POST /api/kb/chroma/sync` 幂等回填副本。前端知识库详情顶部也有状态条与「同步本库」按钮。
 
 ### 2. 初始化数据库

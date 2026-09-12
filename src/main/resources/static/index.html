@@ -77,6 +77,9 @@
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
                 <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
                 <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
+                <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
+                <button v-if="currentId" class="trace-btn" @click="openTrace"
+                        title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
             </header>
             <div class="messages" ref="scroll">
                 <div class="empty" v-if="messages.length === 0">
@@ -119,6 +122,25 @@
                                 <span v-if="m.content">{{ m.content }}</span>
                             </div>
                             <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
+                            <!-- RAG 引用来源（溯源）：回答正文里的 [n] 角标对应这里的第 n 条。
+                                 数据来自当轮 SSE citations 事件或历史接口的 citations 字段；
+                                 与「执行过程」同理只作展示，不进正文、不进会话记忆。 -->
+                            <div v-if="m.role !== 'user' && m.citations && m.citations.length" class="msg-citations">
+                                <div class="cites-head" @click="m.citesOpen = !m.citesOpen">
+                                    <span class="cites-caret">{{ m.citesOpen ? '▾' : '▸' }}</span>
+                                    <span>引用来源 · {{ m.citations.length }}</span>
+                                    <span class="cites-hint">来自知识库检索</span>
+                                </div>
+                                <div class="cites-body" v-show="m.citesOpen">
+                                    <div class="cite-line" v-for="c in m.citations" :key="c.index">
+                                        <span class="cite-no">[{{ c.index }}]</span>
+                                        <span class="cite-src">
+                                            {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
+                                        </span>
+                                        <span class="cite-score" :title="'相关度 ' + c.score">{{ fmtScore(c.score) }}</span>
+                                    </div>
+                                </div>
+                            </div>
                         </template>
                         <span v-else-if="loading && i === messages.length - 1" class="typing">
                             <span></span><span></span><span></span>
@@ -429,6 +451,72 @@
                     <div class="field-hint">示例（翻译官）：目标语言 targetLang（必填，可选项：英语、日语、韩语）；语气 tone（可选，可选项：正式、口语）</div>
                 </div>
 
+                <!-- 工具装配：控制该智能体可调用哪些工具。默认「全部工具」与历史行为一致；
+                     翻译/闲聊等纯文本智能体选「不使用工具」，避免被 SQL、天气等无关工具干扰人设。 -->
+                <div class="param-section">
+                    <div class="label-row">
+                        <label>工具装配</label>
+                    </div>
+                    <div class="field-hint">控制该智能体可调用的工具范围。纯聊天 / 翻译类建议选「不使用工具」，避免被无关工具干扰人设。</div>
+
+                    <div class="tool-mode-row">
+                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'all' }">
+                            <input type="radio" value="all" v-model="agentModal.toolMode" />
+                            <span class="tmc-icon">🌐</span>
+                            <span class="tmc-text"><b>全部工具</b><small>默认，不限制</small></span>
+                        </label>
+                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'none' }">
+                            <input type="radio" value="none" v-model="agentModal.toolMode" />
+                            <span class="tmc-icon">💬</span>
+                            <span class="tmc-text"><b>不使用工具</b><small>纯聊天推荐</small></span>
+                        </label>
+                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'custom' }">
+                            <input type="radio" value="custom" v-model="agentModal.toolMode" />
+                            <span class="tmc-icon">🎯</span>
+                            <span class="tmc-text"><b>指定工具</b><small>按需勾选</small></span>
+                        </label>
+                    </div>
+
+                    <div v-if="agentModal.toolMode === 'custom'" class="tool-picker">
+                        <template v-if="availableTools.length">
+                            <div class="tool-picker-head">
+                                <span class="tph-count">已选 <b>{{ agentModal.toolNames.length }}</b> / {{ availableTools.length }} 个工具</span>
+                                <div class="tph-actions">
+                                    <button type="button" class="tph-btn" @click="toolSelectAll">全选</button>
+                                    <button type="button" class="tph-btn" @click="toolClearAll">清空</button>
+                                </div>
+                            </div>
+                            <div class="tool-search">
+                                <span class="ts-icon">🔍</span>
+                                <input v-model="agentModal.toolSearch" placeholder="搜索工具名或描述…"
+                                       @keydown.esc="agentModal.toolSearch = ''" />
+                                <button v-if="agentModal.toolSearch" type="button" class="ts-clear"
+                                        @click="agentModal.toolSearch = ''" title="清除搜索">✕</button>
+                            </div>
+                            <div class="tool-scroll">
+                                <div v-if="toolGroups.length === 0" class="tool-no-result">
+                                    没有匹配「{{ agentModal.toolSearch }}」的工具
+                                </div>
+                                <div v-for="g in toolGroups" :key="g.group" class="tool-group">
+                                    <div class="tool-group-name">{{ toolGroupLabel(g.group) }}<em>{{ g.tools.length }}</em></div>
+                                    <div class="tool-grid">
+                                        <label v-for="t in g.tools" :key="t.name" class="tool-card"
+                                               :class="{ active: agentModal.toolNames.includes(t.name) }">
+                                            <input type="checkbox" :value="t.name" v-model="agentModal.toolNames" />
+                                            <span class="tool-check"></span>
+                                            <span class="tool-card-body">
+                                                <span class="tool-card-name">{{ t.name }}</span>
+                                                <span class="tool-card-desc" :title="t.description">{{ t.description }}</span>
+                                            </span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+                        <div v-else class="param-empty">暂无可选工具（后端未注册任何工具）。</div>
+                    </div>
+                </div>
+
                 <div class="row">
                     <div class="col">
                         <label>模型（可选）</label>
@@ -473,6 +561,13 @@
 
                 <label>系统提示词</label>
                 <pre class="view-prompt">{{ agentView.agent.systemPrompt }}</pre>
+
+                <label>工具装配</label>
+                <div class="view-text">
+                    <template v-if="parseTools(agentView.agent.toolsJson).mode === 'all'">全部工具（不限制）</template>
+                    <template v-else-if="parseTools(agentView.agent.toolsJson).mode === 'none'">不使用任何工具</template>
+                    <template v-else>{{ parseTools(agentView.agent.toolsJson).names.join('、') }}</template>
+                </div>
 
                 <label>参数补全</label>
                 <div v-if="parseParamSchema(agentView.agent.paramSchema).length" class="view-params">
@@ -559,6 +654,87 @@
                         @click="saveKb">
                     {{ kbModal.saving ? '保存中…' : (kbModal.mode === 'rename' ? '保存' : '创建') }}
                 </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== 链路追踪弹窗（可观测，只读） =====
+         数据来自后端 agent_trace 表：每轮对话在回复产出后异步落库，记录路由来源 / 规划步骤 /
+         RAG 命中与引用 / 工具调用与参数摘要 / token 用量 / 耗时 / 成功失败。
+         用途：回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「花了多少 token」。 -->
+    <div class="modal-mask" v-if="traceModal.open" @click.self="traceModal.open = false">
+        <div class="modal modal-trace">
+            <div class="modal-head">
+                <span>🔍 链路追踪</span>
+                <button class="modal-close" @click="traceModal.open = false">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="trace-toolbar">
+                    <span class="field-hint">仅显示当前会话的最近 50 轮；追踪在本轮回复产出后异步落库，刚发出的那一轮可能稍有延迟。</span>
+                    <button class="btn-ghost btn-sm" @click="openTrace" :disabled="traceModal.loading">
+                        {{ traceModal.loading ? '加载中…' : '刷新' }}
+                    </button>
+                </div>
+                <div v-if="traceModal.error" class="trace-empty">{{ traceModal.error }}</div>
+                <div v-else class="trace-list">
+                    <div class="trace-item" v-for="(t, ti) in traceModal.items" :key="t.traceId">
+                        <div class="trace-row" @click="toggleTrace(ti)">
+                            <span class="trace-caret">{{ traceModal.expanded[ti] ? '▾' : '▸' }}</span>
+                            <span class="trace-time">{{ fmtTime(t.createdAt) }}</span>
+                            <span class="trace-tag" :class="t.status === 'error' ? 'tag-err' : 'tag-ok'">
+                                {{ t.status === 'error' ? '失败' : '成功' }}
+                            </span>
+                            <span class="trace-tag tag-mode">{{ modeLabel(t.mode) }}</span>
+                            <span class="trace-tag tag-route">{{ routeLabel(t.routeSource) }}</span>
+                            <span v-if="t.agentCode" class="trace-agent">{{ t.agentCode }}</span>
+                            <span class="trace-metrics">
+                                <span :title="'RAG 命中块数'">📚 {{ t.kbHitCount }}</span>
+                                <span :title="'工具调用次数'">🔧 {{ (t.toolCalls && t.toolCalls.length) || 0 }}</span>
+                                <span :title="'token 合计（输入+输出）'">🎫 {{ t.totalTokens }}</span>
+                                <span :title="'本轮总耗时'">⏱ {{ fmtElapsed(t.elapsedMs) }}</span>
+                            </span>
+                        </div>
+                        <div class="trace-detail" v-show="traceModal.expanded[ti]">
+                            <div class="trace-q" v-if="t.userMessage">用户：{{ t.userMessage }}</div>
+                            <div class="trace-q trace-rq" v-if="t.retrievalQuery">🔍 检索改写：{{ t.retrievalQuery }}</div>
+                            <div class="trace-kv" v-if="t.errorMessage"><b>错误</b>{{ t.errorMessage }}</div>
+                            <div class="trace-kv">
+                                <b>token</b>输入 {{ t.promptTokens }} · 输出 {{ t.completionTokens }} · 合计 {{ t.totalTokens }}
+                            </div>
+                            <div class="trace-block" v-if="t.planJson && t.planJson !== '[]'">
+                                <div class="trace-block-title">规划步骤</div>
+                                <pre>{{ t.planJson }}</pre>
+                            </div>
+                            <div class="trace-block" v-if="t.toolCalls && t.toolCalls.length">
+                                <div class="trace-block-title">工具调用</div>
+                                <div class="trace-tool" v-for="(tc, ci) in t.toolCalls" :key="ci">
+                                    <span class="cite-no">🔧</span>
+                                    <span class="trace-tool-name">{{ tc.name }}</span>
+                                    <span class="trace-tool-text" v-if="tc.args">入参：{{ tc.args }}</span>
+                                    <span class="trace-tool-text" v-if="tc.result">返回：{{ tc.result }}</span>
+                                </div>
+                            </div>
+                            <div class="trace-block" v-if="t.citations && t.citations.length">
+                                <div class="trace-block-title">引用来源</div>
+                                <div class="cite-line" v-for="c in t.citations" :key="c.index">
+                                    <span class="cite-no">[{{ c.index }}]</span>
+                                    <span class="cite-src">
+                                        {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
+                                    </span>
+                                    <span class="cite-score">{{ fmtScore(c.score) }}</span>
+                                </div>
+                            </div>
+                            <div class="trace-block" v-if="!t.planJson && (!t.toolCalls || !t.toolCalls.length)
+                                    && (!t.citations || !t.citations.length) && !t.retrievalQuery">
+                                <div class="trace-block-title">无规划 / 无工具调用 / 无 RAG 命中</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <span class="field-hint">traceId 可在服务端日志中检索，用于定位单轮全链路日志。</span>
+                <button class="btn-primary" @click="traceModal.open = false">关闭</button>
             </div>
         </div>
     </div>
