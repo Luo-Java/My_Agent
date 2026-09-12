@@ -82,8 +82,11 @@ function escapeHtml(text) {
 /** 构造一条消息对象，预渲染 html 字段（v-html 直接绑定，避免流式突变不刷新）。
  *  version：每次内容更新自增，用作 v-html 所在 DOM 的 :key，强制 Vue 重建节点，
  *  规避流式高频更新下 v-html 未刷新（DOM 停留在中间态）导致的 Markdown 未渲染问题。 */
-function toMsg(role, content) {
-    return { role, content: content || '', html: renderMd(content || ''), version: 0 };
+function toMsg(role, content, attachments) {
+    return {
+        role, content: content || '', html: renderMd(content || ''), version: 0,
+        attachments: (attachments && attachments.length) ? attachments : undefined
+    };
 }
 
 createApp({
@@ -105,42 +108,43 @@ createApp({
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
         const ragEnabled = ref(false);
 
-        // ===== 多模态附件 =====
-        // 待发送的附件列表，每项 {file, previewUrl, caption, filename}。
-        // 选图后立刻 push 一项（previewUrl 用 URL.createObjectURL 走本地浏览零开销）；
-        // 发送时若 caption 仍为 null，先调 /api/chat/vision/describe 串行识别补齐，
-        // 再把 caption（纯文本）随 ChatRequest.attachments 发给后端，原始二进制不进会话存储。
-        // 上限 5 张 × 10MB（与后端 VisionProperties.maxImageBytes 对齐）；单次超过会拒绝发送。
+        // ===== 对话附件（图片 / 文档任意文件）=====
+        // 待发送附件列表，每项 {file, previewUrl, isImage, type, content, filename}。
+        // 图片：previewUrl 用 URL.createObjectURL 本地预览（零上传开销）；
+        // 文档：无预览，仅记录文件名，发送时统一调 /api/chat/attachment/process 拿到 type+content；
+        // 最终把 content（纯文本）随 ChatRequest.attachments 发给后端，原始二进制不进会话存储。
+        // 图片上限 10MB（后端 VisionProperties.maxImageBytes）、文档 15MB（DocumentParserService），
+        // 前端统一按 15MB 拦截；最多 5 个。
         const attachments = ref([]);
-        const imageInput = ref(null);  // hidden file input，用于 JS 触发文件选择
+        const fileInput = ref(null);  // hidden file input，用于 JS 触发文件选择
         const MAX_ATTACHMENTS = 5;
-        const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
-        function triggerImagePicker() {
+        const MAX_ATTACHMENT_SIZE = 15 * 1024 * 1024;
+        const ACCEPT = '.txt,.md,.markdown,.csv,.json,.xml,.yml,.yaml,.properties,.log,.sql,.pdf,.docx,.xlsx,image/*';
+        function triggerFilePicker() {
             if (loading.value) return;
-            if (imageInput.value) imageInput.value.click();
+            if (fileInput.value) fileInput.value.click();
         }
-        function onImagePicked(event) {
+        function onFilePicked(event) {
             const files = event.target.files;
             if (!files || !files.length) return;
             const incoming = Array.from(files);
             for (const f of incoming) {
                 if (attachments.value.length >= MAX_ATTACHMENTS) {
-                    alert(`最多 ${MAX_ATTACHMENTS} 张图片，后续未选择`);
+                    alert(`最多 ${MAX_ATTACHMENTS} 个附件，后续未选择`);
                     break;
                 }
-                if (!f.type || !f.type.startsWith('image/')) {
-                    alert(`跳过非图片文件：${f.name}`);
-                    continue;
-                }
                 if (f.size > MAX_ATTACHMENT_SIZE) {
-                    alert(`图片 ${f.name} 超过 ${(MAX_ATTACHMENT_SIZE / 1024 / 1024)}MB，已跳过`);
+                    alert(`文件 ${f.name} 超过 ${(MAX_ATTACHMENT_SIZE / 1024 / 1024)}MB，已跳过`);
                     continue;
                 }
+                const isImage = !!f.type && f.type.startsWith('image/');
                 attachments.value.push({
                     file: f,
-                    previewUrl: URL.createObjectURL(f),
-                    caption: null,
-                    filename: f.name || 'image'
+                    previewUrl: isImage ? URL.createObjectURL(f) : null,
+                    isImage,
+                    type: null,       // 由后端 /attachment/process 回填
+                    content: null,    // 由后端 /attachment/process 回填
+                    filename: f.name || (isImage ? 'image' : 'file')
                 });
             }
             // 重置 input.value 以便重复选同一文件
@@ -390,7 +394,7 @@ createApp({
                 const resp = await fetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
                 if (resp.ok) {
                     const data = await resp.json();
-                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content));
+                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments));
                 }
             } catch (e) { /* 忽略 */ }
             scrollToBottom();
@@ -1082,46 +1086,51 @@ createApp({
             if (!currentId.value) await newConversation();
             const convId = currentId.value;
 
-            // 1) 若有未识别图片，先串行上传 /api/chat/vision/describe 拿 caption
-            //    （不并发：避免请求次序错乱、单图失败导致整批混乱；超时仍能保证至少已识别部分可用）
-            const pending = attachments.value.filter(a => !a.caption);
-            if (pending.length) {
+            // 1) 把本轮所有附件一次性发给 /api/chat/attachment/process：
+            //    图片→视觉模型识别、文档→解析为文本，后端按入参顺序返回 {type, filename, content}。
+            //    任一文件解析失败不影响其余（该文件 content 为占位说明），前端照常发送。
+            if (attachments.value.length) {
                 try {
                     const fd = new FormData();
-                    pending.forEach(a => fd.append('files', a.file));
-                    const resp = await fetch('/api/chat/vision/describe', { method: 'POST', body: fd });
+                    attachments.value.forEach(a => fd.append('files', a.file));
+                    const resp = await fetch('/api/chat/attachment/process', { method: 'POST', body: fd });
                     if (!resp.ok) throw new Error('HTTP ' + resp.status);
                     const data = await resp.json();
-                    const captions = data.captions || [];
-                    const filenames = data.filenames || [];
-                    let pi = 0;
-                    for (const a of attachments.value) {
-                        if (a.caption == null && pi < captions.length) {
-                            a.caption = captions[pi];
-                            if ((!a.filename || a.filename === 'image') && filenames[pi]) {
-                                a.filename = filenames[pi];
-                            }
-                            pi++;
-                        }
+                    const results = data.results || [];
+                    for (let i = 0; i < attachments.value.length && i < results.length; i++) {
+                        const a = attachments.value[i];
+                        const r = results[i];
+                        a.type = r.type || (a.isImage ? 'image' : 'file');
+                        a.content = r.content || '';
+                        if (r.filename) a.filename = r.filename;
+                        // 落盘信息：服务端 URL 供历史/气泡直接访问；本会话仍优先用本地 blob 预览（零延迟）
+                        a.storedName = r.storedName || null;
+                        a.size = (r.size === undefined ? null : r.size);
+                        a.url = r.url || (a.storedName ? ('/files/' + a.storedName) : null);
                     }
                 } catch (e) {
-                    alert('图片识别失败：' + e.message + '\n已取消本次发送，请稍后重试');
+                    alert('附件处理失败：' + e.message + '\n已取消本次发送，请稍后重试');
                     return;
                 }
             }
 
-            // 2) 组装本轮消息：用户原文 + 已识别附件 caption（纯文本），附预览用于消息气泡展示
+            // 2) 组装本轮消息：用户原文 + 附件（解析文本供当轮注入、落盘 URL 供回看）。
+            //    气泡渲染优先用本地 blob 预览（previewUrl，零延迟），历史加载则用服务端 url(/files/xxx)。
             const userText = text;
             const attMeta = attachments.value
-                .filter(a => a.caption != null)
+                .filter(a => a.content != null)
                 .map(a => ({
-                    type: 'image',
-                    caption: a.caption,
-                    filename: a.filename || 'image',
-                    previewUrl: a.previewUrl
+                    type: a.type || (a.isImage ? 'image' : 'file'),
+                    content: a.content,
+                    filename: a.filename || (a.isImage ? 'image' : 'file'),
+                    previewUrl: a.previewUrl,
+                    url: a.url || null,
+                    storedName: a.storedName || null,
+                    size: a.size,
+                    isImage: a.isImage
                 }));
-            // 用户气泡显示：文本优先；若只有图片则显示「[图片 ×N]」+ 缩略图（attachments 渲染时使用）
-            const displayContent = userText || (attMeta.length ? `[图片 ×${attMeta.length}]` : '');
+            // 用户气泡：有文字显示文字；纯附件时 content 为空，靠 attachments 渲染缩略图/文件 chip
+            const displayContent = userText;
 
             messages.value.push({
                 role: 'user', content: displayContent, html: '', version: 0,
@@ -1144,8 +1153,12 @@ createApp({
                         conversationId: convId,
                         message: userText,
                         planner: planMode.value,
-                        // 发给后端的 attachments 不带 previewUrl（只服务端用 caption/filename/type）
-                        attachments: attMeta.length ? attMeta.map(a => ({ type: a.type, caption: a.caption, filename: a.filename })) : undefined
+                        // 发给后端的 attachments：带 content（当轮注入 LLM）+ storedName/size（落库供历史回看），
+                        // 不带 previewUrl（那是浏览器本地 blob，无意义且后端用不到）
+                        attachments: attMeta.length ? attMeta.map(a => ({
+                            type: a.type, content: a.content, filename: a.filename,
+                            storedName: a.storedName, size: a.size
+                        })) : undefined
                     })
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1244,7 +1257,7 @@ createApp({
             conversations, agents, messages, input, loading, currentId, planMode, ragEnabled,
             onRagEnabledChange, onPlannerChange,
             // 多模态附件
-            attachments, imageInput, triggerImagePicker, onImagePicked, removeAttachment,
+            attachments, fileInput, triggerFilePicker, onFilePicked, removeAttachment, ACCEPT,
             editingId, editingTitle, agentModal, agentView,
             currentAgentName, currentAgentIcon, currentAgentId, currentPlanner, currentRagOn,
             mainView, iconPresets,

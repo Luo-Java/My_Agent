@@ -95,11 +95,13 @@ public class ChatComposer {
      * 见 {@link KbSearchService#buildKbContext(Boolean, Agent, String)}）。
      */
     public ChatClient.ChatClientRequestSpec buildRequest(String conversationId, String message, Conversation conv,
-                                                         Agent agent, String paramBlock) {
+                                                         Agent agent, String paramBlock, String material) {
         String systemPrompt = applyRealtimeRule(promptService.resolveSystemPrompt(agent)
                 + buildLongTermMemoryText(conv)
                 + buildKbContext(ragOn(conv), agent, message)
                 + (paramBlock == null ? "" : paramBlock));
+        // 附件材料只进当轮 system（不进会话记忆）：记忆 Advisor 仅持久化 .user() 纯提问文本
+        systemPrompt = withMaterial(systemPrompt, material);
         return decorateRequest(chatClient.prompt()
                 .system(systemPrompt)
                 .user(message)
@@ -109,14 +111,27 @@ public class ChatComposer {
     /**
      * 通用助手兜底请求（无智能体绑定、不挂载工具）：用于规划模式回退、或规划目标与任何智能体无关时。
      * 复用带记忆的 {@code chatClient}，保证用户原始目标被写入会话历史；知识库侧同样跟随会话开关
-     * （conv.ragEnabled，此时无路由智能体 → 只检索全局库）。
+     * （conv.ragEnabled，此时无路由智能体 → 只检索全局库）。附件材料 {@code material} 仅当轮注入 system，不进记忆。
      */
-    public ChatClient.ChatClientRequestSpec buildDefaultRequest(Conversation conv, String conversationId, String message) {
+    public ChatClient.ChatClientRequestSpec buildDefaultRequest(Conversation conv, String conversationId, String message,
+                                                                String material) {
+        String systemPrompt = promptService.resolveSystemPrompt(null) + buildLongTermMemoryText(conv)
+                + buildKbContext(ragOn(conv), null, message);
+        systemPrompt = withMaterial(systemPrompt, material);
         return chatClient.prompt()
-                .system(promptService.resolveSystemPrompt(null) + buildLongTermMemoryText(conv)
-                        + buildKbContext(ragOn(conv), null, message))
+                .system(systemPrompt)
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
+    }
+
+    /**
+     * 把本轮附件材料追加到 system prompt 末尾（仅在非空时）。附件仅当轮可见、不进会话记忆：
+     * 记忆 Advisor 持久化的是 {@code .user()} 纯提问，且 system 段每轮由本方法重建、不落库。
+     */
+    private static String withMaterial(String systemPrompt, String material) {
+        if (material == null || material.isBlank()) return systemPrompt;
+        return systemPrompt + "\n\n[本轮附件材料] 以下为用户本轮上传的内容（图片已识别、文档已解析为文本），"
+                + "仅作为本次回答参考，不写入长期记忆：\n" + material;
     }
 
     /** 解析智能体系统提示词（透传 PromptService；agent 为 null 时返回通用助手提示词）。 */

@@ -55,7 +55,8 @@ public class AgentRoundHandler implements RoundHandler {
     }
 
     @Override
-    public RoundResult handle(Conversation conv, String conversationId, String message, Consumer<String> progress) {
+    public RoundResult handle(Conversation conv, String conversationId, String message, String material,
+                             Consumer<String> progress) {
         // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
         boolean explicitBinding = AgentBindSource.EXPLICIT.equals(conv.getAgentBindSource());
         Agent agent = determineAgent(conv, message);
@@ -97,8 +98,9 @@ public class AgentRoundHandler implements RoundHandler {
             return RoundResult.clarify(decision.getQuestion());
         }
         // 常规单智能体回答（动态规划由 planner 会话单独处理，见 PlannerRoundHandler）。
+        // message 为纯提问（不含附件），附件材料走 material 注入 system，不进会话记忆。
         ChatClient.ChatClientRequestSpec spec = composer.buildRequest(conversationId, message, conv, agent,
-                paramFillingService.buildParamBlock(decision));
+                paramFillingService.buildParamBlock(decision), material);
         String reply = spec.call().content();
         // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
         if (!explicitBinding) conversationService.unbindAgent(conversationId);

@@ -82,6 +82,10 @@ chroma:
 # 推荐通过环境变量注入：set APP_API_KEY=your-key（PowerShell）/ export APP_API_KEY=your-key（bash）
 app:
   api-key: ${APP_API_KEY:}
+  # 对话附件原文件落盘目录（图片 / 文档）：仅用于历史记录回看缩略图与下载，不进 LLM 上下文、不占 token。
+  # 生产建议指向固定数据盘路径，例如 D:/data/my_agent/attachments
+  attachment:
+    dir: ./data/attachments
 
 server:
   port: 8080

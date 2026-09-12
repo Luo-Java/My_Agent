@@ -41,18 +41,15 @@ public class ChatService {
 
     private final ConversationService conversationService;
     private final MemoryMergeService memoryMergeService;
-    private final PromptService promptService;
     private final AgentRoundHandler agentRoundHandler;
     private final PlannerRoundHandler plannerRoundHandler;
 
     public ChatService(ConversationService conversationService,
                        MemoryMergeService memoryMergeService,
-                       PromptService promptService,
                        AgentRoundHandler agentRoundHandler,
                        PlannerRoundHandler plannerRoundHandler) {
         this.conversationService = conversationService;
         this.memoryMergeService = memoryMergeService;
-        this.promptService = promptService;
         this.agentRoundHandler = agentRoundHandler;
         this.plannerRoundHandler = plannerRoundHandler;
     }
@@ -66,7 +63,7 @@ public class ChatService {
      * @return AI 的完整回复文本
      */
     public String chat(String conversationId, String message) {
-        return chat(conversationId, message, null);
+        return chat(conversationId, message, "", "", null);
     }
 
     /**
@@ -74,18 +71,39 @@ public class ChatService {
      * 历史消息的注入与本轮消息的落库由 MessageChatMemoryAdvisor 自动完成。
      *
      * @param conversationId 会话 ID
-     * @param message        当前用户输入
+     * @param message        当前用户输入（纯提问，不含附件内容）
      * @param planner        本轮是否按规划模式处理（null=跟随会话默认形态；非空=覆盖并写回会话，
      *                       供前端输入框「智能规划」开关使用）
      * @return AI 的完整回复文本
      */
     public String chat(String conversationId, String message, Boolean planner) {
-        log.info("同步对话：会话={}，planner={}", conversationId, planner);
+        return chat(conversationId, message, "", "", planner);
+    }
+
+    /**
+     * 同步对话（带附件）：纯提问走记忆与路由；{@code material}（解析文本）仅当轮注入模型；
+     * {@code attachmentsJson}（展示元数据）在本轮消息落库后写入用户消息，仅服务历史回看。
+     * 三者互不干扰——记忆里只有纯提问，附件既不进历史窗口也不重复消耗 token。
+     *
+     * @param conversationId  会话 ID
+     * @param message         当前用户输入（纯提问文本）
+     * @param material        本轮附件材料（图片 caption / 文档解析文本），空串表示无附件
+     * @param attachmentsJson 本轮附件展示元数据（JSON 数组，不含正文），空串表示无附件
+     * @param planner         本轮是否按规划模式处理
+     * @return AI 的完整回复文本
+     */
+    public String chat(String conversationId, String message, String material, String attachmentsJson,
+                       Boolean planner) {
+        log.info("同步对话：会话={}，planner={}，有附件={}", conversationId, planner,
+                material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId);
+        // 落库前记录水位：附件元数据只写到本轮新增的用户消息，避免早期失败时误挂历史消息
+        Long watermark = hasAttachments(attachmentsJson) ? conversationService.maxMessageId(conversationId) : null;
         // 统一编排入口：规划模式 / 普通对话 / 闲聊都由 runRound 按会话形态分发处理，
         // 追问与正式回答的文本都在返回值里，收尾统一由 afterReply 完成（同步接口无事件通道，
         // 执行过程只记日志，进度展示仅流式接口支持，见 stream）。
-        RoundResult out = runRound(conv, conversationId, message, NO_PROGRESS, planner);
+        RoundResult out = runRound(conv, conversationId, message, material, NO_PROGRESS, planner);
+        persistAttachments(conversationId, watermark, attachmentsJson);
         log.info("同步对话完成：回复长度={}", out.reply() != null ? out.reply().length() : 0);
         afterReply(conversationId, message);
         return out.reply();
@@ -112,7 +130,7 @@ public class ChatService {
      * @return 事件流（progress / token）
      */
     public Flux<StreamEvent> stream(String conversationId, String message) {
-        return stream(conversationId, message, null);
+        return stream(conversationId, message, "", "", null);
     }
 
     /**
@@ -132,14 +150,30 @@ public class ChatService {
      * 其中滚动摘要合并可能触发一次额外 LLM 调用，已改为异步，不会挡住首字、也不会拖住流结束。
      *
      * @param conversationId 会话 ID
-     * @param message        当前用户输入
+     * @param message        当前用户输入（纯提问，不含附件内容）
      * @param planner        本轮是否按规划模式处理（null=跟随会话默认形态；非空=覆盖并写回会话）
      * @return 事件流（progress / token）
      */
     public Flux<StreamEvent> stream(String conversationId, String message, Boolean planner) {
+        return stream(conversationId, message, "", "", planner);
+    }
+
+    /**
+     * 流式对话（带附件）：纯提问走记忆与路由；{@code material}（解析文本）仅当轮注入模型；
+     * {@code attachmentsJson}（展示元数据）在本轮消息落库后写入用户消息，仅服务历史回看。
+     *
+     * @param conversationId  会话 ID
+     * @param message         当前用户输入（纯提问文本）
+     * @param material        本轮附件材料（图片 caption / 文档解析文本），空串表示无附件
+     * @param attachmentsJson 本轮附件展示元数据（JSON 数组，不含正文），空串表示无附件
+     * @param planner         本轮是否按规划模式处理
+     * @return 事件流（progress / token）
+     */
+    public Flux<StreamEvent> stream(String conversationId, String message, String material, String attachmentsJson,
+                                    Boolean planner) {
         return Flux.<StreamEvent>create(sink -> {
                     try {
-                        doStream(conversationId, message, sink, planner);
+                        doStream(conversationId, message, material, attachmentsJson, sink, planner);
                     } catch (Exception e) {
                         log.error("流式对话失败：会话={}，错误={}", conversationId, e.getMessage(), e);
                         // 错误走独立 error 事件：前端红字提示、不进正文、不进记忆
@@ -157,20 +191,44 @@ public class ChatService {
      * 流式对话的实际执行体（在弹性线程上运行，可以放心阻塞调用 LLM）。
      * 结果通过 sink 以事件形式推送：进度用 {@code progress}、正文用 {@code token}。
      */
-    private void doStream(String conversationId, String message, FluxSink<StreamEvent> sink, Boolean planner) {
-        log.info("流式对话：会话={}，planner={}", conversationId, planner);
+    private void doStream(String conversationId, String message, String material, String attachmentsJson,
+                          FluxSink<StreamEvent> sink, Boolean planner) {
+        log.info("流式对话：会话={}，planner={}，有附件={}", conversationId, planner,
+                material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId);
+        // 落库前记录水位：附件元数据只写到本轮新增的用户消息，避免早期失败时误挂历史消息
+        Long watermark = hasAttachments(attachmentsJson) ? conversationService.maxMessageId(conversationId) : null;
         Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
         // 统一编排入口：规划模式 / 普通对话都由 runRound 分发处理，执行过程通过 progress
         // 事件实时推送（只展示、不进记忆）。追问返回澄清文本（整段推）、正式回答返回正文（切片模拟打字机）。
-        RoundResult out = runRound(conv, conversationId, message, progress, planner);
+        RoundResult out = runRound(conv, conversationId, message, material, progress, planner);
         if (out.clarified()) {
             sink.next(StreamEvent.token(out.reply()));
         } else {
             emitChunks(sink, out.reply());
         }
+        // 附件展示元数据写入本轮用户消息（仅历史回看用，不进 LLM 上下文）
+        persistAttachments(conversationId, watermark, attachmentsJson);
         // 数据优先于记忆：正文推完后再做收尾（touch + 异步摘要合并），见 afterReply
         afterReply(conversationId, message);
+    }
+
+    /** 是否有附件展示元数据（空串/null 视为无）。 */
+    private static boolean hasAttachments(String attachmentsJson) {
+        return attachmentsJson != null && !attachmentsJson.isBlank();
+    }
+
+    /**
+     * 把本轮附件展示元数据写入本轮用户消息（见 {@link ConversationService#attachToLatestUserMessage}）。
+     * 仅服务历史回看（缩略图 / 下载），不参与记忆读取，对 LLM 上下文零影响；失败只记日志、不影响本轮回复。
+     */
+    private void persistAttachments(String conversationId, Long watermark, String attachmentsJson) {
+        if (!hasAttachments(attachmentsJson)) return;
+        try {
+            conversationService.attachToLatestUserMessage(conversationId, watermark, attachmentsJson);
+        } catch (Exception e) {
+            log.error("附件元数据写入失败：会话={}", conversationId, e);
+        }
     }
 
     /**
@@ -183,20 +241,20 @@ public class ChatService {
      * 注意：绑定智能体的会话（agentId 非空）不会被写回为规划形态——planner 与 agentId 互斥，
      * 本轮规划请求仅临时生效，不持久化（详见方法内守卫条件）。
      */
-    private RoundResult runRound(Conversation conv, String conversationId, String message,
-                                 Consumer<String> progress, Boolean planner) {
+    private RoundResult runRound(Conversation conv, String conversationId, String message, String material,
+                                Consumer<String> progress, Boolean planner) {
         // 请求级 planner 写回会话（刷新后保持）。planner 与 agentId 互斥：绑定智能体的会话
         // 不持久化规划形态——本轮仍按请求执行规划，但会话保持普通/智能体形态，与 PUT /planner 的防御校验一致
         // （避免绕过 UI 直调 API 造成 agentId + planner 并存的脏状态）。
         if (planner != null && conv != null && !planner.equals(conv.getPlanner())
-                && !(Boolean.TRUE.equals(planner) && conv.getAgentId() != null)) {
+                && !(planner && conv.getAgentId() != null)) {
             conversationService.updatePlanner(conversationId, planner);
             conv.setPlanner(planner);
         }
-        RoundResult r = selectHandler(conv, planner).handle(conv, conversationId, message, progress);
+        RoundResult r = selectHandler(conv, planner).handle(conv, conversationId, message, material, progress);
         // 规划策略返回回退信号（fallback，reply 为 null）：转普通对话策略兜底
         if (r == null || r.isFallback()) {
-            r = agentRoundHandler.handle(conv, conversationId, message, progress);
+            r = agentRoundHandler.handle(conv, conversationId, message, material, progress);
         }
         return r;
     }

@@ -21,11 +21,13 @@ public interface RoundHandler {
      *
      * @param conv           会话实体（由调用方一次查出后传入，本方法不再查库）
      * @param conversationId 会话 ID
-     * @param message        当前用户输入
+     * @param message        当前用户输入（纯提问文本，不含附件内容；附件走 {@code material} 通道）
+     * @param material       本轮附件材料（图片 caption / 文档解析文本），仅当轮注入模型、不进会话记忆；
+     *                       空串表示无附件
      * @param progress       执行过程播报回调（流式接口推 progress 事件，同步接口传空回调），
      *                       这些文本只展示、不进记忆
      * @return 本轮结果；本策略无法处理时返回 {@link RoundResult#fallback()}（其 reply 为 null），
      *         由调用方回退到普通对话策略——请勿返回裸 {@code null}，以免与异常/未处理语义混淆
      */
-    RoundResult handle(Conversation conv, String conversationId, String message, Consumer<String> progress);
+    RoundResult handle(Conversation conv, String conversationId, String message, String material, Consumer<String> progress);
 }

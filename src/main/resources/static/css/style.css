@@ -458,6 +458,53 @@ header {
     pointer-events: none;
 }
 
+/* 非图片附件（文档）在输入区的 chip：图标 + 文件名，宽度自适应 */
+.file-thumb {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 56px;
+    max-width: 160px;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #f3f4f6;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+.file-thumb-body {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 18px;
+    min-width: 0;
+}
+.file-thumb-name {
+    font-size: 12px;
+    color: #374151;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 110px;
+}
+/* 用户消息气泡内的文档附件 chip */
+.msg-attach-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #374151;
+    background: #f3f4f6;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 8px;
+    margin: 0 4px 4px 0;
+    max-width: 220px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* 用户消息气泡内的附件缩略图：左对齐横排，超出换行，不超过消息气泡宽度 */
 .msg-attachments {
     display: flex;
@@ -473,6 +520,10 @@ header {
     border: 1px solid var(--border);
     background: #f3f4f6;
 }
+/* 附件链接（图片缩略图 / 文档 chip 包在 <a> 中，点击在新标签打开原文件） */
+.msg-attachments a { text-decoration: none; line-height: 0; }
+.msg-attachments a.msg-attach-file { line-height: normal; }
+.msg-attachments a:hover .msg-attach-thumb { border-color: var(--primary, #3b82f6); }
 .user-msg { display: flex; flex-direction: column; align-items: flex-end; }
 
 /* 图片按钮：胶囊样式，融入 input-foot 一行（与开关同高），主色描边示意「可点击」 */

@@ -24,5 +24,11 @@ public class ChatMessage {
 
     private String content;
 
+    /**
+     * 本轮附件元数据（JSON 数组：type/filename/storedName/size），仅用于历史展示。
+     * 不含附件正文、不参与记忆读取（DbChatMemory.get 只取 content），对 LLM 上下文零影响。
+     */
+    private String attachmentsJson;
+
     private LocalDateTime createdAt;
 }

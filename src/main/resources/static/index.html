@@ -101,13 +101,22 @@
                                      v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
                             </div>
                         </div>
-                        <!-- 用户消息：纯文本 + 可选附件缩略图；AI 消息：Markdown 渲染（绑定预存的 m.html） -->
-                        <template v-if="m.content">
+                        <!-- 用户消息：纯文本 + 可选附件（图片缩略图 / 文档下载 chip）；AI 消息：Markdown 渲染（绑定预存的 m.html）。
+                             附件对象字段：本会话新发的带 previewUrl(blob)，历史加载的带 url(服务端 /files/)——两者取其一渲染。
+                             纯附件无文字时 content 为空，靠 attachments 也能渲染出气泡。 -->
+                        <template v-if="m.role === 'user' ? (m.content || (m.attachments && m.attachments.length)) : m.content">
                             <div v-if="m.role === 'user'" class="user-msg">
                                 <div v-if="m.attachments && m.attachments.length" class="msg-attachments">
-                                    <img v-for="(a, ai) in m.attachments" :key="ai" :src="a.previewUrl" :alt="a.filename" class="msg-attach-thumb" />
+                                    <template v-for="(a, ai) in m.attachments" :key="ai">
+                                        <a v-if="a.type === 'image' && (a.url || a.previewUrl)"
+                                           :href="a.url || a.previewUrl" target="_blank" rel="noopener">
+                                            <img :src="a.url || a.previewUrl" :alt="a.filename" class="msg-attach-thumb" /></a>
+                                        <a v-else-if="a.url" :href="a.url" target="_blank" rel="noopener"
+                                           class="msg-attach-file" :title="a.filename">📄 {{ a.filename }}</a>
+                                        <span v-else class="msg-attach-file">📄 {{ a.filename }}</span>
+                                    </template>
                                 </div>
-                                <span>{{ m.content }}</span>
+                                <span v-if="m.content">{{ m.content }}</span>
                             </div>
                             <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
                         </template>
@@ -118,13 +127,14 @@
                 </div>
             </div>
             <div class="input-bar">
-                <!-- 多模态图片预览：附件由后端 VisionService 转 caption 后注入对话，本轮结束随附件清除。
-                     原始二进制不进会话存储，刷新/重开会话后不再出现（保持对话存储轻量）。 -->
+                <!-- 附件预览：图片显示缩略图，文档显示文件 chip；发送时由后端 /api/chat/attachment/process
+                     转成文本（当轮注入 LLM）+ 原文件落盘（供历史回看）。解析文本不进会话记忆，刷新后不重复消耗 token；
+                     落盘文件的历史可见性由消息元数据支撑（历史接口返回 /files/ 链接）。 -->
                 <div v-if="attachments.length" class="input-attachments">
-                    <div v-for="(a, i) in attachments" :key="i" class="img-thumb">
-                        <img :src="a.previewUrl" :alt="a.filename || '图片'" />
+                    <div v-for="(a, i) in attachments" :key="i" :class="a.isImage ? 'img-thumb' : 'file-thumb'">
+                        <img v-if="a.isImage && a.previewUrl" :src="a.previewUrl" :alt="a.filename || '图片'" />
+                        <div v-else class="file-thumb-body">📄<span class="file-thumb-name">{{ a.filename }}</span></div>
                         <button class="img-thumb-del" @click="removeAttachment(i)" title="删除附件">×</button>
-                        <div v-if="!a.caption" class="img-thumb-loading">识别中…</div>
                     </div>
                 </div>
                 <div class="input-row">
@@ -136,14 +146,14 @@
                      取消 = 普通对话（智能路由 / 追问）。选择会写回会话，刷新后保持上次选择。
                      绑定智能体的会话不支持规划（planner 与 agentId 互斥），置灰并提示。 -->
                 <div class="input-foot">
-                    <!-- 🖼 多模态图片按钮：点击触发文件选择（多选）；选完后图片转 base64 上传到 /api/chat/vision/describe
-                         拿 caption，发送时随 attachments 一起注入对话上下文（不进会话记忆）。 -->
-                    <button type="button" class="attach-btn" @click="triggerImagePicker"
-                            title="添加图片：选择后由视觉模型转 caption 注入本轮对话；最多 5 张，单张 ≤10MB">
-                        🖼 图片
+                    <!-- 📎 附件按钮：点击触发文件选择（多选，支持图片与常见文档）；发送前统一调
+                         /api/chat/attachment/process 把图片识别为 caption、文档解析为文本，随 attachments 注入本轮对话（不进会话记忆）。 -->
+                    <button type="button" class="attach-btn" @click="triggerFilePicker"
+                            title="添加附件：支持图片与 txt/md/csv/json/pdf/docx/xlsx 等文档；最多 5 个，单个 ≤15MB">
+                        📎 附件
                     </button>
-                    <input ref="imageInput" type="file" accept="image/*" multiple style="display:none"
-                           @change="onImagePicked" />
+                    <input ref="fileInput" type="file" :accept="ACCEPT" multiple style="display:none"
+                           @change="onFilePicked" />
                     <label class="planner-toggle" :class="{ on: planMode && !currentAgentId, disabled: !!currentAgentId }">
                         <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId" @change="onPlannerChange"
                                title="勾选后按规划模式执行：AI 自动编排多个智能体协同完成你的目标" />

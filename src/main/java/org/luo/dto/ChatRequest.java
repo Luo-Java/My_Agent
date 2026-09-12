@@ -1,8 +1,6 @@
 package org.luo.dto;
 
 import java.util.List;
-import org.luo.infrastructure.vision.VisionService;
-import org.luo.service.ChatService;
 
 /**
  * 对话请求体。
@@ -11,8 +9,8 @@ import org.luo.service.ChatService;
  * @param message        用户输入的消息内容。
  * @param planner        本轮是否按规划模式处理（true=动态规划器多智能体编排，false=普通对话）。
  *                       非空时覆盖会话自身的 planner 形态并写回会话；为空时跟随会话默认形态。
- * @param attachments    可选附件列表（当前类型为 {@code image}，caption 由后端 VisionService 产生）。
- *                       非空时由 ChatService 把 caption 拼到 message 后注入上下文，
+ * @param attachments    可选附件列表（图片由 VisionService 识别、文档由 DocumentParserService 解析，
+ *                       统一产出 content 文本）。非空时由 ChatController 把 content 拼到 message 后注入上下文，
  *                       原始二进制不入会话记忆（保证存储与后续检索的轻量）。
  */
 public record ChatRequest(String conversationId, String message, Boolean planner, List<ChatAttachment> attachments) {

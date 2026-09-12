@@ -1,5 +1,10 @@
 package org.luo.controller;
 
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
+import cn.hutool.json.JSONUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.luo.dto.AttachmentDto;
 import org.luo.dto.ConversationSummary;
 import org.luo.dto.CreateConversationRequest;
 import org.luo.dto.HistoryResponse;
@@ -10,6 +15,7 @@ import org.luo.dto.RagEnabledRequest;
 import org.luo.dto.RenameConversationRequest;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
+import org.luo.infrastructure.attachment.AttachmentStorageService;
 import org.luo.service.AgentService;
 import org.luo.service.ConversationService;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -22,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
 import java.util.List;
 import org.luo.service.ChatService;
 
@@ -39,6 +46,7 @@ import org.luo.service.ChatService;
  * GET    /api/chat/conversations     - 会话列表（按最近更新倒序）
  * GET    /api/chat/history           - 读取某会话的历史消息
  */
+@Slf4j
 @RestController
 @RequestMapping("/api/chat")
 public class ConversationController {
@@ -137,6 +145,9 @@ public class ConversationController {
 
     /**
      * 读取某会话的历史消息（按时间正序）。
+     * <p>
+     * 用户消息会附带本轮附件展示元数据（仅文件名/类型/缩略图 URL，不含正文）；该数据不参与记忆读取，
+     * 仅供前端渲染缩略图与下载链接，对 LLM 上下文与 token 零影响。
      *
      * @param conversationId 会话 ID
      * @return 会话 ID + 消息列表
@@ -144,8 +155,31 @@ public class ConversationController {
     @GetMapping("/history")
     public HistoryResponse history(@RequestParam String conversationId) {
         List<MessageDto> messages = conversationService.getHistory(conversationId).stream()
-                .map(m -> new MessageDto(m.getRole(), m.getContent()))
+                .map(m -> new MessageDto(m.getRole(), m.getContent(), parseAttachments(m.getAttachmentsJson())))
                 .toList();
         return new HistoryResponse(conversationId, messages);
+    }
+
+    /** 解析消息的附件元数据 JSON；空 / 异常返回空列表（不影响历史读取）。 */
+    private static List<AttachmentDto> parseAttachments(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            JSONArray arr = JSONUtil.parseArray(json);
+            List<AttachmentDto> list = new ArrayList<>(arr.size());
+            for (int i = 0; i < arr.size(); i++) {
+                JSONObject j = arr.getJSONObject(i);
+                String storedName = j.getStr("storedName");
+                list.add(new AttachmentDto(
+                        j.getStr("type"),
+                        j.getStr("filename"),
+                        storedName,
+                        AttachmentStorageService.url(storedName),
+                        j.getLong("size")));
+            }
+            return list;
+        } catch (Exception e) {
+            log.warn("解析附件元数据失败：{}", json, e);
+            return List.of();
+        }
     }
 }

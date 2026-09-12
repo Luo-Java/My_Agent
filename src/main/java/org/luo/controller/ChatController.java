@@ -1,5 +1,7 @@
 package org.luo.controller;
 
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
 import org.luo.dto.ChatAttachment;
 import org.luo.dto.ChatRequest;
 import org.luo.dto.StreamEvent;
@@ -46,8 +48,10 @@ public class ChatController {
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
         String conversationId = resolveConversationId(request.conversationId());
-        String composed = composeWithAttachments(request.message(), request.attachments());
-        String reply = chatService.chat(conversationId, composed, request.planner());
+        // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
+        AttachmentBundle bundle = extractAttachments(request.attachments());
+        String reply = chatService.chat(conversationId, request.message(),
+                bundle.material(), bundle.metaJson(), request.planner());
         return Map.of("content", reply);
     }
 
@@ -68,8 +72,10 @@ public class ChatController {
     public SseEmitter stream(@RequestBody ChatRequest request) {
         SseEmitter emitter = new SseEmitter(0L);
         String conversationId = resolveConversationId(request.conversationId());
-        String composed = composeWithAttachments(request.message(), request.attachments());
-        Flux<StreamEvent> flux = chatService.stream(conversationId, composed, request.planner());
+        // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
+        AttachmentBundle bundle = extractAttachments(request.attachments());
+        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(),
+                bundle.material(), bundle.metaJson(), request.planner());
 
         Disposable subscription = flux.doOnNext(event -> {
                     try {
@@ -93,26 +99,50 @@ public class ChatController {
     }
 
     /**
-     * 把附件 caption 拼到用户消息前面（仅当轮注入，不进会话记忆；详见 {@link ChatAttachment}）。
-     * 这样下游 ChatService / ChatComposer / RoundHandler 全链路零改动，附件概念只留在 controller 层。
-     * <p>
-     * 拼接格式：先列所有 caption，再附用户原文，让 LLM 先看「素材」再回答。
+     * 一次性抽取附件的两类产物（单次遍历，避免同一列表被反复扫描）：
+     * <ul>
+     *   <li>{@code material} —— 解析文本块（图片 caption / 文档正文），由 {@code ChatComposer} 注入本轮
+     *       system prompt，<b>仅当轮可见、不进会话记忆</b>（记忆 Advisor 只持久化 {@code .user()} 的纯提问）；</li>
+     *   <li>{@code metaJson} —— 展示元数据 JSON（type/filename/storedName/size），写入独立列
+     *       {@code chat_message.attachments_json}，仅供历史回看渲染缩略图 / 下载，<b>不含正文、不进 LLM</b>。</li>
+     * </ul>
+     * 无附件时两者均为空串（调用方据此跳过注入与落库）。
      */
-    private String composeWithAttachments(String message, List<ChatAttachment> attachments) {
-        if (message == null) message = "";
-        if (attachments == null || attachments.isEmpty()) return message;
-        StringBuilder sb = new StringBuilder(message.length() + 256);
-        sb.append("【以下为用户上传的图片识别内容，仅作为本轮参考，不写入长期记忆】\n");
+    private AttachmentBundle extractAttachments(List<ChatAttachment> attachments) {
+        if (attachments == null || attachments.isEmpty()) return AttachmentBundle.EMPTY;
+        StringBuilder material = new StringBuilder(512);
+        JSONArray meta = new JSONArray();
         for (int i = 0; i < attachments.size(); i++) {
             ChatAttachment a = attachments.get(i);
-            sb.append("图片").append(i + 1);
+            // 产物 1：当轮材料（逐条带序号与文件名标注，便于模型区分多份附件）
+            material.append(attachmentLabel(a.type())).append(i + 1);
             if (a.filename() != null && !a.filename().isBlank()) {
-                sb.append("（").append(a.filename()).append("）");
+                material.append("（").append(a.filename()).append("）");
             }
-            sb.append("：\n").append(a.caption() == null ? "" : a.caption()).append("\n\n");
+            material.append("：\n").append(a.content() == null ? "" : a.content()).append("\n\n");
+            // 产物 2：展示元数据（不含正文，仅历史渲染所需的最小字段）
+            JSONObject o = new JSONObject();
+            o.set("type", a.type() == null ? "file" : a.type());
+            o.set("filename", a.filename());
+            o.set("storedName", a.storedName());
+            o.set("size", a.size());
+            meta.add(o);
         }
-        sb.append("【用户消息】\n").append(message);
-        return sb.toString();
+        return new AttachmentBundle(material.toString().strip(), meta.toString());
+    }
+
+    /** 附件抽取结果：{@code material}=当轮注入模型的解析文本；{@code metaJson}=落库供历史回看的展示元数据。 */
+    private record AttachmentBundle(String material, String metaJson) {
+        static final AttachmentBundle EMPTY = new AttachmentBundle("", "");
+    }
+
+    /** 附件类型 → 中文标签（图片 / 文档 / 文件）。 */
+    private static String attachmentLabel(String type) {
+        return switch (type == null ? "" : type) {
+            case "image" -> "图片";
+            case "text" -> "文档";
+            default -> "文件";
+        };
     }
 
     /** 会话 ID 为空时回退到默认会话，避免前端首次对话未建会话。 */

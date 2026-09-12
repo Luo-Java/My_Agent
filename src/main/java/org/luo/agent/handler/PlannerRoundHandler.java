@@ -49,8 +49,10 @@ public class PlannerRoundHandler implements RoundHandler {
     }
 
     @Override
-    public RoundResult handle(Conversation conv, String conversationId, String message, Consumer<String> progress) {
-        PlannerOutcome po = handlePlannerConversation(conv, conversationId, message, progress);
+    public RoundResult handle(Conversation conv, String conversationId, String message, String material,
+                             Consumer<String> progress) {
+        // message 为纯提问（不含附件）；附件材料 material 仅当轮注入（首步 / 兜底），不进会话记忆。
+        PlannerOutcome po = handlePlannerConversation(conv, conversationId, message, material, progress);
         // 防御：规划未产出任何结果（理论不会发生）→ 显式回退信号，调用方转普通对话策略
         if (po.reply() == null) return RoundResult.fallback();
         // 多步执行期间不写记忆，需在回复产出后显式补写「用户原话 → 最终回复」整对
@@ -70,7 +72,7 @@ public class PlannerRoundHandler implements RoundHandler {
      * @return 本轮结果（回复文本 + 是否需显式写记忆）
      */
     private PlannerOutcome handlePlannerConversation(Conversation conv, String conversationId, String message,
-                                                     Consumer<String> progress) {
+                                                     String material, Consumer<String> progress) {
         progress.accept("🧭 正在分析目标并规划执行步骤…");
         List<PlanStep> plan = plannerService.plan(message);
         log.info("动态规划：会话={}, 步骤={}", conversationId, plan);
@@ -78,7 +80,7 @@ public class PlannerRoundHandler implements RoundHandler {
             log.info("动态规划：无需编排（无可用智能体或目标无关），普通回答");
             progress.accept("💬 无需多智能体协同，由通用助手直接回答");
             // 回退路径走带记忆的 chatClient，记忆由 Advisor 自动落库，无需显式补写
-            return new PlannerOutcome(answerDefault(conv, conversationId, message), false);
+            return new PlannerOutcome(answerDefault(conv, conversationId, message, material), false);
         }
         List<StepSpec> specs = new ArrayList<>();
         for (PlanStep s : plan) {
@@ -93,7 +95,7 @@ public class PlannerRoundHandler implements RoundHandler {
         if (specs.isEmpty()) {
             log.warn("动态规划：计划中的智能体均不存在，回退普通回答");
             progress.accept("💬 计划中的智能体都不可用，改由通用助手回答");
-            return new PlannerOutcome(answerDefault(conv, conversationId, message), false);
+            return new PlannerOutcome(answerDefault(conv, conversationId, message, material), false);
         }
         log.info("动态规划启动：会话={}，步骤数={}", conversationId, specs.size());
         // 播报计划清单：让用户先看到「准备怎么做」，再看到逐步执行情况
@@ -106,11 +108,11 @@ public class PlannerRoundHandler implements RoundHandler {
             }
         }
         progress.accept(planText.toString());
-        String reply = executeSteps(specs, message, conversationId, conv, null, progress);
+        String reply = executeSteps(specs, message, conversationId, conv, null, material, progress);
         if (reply == null || reply.isBlank()) {
             log.warn("动态规划未产出结果，回退普通回答");
             progress.accept("⚠️ 各步骤均未产出结果，改由通用助手回答");
-            return new PlannerOutcome(answerDefault(conv, conversationId, message), false);
+            return new PlannerOutcome(answerDefault(conv, conversationId, message, material), false);
         }
         progress.accept("✅ 全部步骤执行完毕，已生成最终结果");
         // 多步规划：执行期间所有步骤都用 internalChatClient（不写记忆），避免「指令+上一步输出」这类合成串
@@ -131,7 +133,7 @@ public class PlannerRoundHandler implements RoundHandler {
      * </ul>
      */
     private String executeSteps(List<StepSpec> steps, String firstInput, String conversationId,
-                                Conversation conv, String paramBlock, Consumer<String> progress) {
+                                Conversation conv, String paramBlock, String material, Consumer<String> progress) {
         if (steps == null || steps.isEmpty()) return null;
         // 近期窗口历史（替代记忆 Advisor 的读取）：仅注入到最后一步，避免合成输入被误写入记忆。
         String historyContext = composer.buildHistoryContextText(conversationId, 0,
@@ -144,6 +146,11 @@ public class PlannerRoundHandler implements RoundHandler {
             String stepTag = "步骤 " + (i + 1) + "/" + steps.size() + " · " + s.agent().getName();
             progress.accept("▶ " + stepTag + " 执行中…");
             String userInput = (i == 0) ? firstInput : "上一步的输出：\n" + previous;
+            // 附件材料仅注入首步（用户原始目标所在步），后续步以上一步产物为输入，避免重复放大
+            if (i == 0 && material != null && !material.isBlank()) {
+                userInput = userInput + "\n\n[本轮附件材料] 以下为用户本轮上传的内容（图片已识别、文档已解析为文本），"
+                        + "仅作本次参考：\n" + material;
+            }
             if (s.instruction() != null && !s.instruction().isBlank()) {
                 userInput = s.instruction() + "\n\n" + userInput;
             }
@@ -182,9 +189,10 @@ public class PlannerRoundHandler implements RoundHandler {
         return last;
     }
 
-    /** 通用助手兜底回答（无智能体绑定、不挂载工具）：用于规划模式回退、或规划目标与任何智能体无关时。 */
-    private String answerDefault(Conversation conv, String conversationId, String message) {
-        String reply = composer.buildDefaultRequest(conv, conversationId, message).call().content();
+    /** 通用助手兜底回答（无智能体绑定、不挂载工具）：用于规划模式回退、或规划目标与任何智能体无关时。
+     *  附件材料 material 仅当轮注入 system，不进会话记忆。 */
+    private String answerDefault(Conversation conv, String conversationId, String message, String material) {
+        String reply = composer.buildDefaultRequest(conv, conversationId, message, material).call().content();
         return reply != null ? reply : "";
     }
 

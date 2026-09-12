@@ -50,8 +50,8 @@ import org.luo.dto.ChatRequest;
  * <p>
  * <b>为什么不是「一次请求传多图」</b>（设计决策，不要顺手改掉）：Spring AI {@code UserMessage.media(Media...)}
  * 与 dashscope 视觉模型都支持一次请求带多张图，但<b>一次请求只返回一段合并文本</b>，
- * 会丢失「哪段描述来自哪张图」的归属——而下游 {@code ChatController#composeWithAttachments}
- * 是按 {@code 图片N（文件名）：caption} <b>逐条带文件名标注</b>注入上下文的
+ * 会丢失「哪段描述来自哪张图」的归属——而下游 {@code ChatController#extractAttachments}
+ * 是按 {@code 图片N（文件名）：caption} <b>逐条带文件名标注</b>抽取为当轮材料块的
  * （如「工资条」与「聊天记录」需区分各自内容）。逐图调用因此保住了归属标注、单图失败隔离
  * 与单图识别质量；延迟由并发压平（N×t → ≈t），且每张图同样只传输一次、仅短指令重复 N 遍，
  * token 成本与一次调用基本相当。

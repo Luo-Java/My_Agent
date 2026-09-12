@@ -212,6 +212,52 @@ public class ConversationService {
     }
 
     /**
+     * 会话内当前最大消息 ID（无消息返回 null）。用于在落库前记录水位，
+     * 事后只把附件元数据写到「本轮新增」的用户消息上，避免解析早期失败时误挂到上一条。
+     *
+     * @param conversationId 会话 ID
+     * @return 最大消息 ID；会话无消息时为 null
+     */
+    public Long maxMessageId(String conversationId) {
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId).orderByDesc("id").last("LIMIT 1");
+        ChatMessage last = chatMessageMapper.selectOne(qw);
+        return last == null ? null : last.getId();
+    }
+
+    /**
+     * 把本轮附件元数据 JSON 写到「{@code id > afterId} 的最新一条用户消息」上。
+     * <p>
+     * 仅服务历史回看（缩略图 / 下载）：该列<b>不参与记忆读取</b>（DbChatMemory.get 只取 content），
+     * 因此对 LLM 上下文与 token 零影响。{@code afterId} 为落库前水位（见 {@link #maxMessageId}），
+     * 防止本轮在写用户消息前就失败时，错误地把附件挂到历史消息上。
+     *
+     * @param conversationId 会话 ID
+     * @param afterId        水位：只更新 id 大于该值的用户消息；null 表示不限（更新最新一条）
+     * @param attachmentsJson 附件元数据 JSON 数组；空则不处理
+     */
+    @Transactional
+    public void attachToLatestUserMessage(String conversationId, Long afterId, String attachmentsJson) {
+        if (conversationId == null || conversationId.isBlank()
+                || attachmentsJson == null || attachmentsJson.isBlank()) {
+            return;
+        }
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId).eq("role", "user");
+        if (afterId != null) qw.gt("id", afterId);
+        qw.orderByDesc("id").last("LIMIT 1");
+        ChatMessage last = chatMessageMapper.selectOne(qw);
+        if (last == null) {
+            log.warn("附件元数据未找到可挂载的用户消息：会话={}", conversationId);
+            return;
+        }
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getId, last.getId())
+                .set(ChatMessage::getAttachmentsJson, attachmentsJson));
+        log.debug("附件元数据写入：会话={}，消息={}", conversationId, last.getId());
+    }
+
+    /**
      * 读取某会话的历史消息，按时间正序。
      *
      * @param conversationId 会话 ID
