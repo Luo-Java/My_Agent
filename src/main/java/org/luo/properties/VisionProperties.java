@@ -1,4 +1,4 @@
-package org.luo.config;
+package org.luo.properties;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 

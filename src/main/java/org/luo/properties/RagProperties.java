@@ -1,8 +1,7 @@
-package org.luo.config;
+package org.luo.properties;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.luo.infrastructure.rerank.RerankService;
-import org.luo.service.KbSearchService;
 
 /**
  * RAG 检索与精排配置（{@code agent.rag.*}）：三段式「粗排召回 → 精排 → 截断」的可调参数。

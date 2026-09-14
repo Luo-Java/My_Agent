@@ -1,7 +1,7 @@
 package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
-import org.luo.config.PromptProperties;
+import org.luo.properties.PromptProperties;
 import org.luo.entity.Agent;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;

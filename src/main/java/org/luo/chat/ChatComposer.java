@@ -3,7 +3,7 @@ package org.luo.chat;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.advisor.RoundTraceAdvisor;
 import org.luo.advisor.ToolUsageLoggingAdvisor;
-import org.luo.config.PromptProperties;
+import org.luo.properties.PromptProperties;
 import org.luo.dto.KbCitation;
 import org.luo.entity.Agent;
 import org.luo.entity.Conversation;
@@ -28,8 +28,6 @@ import java.util.concurrent.TimeoutException;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.luo.agent.PromptService;
 import org.luo.agent.QueryRewriteService;
-import org.luo.agent.handler.AgentRoundHandler;
-import org.luo.agent.handler.PlannerRoundHandler;
 
 /**
  * LLM 请求组装器：把智能体 / 记忆 / 工具组装成一次 ChatClient 请求，供普通对话与规划执行两条路径共用。

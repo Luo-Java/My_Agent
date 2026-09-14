@@ -1,4 +1,4 @@
-package org.luo.config;
+package org.luo.properties;
 
 import lombok.Getter;
 import lombok.Setter;

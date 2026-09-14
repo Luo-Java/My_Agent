@@ -1,7 +1,7 @@
 package org.luo.memory;
 
 import lombok.extern.slf4j.Slf4j;
-import org.luo.config.MemoryProperties;
+import org.luo.properties.MemoryProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.service.ConversationService;
 import org.springframework.ai.chat.memory.ChatMemory;

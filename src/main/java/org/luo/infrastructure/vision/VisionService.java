@@ -2,7 +2,7 @@ package org.luo.infrastructure.vision;
 
 import cn.hutool.core.exceptions.ExceptionUtil;
 import lombok.extern.slf4j.Slf4j;
-import org.luo.config.VisionProperties;
+import org.luo.properties.VisionProperties;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -22,12 +22,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import org.luo.agent.AgentRouter;
-import org.luo.agent.MemoryMergeService;
-import org.luo.agent.ParamFillingService;
-import org.luo.agent.PromptService;
+
 import org.luo.controller.ChatController;
-import org.luo.dto.ChatRequest;
 
 /**
  * 多模态视觉识别服务：把图片转成文本描述（caption），供 ChatRequest.attachments 注入对话。
@@ -44,7 +40,7 @@ import org.luo.dto.ChatRequest;
  * 与 files <b>1:1 对齐</b>；单图失败/超时只影响该图（占位 caption），不抛错给调用方。
  * <p>
  * <b>为什么不是「一次请求传多图」</b>（设计决策，勿顺手改）：一次请求只返回一段合并文本，会丢失
- * 「哪段描述来自哪张图」的归属——而下游 {@link ChatController#extractAttachments} 按
+ * 「哪段描述来自哪张图」的归属——而下游 {@link ChatController} 按
  * {@code 图片N（文件名）：caption} 逐条带标注抽取（如「工资条」与「聊天记录」需区分各自内容）。
  * 逐图调用保住了归属标注与单图失败隔离；延迟由并发压平（N×t → ≈t），每图同样只传一次、仅短指令重复 N 遍。
  * 仅当未来需要<b>跨图联合对比</b>时才应改为合并调用。

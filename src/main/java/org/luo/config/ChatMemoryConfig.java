@@ -1,6 +1,7 @@
 package org.luo.config;
 
 import org.luo.memory.DbChatMemory;
+import org.luo.properties.MemoryProperties;
 import org.luo.service.ConversationService;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;

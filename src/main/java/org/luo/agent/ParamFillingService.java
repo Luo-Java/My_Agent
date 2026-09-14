@@ -1,7 +1,8 @@
 package org.luo.agent;
 
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import org.luo.config.PromptProperties;
+import org.luo.properties.PromptProperties;
 import org.luo.entity.Agent;
 import org.luo.entity.ChatMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
@@ -17,10 +18,6 @@ import java.util.stream.Collectors;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
-import org.luo.agent.handler.AgentRoundHandler;
-import org.luo.entity.Conversation;
-import org.luo.memory.DbChatMemory;
-import org.luo.service.ChatService;
 import org.luo.service.ConversationService;
 
 /**
@@ -283,16 +280,15 @@ public class ParamFillingService {
 
     /** 参数补全决策结果。question 非 null 表示需要追问；否则转交主模型（params 为已确认参数）。 */
     public static final class ClarifyDecision {
+        /**
+         * 追问文本；非 null 表示需要追问（供编排层 AgentRoundHandler 跨包访问）。
+         */
+        @Getter
         final String question;
         final Map<String, String> params;
         final Map<String, String> paramLabels;
         final boolean limited;
         final List<String> missingLabels;
-
-        /** 追问文本；非 null 表示需要追问（供编排层 AgentRoundHandler 跨包访问）。 */
-        public String getQuestion() {
-            return question;
-        }
 
         ClarifyDecision(String question, Map<String, String> params, Map<String, String> paramLabels,
                         boolean limited, List<String> missingLabels) {

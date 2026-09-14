@@ -1,4 +1,4 @@
-package org.luo.config;
+package org.luo.properties;
 
 import org.luo.memory.DbChatMemory;
 import org.springframework.boot.context.properties.ConfigurationProperties;

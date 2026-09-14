@@ -1,8 +1,8 @@
 package org.luo.agent;
 
 import lombok.extern.slf4j.Slf4j;
-import org.luo.config.MemoryProperties;
-import org.luo.config.PromptProperties;
+import org.luo.properties.MemoryProperties;
+import org.luo.properties.PromptProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
 import org.luo.memory.DbChatMemory;
@@ -90,7 +90,7 @@ public class MemoryMergeService {
 
     /**
      * 检查历史是否溢出窗口达阈值，是则触发一次 LLM 合并。
-     * <b>窗口口径必须与 {@link DbChatMemory#get()} 同源</b>：取同一段「最近 {@value DbChatMemory#SQL_FETCH_LIMIT} 条」
+     * <b>窗口口径必须与 {@link DbChatMemory} 同源</b>：取同一段「最近 {@value DbChatMemory#SQL_FETCH_LIMIT} 条」
      * 列表、调同一个 {@link DbChatMemory#computeWindowStart}，再换算回全量绝对索引
      * （{@code total - recent.size() + startInRecent}）。早期实现分别在「全量」与「截断」列表上算起点，
      * 历史超过预取上限后两把尺子错位，中间那段既不进摘要也不进上下文（模型「忘了前面几轮」）。
