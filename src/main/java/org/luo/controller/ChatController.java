@@ -6,6 +6,7 @@ import org.luo.dto.ChatAttachment;
 import org.luo.dto.ChatRequest;
 import org.luo.dto.StreamEvent;
 import org.luo.service.ChatService;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -15,33 +16,24 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
-import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.luo.agent.handler.RoundHandler;
-import org.luo.chat.ChatComposer;
 
 /**
- * 对话接口（与会话管理业务分离）。
+ * 对话接口（与会话管理业务分离，后者见 ConversationController）。
  * <p>
- * 只负责把用户消息交给 ChatService 调用大模型；会话的增删改查与历史读取见 ConversationController。
+ * POST /api/chat/send   - 同步返回完整回复；POST /api/chat/stream - SSE 流式返回。
  * <p>
- * POST /api/chat/send   - 同步返回完整回复
- * POST /api/chat/stream - SSE 流式返回（前端逐字渲染）
- * <p>
- * <b>传输层兜底</b>（与业务无关，纯粹防止连接被「静默挂死」）：
- * <ul>
- *   <li><b>有限超时</b>：{@code app.sse.timeout-seconds}（默认 300s）。原先传 {@code 0L} 表示永不超时，
- *       一旦某次上游调用异常卡住，这条 SSE 连接与它占用的异步线程会一直挂着、永不自愈；</li>
- *   <li><b>心跳</b>：{@code app.sse.heartbeat-seconds}（默认 15s）。一轮对话在
- *       「路由 → 参数抽取 → 查询改写 → 检索」的前置链上完全没有字节流出，
- *       反向代理（nginx 默认 {@code proxy_read_timeout 60s}）会把空闲长连接直接切断，
- *       表现为「前端莫名其妙断开」。周期发 {@link StreamEvent#ping()} 即可保活。</li>
- * </ul>
+ * <b>传输层兜底</b>（与业务无关，纯防连接被静默挂死）：有限超时（{@code app.sse.timeout-seconds}，默认 300s，
+ * 不用 {@code 0L} 永不超时——上游卡死会让连接与异步线程永久泄漏）；心跳（{@code app.sse.heartbeat-seconds}，
+ * 默认 15s）——前置链（路由→参数抽取→改写→检索）期间无字节流出，反向代理会当空闲切断长连接，
+ * 周期发 {@link StreamEvent#ping()} 保活。
  */
 @RestController
 @RequestMapping("/api/chat")
@@ -49,29 +41,32 @@ public class ChatController {
 
     private final ChatService chatService;
 
-    /**
-     * SSE 连接最长存活时间（秒）。必须有限：{@code 0} 表示永不超时，
-     * 会把「上游卡死」变成「连接永久泄漏」。默认 300s，足够覆盖最长的规划 + 多轮工具调用。
-     */
+    /** SSE 连接最长存活时间（秒）。必须有限，默认 300s，足够覆盖最长的规划 + 多轮工具调用。 */
     private final long sseTimeoutSeconds;
 
     /** 心跳间隔（秒），{@code <=0} 表示关闭心跳。 */
     private final long heartbeatSeconds;
 
+    /**
+     * 心跳专用调度器（bean {@code sseHeartbeatScheduler}）。
+     * <p>
+     * 刻意<b>不复用</b> Reactor {@code Schedulers.parallel()}：心跳要调 {@code SseEmitter.send()}，
+     * 对慢客户端是<b>阻塞</b>调用；而 {@code parallel()} 同时被打字机与 Reactor 内部使用，
+     * 几个卡住的连接就能把它占满、连带全站心跳停摆。用独立调度器隔离风险（见 ExecutorConfig）。
+     */
+    private final ScheduledExecutorService heartbeatScheduler;
+
     public ChatController(ChatService chatService,
                           @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
-                          @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds) {
+                          @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds,
+                          @Qualifier("sseHeartbeatScheduler") ScheduledExecutorService heartbeatScheduler) {
         this.chatService = chatService;
         this.sseTimeoutSeconds = sseTimeoutSeconds;
         this.heartbeatSeconds = heartbeatSeconds;
+        this.heartbeatScheduler = heartbeatScheduler;
     }
 
-    /**
-     * 同步对话：等待完整回复后一次性返回。
-     *
-     * @param request 会话 ID（可空，空则用默认会话）+ 用户消息
-     * @return {@code {"content": "完整回复"}}
-     */
+    /** 同步对话：等待完整回复后一次性返回 {@code {"content": "..."}}。 */
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
         String conversationId = resolveConversationId(request.conversationId());
@@ -79,21 +74,14 @@ public class ChatController {
         AttachmentBundle bundle = extractAttachments(request.attachments());
         String reply = chatService.chat(conversationId, request.message(),
                 bundle.material(), bundle.metaJson(), request.planner());
-        return Map.of("content", reply);
+        // Map.of 拒绝 null 值：出口再兜一道，避免上游漏判空把一次 200 变成 500
+        return Map.of("content", reply == null ? "" : reply);
     }
 
     /**
-     * 流式对话：以 SSE 推送事件，前端逐字渲染。
-     * <p>
-     * 每条事件的 data 都是 JSON，字段名即事件类型：
-     * <ul>
-     *   <li>{@code {"token":"..."}} —— 正文分片，前端累加进消息气泡，且是唯一写入会话记忆的内容；</li>
-     *   <li>{@code {"progress":"..."}} —— 执行过程（规划步骤、每步进展），前端单独展示为「执行过程」，
-     *       不属于消息正文、不写入会话记忆，刷新会话后不再出现。</li>
-     * </ul>
-     *
-     * @param request 会话 ID（可空，空则用默认会话）+ 用户消息（可带 attachments）
-     * @return SSE 事件流
+     * 流式对话：以 SSE 推送事件，前端逐字渲染。每条事件 data 为 JSON，字段名即事件类型：
+     * {@code {"token":"..."}} 正文分片（唯一写入会话记忆的内容）；{@code {"progress":"..."}} 执行过程
+     * （规划步骤与进展，不写入记忆、刷新后消失）。
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@RequestBody ChatRequest request) {
@@ -110,9 +98,8 @@ public class ChatController {
 
         Disposable subscription = flux.doOnNext(event -> {
                     try {
-                        // 用 JSON 包裹文本：内容中的换行/空行会被 JSON 转义，
-                        // 避免内容里的 \n\n 被前端误判为 SSE 事件边界导致数据错乱/丢字。
-                        // 字段名用事件类型（token / progress / error），前端据此决定渲染到正文还是执行过程区。
+                        // 用 JSON 包裹文本：内容里的换行会被转义，避免 \n\n 被前端误判为 SSE 事件边界而丢字。
+                        // 字段名即事件类型（token / progress / error），前端据此决定渲染到正文还是执行过程区。
                         emitter.send(Map.of(event.type(), event.text() == null ? "" : event.text()));
                     } catch (IOException e) {
                         emitter.completeWithError(e);
@@ -128,30 +115,30 @@ public class ChatController {
                 })
                 .subscribe();
 
-        // 心跳：前置链（路由→参数抽取→改写→检索）期间没有任何字节流出，容易被反向代理判为空闲而切断。
-        // 用独立的周期任务推送 ping 事件保活，与业务流完全解耦（不动流的终止语义——
-        // 若改用 Flux.merge/interval，无限流会让 emitter 永不 complete）。
-        Disposable heartbeat = heartbeatSeconds > 0
-                ? Schedulers.parallel().schedulePeriodically(() -> {
+        // 心跳：前置链期间无字节流出，易被反向代理判为空闲切断。用独立周期任务推 ping 保活，与业务流完全解耦
+        // （不动流的终止语义——若改用 Flux.merge/interval，无限流会让 emitter 永不 complete）。
+        // 调度器为独立线程池（非 Reactor parallel），且用 scheduleWithFixedDelay：下一次从上次执行完成才开始计时，
+        // 慢客户端只让该连接的心跳顺延，不在身上堆任务。
+        ScheduledFuture<?> heartbeat = heartbeatSeconds > 0
+                ? heartbeatScheduler.scheduleWithFixedDelay(() -> {
                     if (finished.get()) {
                         return;
                     }
                     try {
                         emitter.send(Map.of(StreamEvent.TYPE_PING, "1"));
                     } catch (Exception e) {
-                        // 客户端已断开（IOException）：连接即将因 onCompletion 被清理，这里无需额外处理
+                        // 客户端已断开：连接即将因 onCompletion 被清理，无需额外处理
                         finished.set(true);
                     }
                 }, heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS)
                 : null;
 
-        // 客户端断开（或超时）时取消订阅与心跳：停止后续事件推送与延迟任务，
-        // 避免 LLM 侧已排队的调用继续空烧 token（SSE 连接关闭会触发 onCompletion）。
+        // 客户端断开（或超时）时取消订阅与心跳：停止后续推送与延迟任务，避免 LLM 侧已排队的调用继续空烧 token。
         Runnable cleanup = () -> {
             finished.set(true);
             subscription.dispose();
             if (heartbeat != null) {
-                heartbeat.dispose();
+                heartbeat.cancel(false);
             }
         };
         emitter.onCompletion(cleanup);
@@ -161,14 +148,14 @@ public class ChatController {
     }
 
     /**
-     * 一次性抽取附件的两类产物（单次遍历，避免同一列表被反复扫描）：
+     * 一次性抽取附件的两类产物（单次遍历）：
      * <ul>
-     *   <li>{@code material} —— 解析文本块（图片 caption / 文档正文），由 {@code ChatComposer} 注入本轮
-     *       system prompt，<b>仅当轮可见、不进会话记忆</b>（记忆 Advisor 只持久化 {@code .user()} 的纯提问）；</li>
-     *   <li>{@code metaJson} —— 展示元数据 JSON（type/filename/storedName/size），写入独立列
-     *       {@code chat_message.attachments_json}，仅供历史回看渲染缩略图 / 下载，<b>不含正文、不进 LLM</b>。</li>
+     *   <li>{@code material} —— 解析文本（图片 caption / 文档正文），由 ChatComposer 注入本轮 system prompt，
+     *       <b>仅当轮可见、不进会话记忆</b>；</li>
+     *   <li>{@code metaJson} —— 展示元数据 JSON（type/filename/storedName/size），写独立列
+     *       {@code chat_message.attachments_json}，仅供历史回看，<b>不含正文、不进 LLM</b>。</li>
      * </ul>
-     * 无附件时两者均为空串（调用方据此跳过注入与落库）。
+     * 无附件时两者均为空串。
      */
     private AttachmentBundle extractAttachments(List<ChatAttachment> attachments) {
         if (attachments == null || attachments.isEmpty()) return AttachmentBundle.EMPTY;

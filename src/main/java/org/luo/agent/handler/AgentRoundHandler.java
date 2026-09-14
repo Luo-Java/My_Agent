@@ -20,16 +20,12 @@ import org.luo.service.ChatService;
 
 /**
  * 普通对话策略（非规划模式）：智能路由 → 话题切换预检 → 参数补全/追问 → 正式回答。
- * 由 ChatService 的 {@code runRound} 统一入口按会话形态选择调用，差异只在进度回调
- * （同步接口传空回调，流式接口推 progress 事件）。
+ * 由 {@code ChatService.runRound} 按会话形态选择调用，差异只在进度回调（同步传空回调，流式推 progress 事件）。
  * <p>
  * 需要落库的交互在本类内完成：追问时临时绑定 agent（CLARIFY）并落库追问记录；正式回答后解绑
- * （仅 CLARIFY 绑定、显式绑定保持）。调用方负责把 {@link RoundResult#reply()} 输出给用户
- * （同步接口直接返回；流式接口按 clarified 分支推整段或切片），并在之后统一收尾。
- * 落库/解绑均为毫秒级 DB 操作，发生在 LLM 调用（耗时主体）之后，不影响用户首字感知。
+ * （仅 CLARIFY 绑定、显式绑定保持）。落库/解绑均为毫秒级 DB 操作，发生在 LLM 调用之后，不影响首字感知。
  * <p>
- * 记忆写入契约：信任记忆 Advisor 自动落库（用户消息→回复），不需要显式补写
- * （{@link RoundResult#needSaveExchange()} 恒为 false）。
+ * 记忆写入契约：信任记忆 Advisor 自动落库，不需要显式补写（{@link RoundResult#needSaveExchange()} 恒为 false）。
  */
 @Slf4j
 @Service
@@ -65,23 +61,19 @@ public class AgentRoundHandler implements RoundHandler {
     public RoundResult handle(Conversation conv, String conversationId, String message, String material,
                              Consumer<String> progress, RoundTrace trace) {
         // 检索问题预取：RAG 开启时立即异步启动「多轮查询改写」，与下面的智能路由 / 参数抽取并行。
-        // 前置链原本是「路由 → 参数抽取 → 改写」三个串行模型往返，而改写只看用户原话与会话历史、
-        // 与另外两段互不依赖，提前并发能把首字延迟压掉整整一个往返
-        // （详见 ChatComposer#prefetchRetrievalQuery）。未开 RAG 返回 null、不产生任何额外调用；
-        // 本轮若走追问分支则结果作废——刻意接受的轻微浪费。
+        // 前置链原本是「路由 → 参数抽取 → 改写」三段串行模型往返，而改写只看用户原话与会话历史、
+        // 与另两段互不依赖，提前并发能压掉整整一个往返的延迟（见 ChatComposer#prefetchRetrievalQuery）。
+        // 未开 RAG 返回 null、零额外调用；本轮若走追问分支则结果作废（刻意接受的轻微浪费）。
         CompletableFuture<String> prefetchedQuery = composer.prefetchRetrievalQuery(conversationId, message, conv);
         // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
         boolean explicitBinding = AgentBindSource.EXPLICIT.equals(conv.getAgentBindSource());
         Agent agent = determineAgent(conv, message);
 
-        // 话题切换预检：仅当会话处于「追问绑定(CLARIFY)」时。
-        // 携带「待回答的追问」重新审视本轮消息的真实意图，避免「深圳烧鸡味道怎么样」这类含城市词的新话题
-        // 被误当成天气补全、进而去查天气。必须放在参数补全之前：原实现依赖「是否凑齐参数」判断，
-        // 但新话题里若恰好含城市词会被直接凑齐参数，导致检测彻底进不去。
-        // 由路由 LLM 语义判断三态（不做关键词/语气词启发式）：
-        //   continueTask=用户在回答追问 → 保持绑定继续补全；
-        //   agent() 命中同一 agent → 继续补全；命中另一 agent → 转向（解绑）；
-        //   none（未命中且未在回答追问）= 新话题且无 agent 可接 → 转普通对话并解绑。
+        // 话题切换预检：仅当会话处于「追问绑定(CLARIFY)」时。携带「待回答的追问」重新审视本轮消息的真实意图，
+        // 避免「深圳烧鸡味道怎么样」这类含城市词的新话题被误当成天气补全、进而去查天气。必须放在参数补全之前：
+        // 原实现依赖「是否凑齐参数」判断，但新话题里若恰好含城市词会被直接凑齐参数，检测彻底进不去。
+        // 由路由 LLM 语义判断三态：continueTask=在回答追问 → 继续补全；命中另一 agent → 转向解绑；
+        // none（未命中且未在回答追问）= 新话题且无 agent 可接 → 转普通对话并解绑。
         if (!explicitBinding && conv.getAgentId() != null && AgentBindSource.CLARIFY.equals(conv.getAgentBindSource())) {
             String pendingQuestion = paramFillingService.lastClarifyQuestion(conversationId);
             AgentRouter.RouteDecision rd = agentRouter.route(message, pendingQuestion,
@@ -108,7 +100,7 @@ public class AgentRoundHandler implements RoundHandler {
 
         ParamFillingService.ClarifyDecision decision = paramFillingService.decideClarify(conversationId, message, agent);
         if (decision.getQuestion() != null) {
-            // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮追问回答能复用同一 agent。
+            // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮回答能复用同一 agent。
             // 落库由 saveClarifyExchange 统一完成（避免话题切换分支误落库失效的追问）。
             if (agent != null && !explicitBinding) {
                 conversationService.bindAgent(conversationId, agent.getId());
@@ -118,26 +110,26 @@ public class AgentRoundHandler implements RoundHandler {
         }
         // 常规单智能体回答（动态规划由 planner 会话单独处理，见 PlannerRoundHandler）。
         // message 为纯提问（不含附件），附件材料走 material 注入 system，不进会话记忆。
-        // prefetchedQuery 在此被消费：正常情况下它早已完成，join 不产生等待（见方法开头）。
         ChatComposer.ComposedRequest composed = composer.buildRequest(conversationId, message, conv, agent,
                 paramFillingService.buildParamBlock(decision), material, trace, prefetchedQuery);
         ChatClient.ChatClientRequestSpec spec = composed.spec();
+        // content() 标注 @Nullable（模型可能只产出工具调用而无正文）：必须在此收口，否则 null 会走到同步接口的
+        // Map.of("content", reply) —— Map.of 拒绝 null 值 → NPE → 500。与流式路径 emitChunks 的归一口径一致。
         String reply = spec.call().content();
+        if (reply == null) reply = "";
         // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
         if (!explicitBinding) conversationService.unbindAgent(conversationId);
         // 带上本轮 RAG 引用：由 ChatService 落库到本轮 assistant 消息（前端渲染角标用）
         return RoundResult.answer(reply, composed.citations());
     }
 
-    /**
-     * 判断本次请求应绑定的智能体：显式绑定优先；未绑定的普通会话走智能路由；二者皆无则返回 null（普通对话）。
-     */
+    /** 判断本次请求应绑定的智能体：显式绑定优先；未绑定的普通会话走智能路由；二者皆无则返回 null（普通对话）。 */
     private Agent determineAgent(Conversation conv, String message) {
         if (conv != null && conv.getAgentId() != null) {
             return agentService.getAgent(conv.getAgentId());
         }
         if (conv != null) {
-            // 传入最近若干轮对话上下文：让路由识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）。
+            // 传入最近若干轮上下文：让路由识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）。
             // 否则失去上下文会被误判为普通对话，导致带工具的智能体无法被路由、进而「无法回答」。
             return agentRouter.route(message, null,
                     composer.buildHistoryContextText(conv.getId(), RECENT_TURNS, null)).agent();

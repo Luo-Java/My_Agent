@@ -77,6 +77,12 @@
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
                 <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
                 <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
+                <!-- 访问密钥：服务端配置 app.api-key / APP_API_KEY 后，这里填入相同值即可正常调用；
+                     只存本浏览器 localStorage，不随页面源码分发。未启用服务端鉴权时留空即可。 -->
+                <button class="trace-btn key-btn" :class="{ 'key-btn-on': apiKeySet }" @click="editApiKey"
+                        :title="apiKeySet ? '已保存访问密钥（点击可修改或清除）' : '服务端启用 APP_API_KEY 后，在此填入相同密钥（仅存于本浏览器）'">
+                    🔑 {{ apiKeySet ? '已授权' : '访问密钥' }}
+                </button>
                 <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
                 <button v-if="currentId" class="trace-btn" @click="openTrace"
                         title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>

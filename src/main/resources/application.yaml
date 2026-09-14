@@ -2,63 +2,65 @@ spring:
   application:
     name: My_Agent
 
-  # 导入独立提示词配置（agent.prompt.*），提示词集中外置，见 resources/prompts.yaml
+  # 导入独立提示词配置（agent.prompt.*，见 resources/prompts.yaml）+ 本地私有配置
+  # （application-local.yaml，含数据库口令与模型 API Key；该文件已被 .gitignore 排除）。
+  # 本地私有配置用 optional: 引入 —— 文件不存在也不报错，部署时可改用环境变量
+  # （DB_PASSWORD / OPENAI_API_KEY，优先级高于任何配置文件）。
   config:
-    import: classpath:prompts.yaml
+    import: classpath:prompts.yaml, optional:file:./application-local.yaml, optional:file:./config/application-local.yaml
 
-  # 启动时自动执行 schema.sql 建表（幂等：CREATE TABLE IF NOT EXISTS；
-  # continue-on-error 让“为旧表补列”的 ALTER 在列已存在时不报错）
+  # 建表脚本默认【不自动执行】（下方 sql.init 整段处于注释状态）：DDL 由人工在 mysql 客户端
+  # 手动执行 src/main/resources/sql/schema.sql（建表）与 alter.sql（存量库补列）。
+  # 如需应用启动时自动建表，取消下面注释即可 —— schema.sql 幂等（CREATE TABLE IF NOT EXISTS），
 #  sql:
 #    init:
 #      mode: always
 #      schema-locations: classpath:sql/schema.sql,classpath:sql/alter.sql
 #      continue-on-error: true
 
+  # 文件上传上限。单文件给到 20MB 留余量（覆盖前端 15MB 的限额），
+  # 请求总量 80MB 覆盖 5 个满额附件。超限由 GlobalExceptionHandler 转成 413 友好提示，不再裸 500。
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 80MB
+
   datasource:
-    # 数据库 my_agent 不存在时，连接参数中的 createDatabaseIfNotExist 会自动创建
+    # 库名 agent 必须【事先手动创建】：连接串未带 createDatabaseIfNotExist，不会自动建库。
     url: jdbc:mysql://localhost:3306/agent?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
     username: ${DB_USERNAME:root}
-    password: ${DB_PASSWORD:root@123}
+    # 口令不进仓库：由 application-local.yaml 提供，或用环境变量 DB_PASSWORD 注入。
+    # spring.config.import 引入的 application-local.yaml，留一个空值反而会把本地口令覆盖成空串。
     driver-class-name: com.mysql.cj.jdbc.Driver
 
   ai:
     openai:
-      # API Key：推荐通过环境变量 OPENAI_API_KEY 注入，或在此直接填写
-      api-key: ${OPENAI_API_KEY:sk-67e763f880894e47a4e5cc56be6e0615}
-      # OpenAI 兼容的基础地址。
+      # API Key 不进仓库：由 application-local.yaml 提供，或用环境变量 OPENAI_API_KEY 注入。
       # 使用 DeepSeek / 通义千问 / 本地 Ollama 等兼容服务时，改成对应地址即可，
       # 例如 DeepSeek: https://api.deepseek.com   本地 Ollama: http://localhost:11434
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      # 客户端级超时与重试，**对所有 LLM 调用生效**（含路由 / 参数抽取 / 查询改写这些前置调用）——
-      # 它们在 Spring AI 里由 OpenAiSetup.setupSyncClient 在建客户端时固化，运行时改不了。
       # Spring AI 默认 timeout=60s、max-retries=3：重试会放大失败代价，一次持续 429/5xx 最多尝试 4 次，
-      # 前置链上每个调用都可能各花掉数十秒，用户只能干等。这里把重试收紧到 1，让失败尽快暴露
-      # （前置链各自有降级：路由失败=不路由、改写失败=用原话，都不会中断对话）。
-      # 注意：OpenAiChatOptions 虽有 timeout 字段，但 OpenAiChatModel 全文未引用它（死字段），
-      # per-request 超时无法实现，只能在这里全局配置。
+      # 故这里收紧到 max-retries=1。
+      # 注：OpenAiChatOptions 虽有 timeout 字段，但 OpenAiChatModel 全文未引用它（死字段），
       timeout: 60s
       max-retries: 1
       chat:
-        # 使用的模型 ID，例如 gpt-4o-mini / gpt-4o / deepseek-chat
+        # 主对话模型 ID（OpenAI 兼容服务下的模型名，如 gpt-4o-mini / deepseek-chat / qwen3.7-plus）。
         model: kimi-k2.7-code
       # 知识库（RAG）向量化：与 chat 共用上方的 api-key / base-url（OpenAI 兼容的 /embeddings 端点）。
-      # 未配置/调用失败时对话不受影响（知识库检索静默降级），仅「添加知识」会明确报错。
       embedding:
-        # 向量模型（OpenAI 兼容 /embeddings 端点）。当前用 qwen3.7-text-embedding；
-        # 换模型后需确认其输出维度与 Chroma 集合一致（本集合建为 1024 维），并同步调整
-        # ChromaVectorStoreService 的相似度还原逻辑（注：Chroma 0.5 cosine 的 score = 2·cos − 1，非真实余弦）
+        # 换模型会使已入库向量失效（维度 / 语义空间不同），需重传文件或 rechunk 重建。
         model: qwen3.7-text-embedding
 
 # 智能体平台自身配置。
-# ⚠️ 这几个键必须写在**顶层**，不要缩进到 spring: 下面。
-# 踩过的坑：曾把 agent: 缩进 2 格写成 spring 的子键，于是实际属性名变成 spring.agent.rag.*，
-# 与 @ConfigurationProperties("agent.rag") 完全对不上 —— 整段配置静默失效、全部回落到 record 默认值。
-# 又因为「默认值」与「这里写的值」恰好相同，问题一直没暴露，直到改配置却不生效才会发现。
+# 前缀必须是【顶层 agent.*】，与代码里的 @ConfigurationProperties("agent.*") 对应。
+# 历史上曾因缩进错误被挂到 spring: 下（实际键变成 spring.agent.*）而整段静默失效，改动务必核对缩进。
 agent:
   # 多模态视觉识别：图片由 VisionService 转文本 caption 后注入对话上下文。
-  # 复用 spring.ai.openai.api-key / base-url；dashscope 兼容端点支持 qwen-vl-plus / qwen-vl-ocr 等。
+  # 整段被注释 = 全部使用 VisionProperties 的默认值（model=qwen3.5-ocr / 单图 10MB / 超时 30s）。
+  # 需要覆盖时取消注释；model 填 dashscope OpenAI 兼容接口支持的视觉模型（qwen3.5-ocr / qwen-vl-plus 等）。
   # vision:
-  #   model: qwen-vl-plus
+  #   model: qwen3.5-ocr
   #   max-image-bytes: 10485760   # 单图 10MB 上限，超出返回「图片过大」占位
   #   timeout-seconds: 30
 
@@ -117,10 +119,10 @@ chroma:
   # 超了会 400 "batch size ... larger than 20"），不是 Chroma 的请求体积限制。默认 10 留一倍余量
   upsert-batch-size: 10
 
-# 接口访问控制（可选）：留空 = 不校验（本地开发默认，行为与原先一致）；
-# 配置后所有 /api/** 请求必须带 X-Api-Key 头且与值一致才放行（静态前端页面不受影响），
-# 用于把服务暴露到局域网/公网时防他人直接调用 SQL 工具或白嫖 LLM Key。
-# 推荐通过环境变量注入：set APP_API_KEY=your-key（PowerShell）/ export APP_API_KEY=your-key（bash）
+# 接口访问控制（可选）：留空 = 不校验（本地开发默认）。
+# 设为非空值后，所有 /api/** 请求必须带 X-Api-Key 头（或 Authorization: Bearer）且与值一致才放行，
+# 未带 / 错误一律 401。网页界面本身不在拦截范围内，但页面发起的 /api 请求会 401 ——
+# 点顶栏「🔑 访问密钥」填入同一个值即可（存浏览器 localStorage，见 static/js/app.js 的 apiFetch）。
 app:
   api-key: ${APP_API_KEY:}
   # SSE 传输层兜底（见 ChatController）
@@ -140,12 +142,10 @@ app:
 server:
   port: 8080
 
-# 日志配置：输出全部级别（TRACE 是最低级别，涵盖 TRACE/DEBUG/INFO/WARN/ERROR）
+# 日志配置
 logging:
   level:
-    root: info           # 全局所有框架与业务代码都输出
-    org.luo: debug        # 本项目代码显式设为 trace，确保自定义日志全量输出
+    root: info           # 框架与第三方依赖：info（避免刷屏）
+    org.luo: debug       # 本项目代码：debug（排查时改成 trace 可看到更细的链路日志）
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
-
-

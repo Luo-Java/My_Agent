@@ -19,13 +19,13 @@ import org.luo.service.ChatService;
 /**
  * 动态规划器（Dynamic Planner）服务。
  * <p>
- * 与「顺序工作流（手动预配置步骤）」不同，规划器在<b>运行时</b>根据用户的自然语言目标与当前可用智能体清单，
- * 由 LLM 自行决定应该调用哪些智能体、以什么顺序、每步给什么指令，产出一份顺序计划后再交给 {@link ChatService}
- * 顺序执行（前一步输出作为后一步输入）。用户无需任何预配置，直接描述目标即可，对终端用户更友好。
+ * 与「手动预配置步骤的顺序工作流」不同，规划器在<b>运行时</b>根据用户自然语言目标与当前可用智能体清单，
+ * 由 LLM 决定调用哪些智能体、以什么顺序、每步给什么指令，产出顺序计划后交 {@link ChatService} 执行
+ * （前一步输出作为后一步输入）。用户无需任何预配置。
  * <p>
- * 规划器复用 {@link ChatComposer#internalChatClient()}（无记忆 ChatClient，只产出计划 JSON，不写入任何
- * 会话历史）；计划解析使用 Hutool 的 {@code JSONUtil}（与路由 / 参数解析一致，规避 Jackson
- * {@code ObjectMapper}）。解析失败或无可执行步骤时返回空列表，由调用方回退普通回答，绝不阻断主流程。
+ * 复用 {@link ChatComposer#internalChatClient()}（无记忆，只产出计划 JSON、不写会话历史）；计划解析用
+ * Hutool {@code JSONUtil}（与路由/参数解析一致，规避 Jackson ObjectMapper）。解析失败或无可执行步骤时
+ * 返回空列表，由调用方回退普通回答，绝不阻断主流程。
  */
 @Slf4j
 @Service
@@ -47,7 +47,7 @@ public class PlannerService {
     public record PlanStep(String agentCode, String instruction) {}
 
     /**
-     * 动态规划：根据用户目标与当前可用智能体清单，让 LLM 产出一份「顺序执行」的计划。
+     * 动态规划：根据用户目标与可用智能体清单，让 LLM 产出「顺序执行」计划。
      *
      * @param userGoal 用户当前自然语言目标
      * @return 计划步骤列表（可能为空，表示无需编排、直接普通回答）；解析失败返回空列表
@@ -76,10 +76,7 @@ public class PlannerService {
         }
     }
 
-    /**
-     * 解析规划回复为步骤列表：识别 {@code steps} 数组，逐个取出 agentCode + instruction。
-     * 使用 Hutool {@code JSONUtil} 解析，规避 Jackson {@code ObjectMapper}。
-     */
+    /** 解析规划回复为步骤列表：识别 {@code steps} 数组，逐个取 agentCode + instruction（Hutool JSONUtil，规避 Jackson）。 */
     private List<PlanStep> parsePlan(String reply) {
         try {
             JSONObject obj = JSONUtil.parseObj(reply);

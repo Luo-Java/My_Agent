@@ -9,6 +9,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 import org.luo.controller.ChatController;
 import org.luo.exception.AiErrorCode;
@@ -49,5 +50,18 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ErrorResponse> handleNotFound(NoResourceFoundException e) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse(404, "资源不存在"));
+    }
+
+    /**
+     * 上传内容超过 {@code spring.servlet.multipart.max-file-size / max-request-size} → 413。
+     * <p>
+     * 不接这个异常时会落到通用兜底分支被当成「服务器内部错误」（500），前端只看到「服务器错误」，
+     * 完全不知道是文件太大。提示语中的上限需与 application.yaml 的 multipart 配置保持一致。
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ErrorResponse> handleUploadTooLarge(MaxUploadSizeExceededException e) {
+        log.warn("上传内容超限：{}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
+                .body(new ErrorResponse(413, "上传文件过大（单文件上限 20MB），请压缩或减少附件后重试"));
     }
 }

@@ -1,5 +1,27 @@
 const { createApp, ref, reactive, computed, onMounted, nextTick } = Vue;
 
+// ==================== 接口访问密钥（X-Api-Key） ====================
+/** 密钥在浏览器本地的存储键。只存本机、不进页面源码（服务端配置 APP_API_KEY 后才需要填）。 */
+const API_KEY_STORAGE = 'my_agent_api_key';
+
+/** 读取已保存的访问密钥；localStorage 不可用（隐私模式等）时返回空串。 */
+function getApiKey() {
+    try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
+}
+
+/** 统一 API 请求：自动附加 X-Api-Key 头。
+ *  所有 /api/** 调用都必须走这里 —— 服务端一旦配置 app.api-key，裸 fetch 会全部 401。
+ *  附件图片走 /files/**（不在 ApiKeyInterceptor 的 /api/** 范围内），<img> 直连即可，无需带头。 */
+function apiFetch(url, options) {
+    const opts = Object.assign({}, options || {});
+    const headers = Object.assign({}, opts.headers || {});
+    const key = getApiKey();
+    if (key) headers['X-Api-Key'] = key;
+    opts.headers = headers;
+    return window.fetch(url, opts);
+}
+
+
 // 配置 marked：启用 GFM（表格/任务列表/删除线），关闭 sanitize 让代码块正常渲染
 if (typeof marked !== 'undefined') {
     marked.setOptions({
@@ -108,6 +130,10 @@ createApp({
         // 输入框「智能规划」开关：勾选=按规划模式执行（动态规划器编排多智能体），取消=普通对话。
         // 随会话切换同步（规划会话默认勾选），发送时随请求写回会话（刷新后保持）。
         const planMode = ref(false);
+
+        // 顶栏「访问密钥」按钮状态：true = 本浏览器已保存密钥。
+        // 只存布尔值，密钥本身不进 Vue 状态（避免出现在调试面板/组件实例里），读取统一走 getApiKey()。
+        const apiKeySet = ref(!!getApiKey());
 
         // 输入框「📚 RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
@@ -271,7 +297,7 @@ createApp({
         async function onRagEnabledChange() {
             if (!currentId.value) return;
             try {
-                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/rag', {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/rag', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ enabled: ragEnabled.value })
@@ -290,7 +316,7 @@ createApp({
         async function onPlannerChange() {
             if (!currentId.value) { planMode.value = false; return; }
             try {
-                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/planner', {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/planner', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ enabled: planMode.value })
@@ -327,7 +353,7 @@ createApp({
         // ===== 会话 =====
         async function loadConversations() {
             try {
-                const resp = await fetch('/api/chat/conversations');
+                const resp = await apiFetch('/api/chat/conversations');
                 if (!resp.ok) return;
                 const list = await resp.json();
                 conversations.value = list;
@@ -344,7 +370,7 @@ createApp({
         // 开启新对话（默认助手，不绑定智能体）
         async function newConversation() {
             try {
-                const resp = await fetch('/api/chat/conversation', { method: 'POST' });
+                const resp = await apiFetch('/api/chat/conversation', { method: 'POST' });
                 if (!resp.ok) { alert('创建会话失败'); return; }
                 const data = await resp.json();
                 currentId.value = data.conversationId;
@@ -366,7 +392,7 @@ createApp({
         // 用某个智能体开启新对话
         async function startAgentChat(a) {
             try {
-                const resp = await fetch('/api/chat/conversation', {
+                const resp = await apiFetch('/api/chat/conversation', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ agentId: a.id })
@@ -400,7 +426,7 @@ createApp({
             // RAG 开关跟随会话：上次的开关状态回显（false=关闭）
             ragEnabled.value = !!(conv && conv.ragEnabled);
             try {
-                const resp = await fetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
+                const resp = await apiFetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
                 if (resp.ok) {
                     const data = await resp.json();
                     messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations));
@@ -425,7 +451,7 @@ createApp({
             editingId.value = null;
             if (!id || !title) return;
             try {
-                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(id), {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(id), {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ title })
@@ -442,7 +468,7 @@ createApp({
             if (!id) return;
             if (!confirm('确定删除该对话及其所有消息吗？此操作不可恢复。')) return;
             try {
-                const resp = await fetch('/api/chat/conversation/' + encodeURIComponent(id), {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(id), {
                     method: 'DELETE'
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -463,7 +489,7 @@ createApp({
         // ===== 智能体 =====
         async function loadAgents() {
             try {
-                const resp = await fetch('/api/agent');
+                const resp = await apiFetch('/api/agent');
                 if (resp.ok) agents.value = await resp.json();
             } catch (e) { /* 忽略 */ }
         }
@@ -471,7 +497,7 @@ createApp({
         /** 拉取可用工具清单（工具集在应用启动时固定，拉一次即可）。失败静默，不影响智能体管理主流程。 */
         async function loadTools() {
             try {
-                const resp = await fetch('/api/agent/tools');
+                const resp = await apiFetch('/api/agent/tools');
                 if (resp.ok) availableTools.value = await resp.json();
             } catch (e) { /* 忽略 */ }
         }
@@ -660,7 +686,7 @@ createApp({
             }
             m.genLoading = true;
             try {
-                const resp = await fetch('/api/agent/generate-prompt', {
+                const resp = await apiFetch('/api/agent/generate-prompt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: m.name, description: m.description })
@@ -702,7 +728,7 @@ createApp({
             const url = m.id ? ('/api/agent/' + encodeURIComponent(m.id)) : '/api/agent';
             const method = m.id ? 'PUT' : 'POST';
             try {
-                const resp = await fetch(url, {
+                const resp = await apiFetch(url, {
                     method,
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -722,7 +748,7 @@ createApp({
             if (!id) return;
             if (!confirm('确定删除该智能体吗？已绑定它的会话将退回为默认助手，历史消息保留。')) return;
             try {
-                const resp = await fetch('/api/agent/' + encodeURIComponent(id), { method: 'DELETE' });
+                const resp = await apiFetch('/api/agent/' + encodeURIComponent(id), { method: 'DELETE' });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 agents.value = agents.value.filter(a => a.id !== id);
                 if (agentView.open && agentView.agent && agentView.agent.id === id) {
@@ -737,7 +763,7 @@ createApp({
         // ===== 知识库（RAG） =====
         async function loadKbs() {
             try {
-                const resp = await fetch('/api/kb');
+                const resp = await apiFetch('/api/kb');
                 if (resp.ok) kbs.value = await resp.json();
             } catch (e) { /* 忽略 */ }
         }
@@ -798,7 +824,7 @@ createApp({
         // 拉取分片策略元数据与重叠默认值（key/label/desc + defaultOverlap），供设置弹窗与展示使用
         async function loadChunkStrategies() {
             try {
-                const resp = await fetch('/api/kb/chunk-strategies');
+                const resp = await apiFetch('/api/kb/chunk-strategies');
                 if (resp.ok) {
                     const data = await resp.json();
                     kbDetail.strategies = (data && data.strategies) || [];
@@ -861,7 +887,7 @@ createApp({
             const url = kbModal.mode === 'create' ? '/api/kb' : '/api/kb/' + kbModal.id;
             const method = kbModal.mode === 'create' ? 'POST' : 'PUT';
             try {
-                const resp = await fetch(url, {
+                const resp = await apiFetch(url, {
                     method,
                     headers: { 'Content-Type': 'application/json' },
                     // rename 时 agentId 恒为 null：归属不可变更（全局/专属由创建决定）
@@ -901,7 +927,7 @@ createApp({
                 : '确定删除「通用知识库」及其全部 ' + (kb.docCount || 0) + ' 个知识块吗？\n删除后所有对话将不再检索全局资料；下次进入会重建一个空库。';
             if (!confirm(tip)) return;
             try {
-                const resp = await fetch('/api/kb/' + encodeURIComponent(id), { method: 'DELETE' });
+                const resp = await apiFetch('/api/kb/' + encodeURIComponent(id), { method: 'DELETE' });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 kbs.value = kbs.value.filter(x => x.id !== id);
                 if (kbDetail.open && kbDetail.kb && kbDetail.kb.id === id) kbDetail.open = false;
@@ -931,7 +957,7 @@ createApp({
         // Chroma 向量副本状态：确认上传的知识块是否真的同步进了向量库（MySQL 是源，Chroma 是加速副本）
         async function loadChromaStatus() {
             try {
-                const resp = await fetch('/api/kb/chroma/status');
+                const resp = await apiFetch('/api/kb/chroma/status');
                 if (resp.ok) Object.assign(chroma.value, await resp.json());
             } catch (e) { /* 忽略：状态条保持上一次结果 */ }
         }
@@ -942,7 +968,7 @@ createApp({
             chroma.value.syncing = true;
             chroma.value.msg = '';
             try {
-                const resp = await fetch('/api/kb/chroma/sync', {
+                const resp = await apiFetch('/api/kb/chroma/sync', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ kbId: kbDetail.kb.id })
@@ -966,7 +992,7 @@ createApp({
         async function loadFiles() {
             if (!kbDetail.kb) return;
             try {
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files');
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/files');
                 if (resp.ok) kbDetail.fileList = (await resp.json()) || [];
             } catch (e) { /* 忽略 */ }
         }
@@ -978,7 +1004,7 @@ createApp({
                     + ' 个知识块吗？\n删除后对话将不再检索到该文件的内容，且无法恢复。';
             if (!confirm(tip)) return;
             try {
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files/' + f.id, { method: 'DELETE' });
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/files/' + f.id, { method: 'DELETE' });
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
                 if (!resp.ok) {
@@ -1022,7 +1048,7 @@ createApp({
             }
             r.busy = true;
             try {
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/files/' + r.file.id + '/rechunk', {
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/files/' + r.file.id + '/rechunk', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ strategy: r.strategy, overlap: newOv })
@@ -1053,7 +1079,7 @@ createApp({
             if (!kbDetail.kb) return;
             try {
                 const offset = append ? kbDetail.chunks.length : 0;
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/chunks?offset=' + offset + '&limit=20');
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/chunks?offset=' + offset + '&limit=20');
                 if (resp.ok) {
                     const d = await resp.json();
                     kbDetail.total = d.total || 0;
@@ -1107,7 +1133,7 @@ createApp({
             try {
                 const fd = new FormData();
                 for (const f of kbDetail.files) fd.append('files', f);
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/upload', { method: 'POST', body: fd });
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/upload', { method: 'POST', body: fd });
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
                 if (!resp.ok) {
@@ -1125,12 +1151,9 @@ createApp({
                     text += (text ? '；' : '') + errList.length + ' 个文件失败：'
                             + errList.map(r => r.fileName + (r.message ? '（' + r.message + '）' : '')).join('；');
                 }
-                // 向量副本（Chroma）未同步：MySQL 已入库、检索会回退 MySQL 余弦，但要让用户看见
-                const unsynced = okList.filter(r => r.chromaSynced === false);
-                if (unsynced.length) {
-                    text += (text ? '；' : '') + '⚠ ' + unsynced.length
-                            + ' 个文件仅写入 MySQL，向量副本（Chroma）未同步，可点上方「同步」回填';
-                }
+                // 不再依据响应里的 chromaSynced 提示用户：向量副本写入已延后到事务提交之后，
+                // 接口返回时结果尚未产生。副本实况由下方 loadChromaStatus() 拉取（顶部状态条显示
+                // 实际向量条数，可据此点「同步」回填）。
                 kbDetail.msgOk = errList.length === 0;
                 kbDetail.msg = text || '没有处理任何文件';
                 kbDetail.files = [];
@@ -1156,7 +1179,7 @@ createApp({
         async function deleteChunk(cid) {
             if (!confirm('删除该知识块？删除后对话将不再检索到它。')) return;
             try {
-                const resp = await fetch('/api/kb/' + kbDetail.kb.id + '/chunks/' + cid, { method: 'DELETE' });
+                const resp = await apiFetch('/api/kb/' + kbDetail.kb.id + '/chunks/' + cid, { method: 'DELETE' });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 kbDetail.chunks = kbDetail.chunks.filter(c => c.id !== cid);
                 kbDetail.total = Math.max(0, kbDetail.total - 1);
@@ -1173,6 +1196,26 @@ createApp({
         // 回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「调了哪些工具、花了多少 token、耗时多久」。
         // items：追踪列表（按时间倒序）；expanded：按索引记录哪几条展开了明细。
         const traceModal = reactive({ open: false, loading: false, items: [], expanded: {}, error: '' });
+        /** 顶栏「访问密钥」：写入/清除本浏览器的 X-Api-Key。
+         *  用原生 prompt（无需新增样式）；密钥明文存 localStorage，仅本机可见。 */
+        function editApiKey() {
+            const typed = window.prompt(
+                    '服务端未启用鉴权时无需填写。\n请输入访问密钥（与服务端 app.api-key / APP_API_KEY 一致；'
+                    + '留空并确定 = 清除已保存的密钥）：',
+                    getApiKey());
+            if (typed === null) return;               // 用户取消
+            const key = typed.trim();
+            try {
+                if (key) localStorage.setItem(API_KEY_STORAGE, key);
+                else localStorage.removeItem(API_KEY_STORAGE);
+            } catch (e) {
+                alert('浏览器本地存储不可用（如隐私模式），密钥未能保存');
+                return;
+            }
+            apiKeySet.value = !!key;
+            alert(key ? '已保存访问密钥（仅存于本浏览器，刷新后仍生效）' : '已清除访问密钥');
+        }
+
         async function openTrace() {
             traceModal.open = true;
             traceModal.loading = true;
@@ -1181,7 +1224,7 @@ createApp({
             traceModal.error = '';
             try {
                 const q = currentId.value ? ('?conversationId=' + encodeURIComponent(currentId.value)) : '';
-                const resp = await fetch('/api/trace' + q);
+                const resp = await apiFetch('/api/trace' + q);
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const list = await resp.json();
                 traceModal.items = Array.isArray(list) ? list : [];
@@ -1233,7 +1276,7 @@ createApp({
                 try {
                     const fd = new FormData();
                     attachments.value.forEach(a => fd.append('files', a.file));
-                    const resp = await fetch('/api/chat/attachment/process', { method: 'POST', body: fd });
+                    const resp = await apiFetch('/api/chat/attachment/process', { method: 'POST', body: fd });
                     if (!resp.ok) throw new Error('HTTP ' + resp.status);
                     const data = await resp.json();
                     const results = data.results || [];
@@ -1287,7 +1330,7 @@ createApp({
             const lastIndex = messages.value.length - 1;
 
             try {
-                const resp = await fetch('/api/chat/stream', {
+                const resp = await apiFetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -1432,6 +1475,8 @@ createApp({
             strategyLabel, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
             pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
+            // 顶栏「访问密钥」：状态 + 修改入口（所有 /api 请求经 apiFetch 自动带上该密钥）
+            apiKeySet, editApiKey,
             // 链路追踪（可观测）：traceModal + 展示辅助函数
             traceModal, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore
         };

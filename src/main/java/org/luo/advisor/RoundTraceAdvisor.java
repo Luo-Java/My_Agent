@@ -20,30 +20,25 @@ import java.util.List;
 /**
  * 链路追踪 Advisor：把「模型调用」这一层的事实采集进 {@link RoundTrace}——工具调用明细与 token 用量。
  * <p>
- * <b>为什么必须由 Advisor 采集</b>：工具调用循环发生在 Spring AI 内部（ToolCallingAdvisor 反复调模型、
- * 执行工具、再调模型），业务代码只看得到最终结果，中间调了哪些工具、每次花多少 token 只有 Advisor 看得见。
+ * <b>为什么必须由 Advisor 采集</b>：工具循环发生在 Spring AI 内部（反复调模型、执行工具、再调模型），
+ * 业务代码只看得到最终结果；调了哪些工具、每次花多少 token 只有 Advisor 看得见。
  * <p>
- * <b>放在链最内层</b>（order 取最大值附近）：这样它在工具循环<b>之内</b>，每一轮模型调用都会经过——
- * 工具调用明细与 token 才能随循环逐步累加，而不是只看到最终那一次。
+ * <b>放在链最内层</b>（order 取最大值附近）：这样它在工具循环<b>之内</b>，每轮模型调用都会经过，
+ * 明细与 token 才能随循环逐步累加，而不是只看到最终那一次。
  * <p>
- * <b>trace 从哪来</b>：{@code ChatService} 把当轮 {@link RoundTrace} 塞进 ChatClient 的 advisor 上下文
- * （键 {@link RoundTrace#CONTEXT_KEY}，与 MemoryChatMemoryAdvisor 用 CONVERSATION_ID 同款机制），
- * 本 Advisor 在 {@link #before} 里取回。取不到（如规划器内部的裸 ChatModel 调用）就整体跳过——
- * 追踪是旁路，缺数据可以接受，报错不可以。
+ * <b>trace 从哪来</b>：ChatService 把当轮 {@link RoundTrace} 塞进 advisor 上下文（键
+ * {@link RoundTrace#CONTEXT_KEY}，与 CONVERSATION_ID 同款机制），本 Advisor 在 {@link #before} 取回；
+ * 取不到（如规划器内部的裸 ChatModel 调用）就整体跳过——追踪是旁路，缺数据可接受，报错不可以。
  * <p>
- * <b>token 为什么用 ThreadLocal 过渡</b>：用量只有在模型返回后才拿得到，而 {@code after} 回调只有响应对象。
- * Spring AI 的 {@code before} 与 {@code after} 对同一次 advisor 调用保证<b>同线程同步</b>执行
- * （{@code adviseCall} = before → nextCall → after），故用 ThreadLocal 把 trace 从 before 带到 after 最直接；
- * 且这个传递窗口仅限单次调用内，即便未来规划器改成 DAG 并行（多线程），每线程各自持有自己的 trace，也不会串。
+ * <b>token 为什么用 ThreadLocal 过渡</b>：用量只有在模型返回后才拿得到，而 {@code after} 只有响应对象。
+ * Spring AI 保证 {@code before}/{@code after} 对同一次 advisor 调用<b>同线程同步</b>执行，故用 ThreadLocal
+ * 把 trace 从 before 带到 after 最直接；该窗口仅限单次调用内，即便未来 DAG 并行也是每线程各持自己的 trace。
  */
 @Slf4j
 @Component
 public class RoundTraceAdvisor implements BaseAdvisor {
 
-    /**
-     * before → after 的同线程传递（见类注释「token 为什么用 ThreadLocal 过渡」）。
-     * 只在单次 advisor 调用的窗口内使用，用完即清，避免线程池复用导致串数据。
-     */
+    /** before → after 的同线程传递；只在单次调用窗口内使用，用完即清，避免线程池复用导致串数据。 */
     private static final ThreadLocal<RoundTrace> CURRENT = new ThreadLocal<>();
 
     @Override
@@ -55,7 +50,13 @@ public class RoundTraceAdvisor implements BaseAdvisor {
     @Override
     public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
         RoundTrace trace = traceOf(request.context());
-        if (trace == null) return request;
+        if (trace == null) {
+            // 无 trace 的调用（如规划器内部裸调用）：必须主动清掉可能残留的上一轮引用——
+            // 若上一次调用在 after 前抛异常，boundedElastic 复用的线程会残留旧 trace，
+            // 下一次「无 trace」调用的 after 命中兜底分支就会把 token 累加到已落库的旧记录上。
+            CURRENT.remove();
+            return request;
+        }
         CURRENT.set(trace);
         trace.syncToolCalls(extractToolCalls(request.prompt()));
         return request;
@@ -87,14 +88,10 @@ public class RoundTraceAdvisor implements BaseAdvisor {
     }
 
     /**
-     * 从 prompt 的历史消息里抽出「已执行的工具调用」：工具名 + 入参 + 返回摘要。
-     * <ul>
-     *   <li>入参来自 {@link AssistantMessage#getToolCalls()}（模型发起的调用，含 arguments）；</li>
-     *   <li>返回来自 {@link ToolResponseMessage}（工具执行结果，含 responseData）。</li>
-     * </ul>
-     * 两者在历史里<b>按执行顺序</b>各自成列，按下标对齐即可（数量不一致时以多者为准、缺失侧留空）。
-     * 这个方法在每轮模型调用前都会被调一次，返回的是「此刻完整历史」——调用方
-     * {@link RoundTrace#syncToolCalls} 只在变长时替换，保证最终拿到全量而不是最后一次的空集。
+     * 从 prompt 历史里抽出「已执行的工具调用」（工具名 + 入参 + 返回摘要）：入参来自
+     * {@link AssistantMessage#getToolCalls()}，返回来自 {@link ToolResponseMessage}；两者在历史里按执行顺序
+     * 各自成列，按下标对齐即可（数量不一致时以多者为准、缺失侧留空）。该方法每轮模型调用前都调一次、
+     * 返回「此刻完整历史」——调用方 {@link RoundTrace#syncToolCalls} 只在变长时替换，保证拿到全量而非末次空集。
      */
     private static List<RoundTrace.ToolCall> extractToolCalls(Prompt prompt) {
         if (prompt == null || prompt.getInstructions() == null) return List.of();

@@ -12,13 +12,10 @@ import org.luo.infrastructure.chroma.ChromaClient.ChromaDoc;
 import org.luo.infrastructure.chroma.ChromaClient.ChromaHit;
 
 /**
- * Chroma 向量库<b>业务门面</b>（与「MySQL 双写留存」配套）。
- * 连接生命周期下沉到 {@link ChromaConnection}，具体操作下沉到 {@link ChromaClient}；本类只做：
- * <ul>
- *   <li><b>实体转换</b>：KnowledgeChunk → ChromaDoc（chunk id 即文档 id，kb_id/source 写 metadata）；</li>
- *   <li><b>编排与降级</b>：经 connection.connected(op) 取客户端，未连接/失败降级（MySQL 已留档）；</li>
- *   <li><b>对外契约</b>：提供稳定的 upsert/delete/search/status，屏蔽底层 Chroma 版本细节。</li>
- * </ul>
+ * Chroma 向量库<b>业务门面</b>（与「MySQL 双写留存」配套）。连接生命周期下沉到 {@link ChromaConnection}，
+ * 具体操作下沉到 {@link ChromaClient}；本类只做三件事：<b>实体转换</b>（KnowledgeChunk → ChromaDoc，
+ * chunk id 即文档 id、kb_id/source 写 metadata）、<b>编排与降级</b>（经 connection.connected(op) 取客户端，
+ * 未连接/失败即降级，MySQL 已留档）、<b>对外契约</b>（稳定的 upsert/delete/search/status，屏蔽 Chroma 版本细节）。
  */
 @Slf4j
 @Service
@@ -33,8 +30,7 @@ public class ChromaVectorStoreService {
     /**
      * 把已落库知识块 upsert 到 Chroma（按 chunk id 幂等覆盖）。失败只 warn 降级（MySQL 已留档），返回 false 供调用方统计。
      *
-     * @param kbId   所属知识库 ID（写入文档 metadata，检索过滤用）
-     * @param chunks 已落库的知识块（id 必须非空）
+     * @param kbId 所属知识库 ID（写入文档 metadata，检索过滤用）
      */
     public boolean upsertChunks(Long kbId, List<KnowledgeChunk> chunks) {
         if (kbId == null || chunks == null || chunks.isEmpty()) {
@@ -83,10 +79,7 @@ public class ChromaVectorStoreService {
      * 多库合并检索：委托 ChromaClient 完成 query + 余弦还原 + kb_id 过滤，本方法只管连接就绪与降级。
      * 服务不可用/失败返回空列表（调用方回退 MySQL 余弦），绝不抛错。
      *
-     * @param kbIds    目标知识库 ID（≥1 个）
-     * @param query    检索文本
-     * @param topK     返回候选数上限（多库建议传 库数×单库上限，由调用方统一排序截断）
-     * @param minScore 余弦相似度最低阈值
+     * @param topK 返回候选数上限（多库建议传 库数×单库上限，由调用方统一排序截断）
      */
     public List<ChromaHit> search(Collection<Long> kbIds, String query, int topK, double minScore) {
         if (kbIds == null || kbIds.isEmpty() || query == null || query.isBlank()) {

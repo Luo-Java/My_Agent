@@ -12,25 +12,20 @@ import java.util.UUID;
 /**
  * 单轮对话的可观测上下文（一次对话 = 一个 RoundTrace）。
  * <p>
- * 生命期：{@code ChatService} 在本轮开始前 {@code new}，一路向下传到各编排环节，本轮结束后交给
- * {@link TraceService} 异步落库 {@code agent_trace}。它是<b>可变收集器</b>——各环节往里塞自己那段事实，
- * 谁也不必知道别人：路由塞路由结论、RAG 塞命中与引用、规划塞计划、Advisor 塞工具调用与 token。
+ * 生命期：{@code ChatService} 在本轮开始前 new，一路向下传到各编排环节，结束后交 {@link TraceService}
+ * 异步落库 agent_trace。<b>可变收集器</b>——各环节往里塞自己那段事实（路由结论 / RAG 命中与引用 /
+ * 计划 / Advisor 的工具调用与 token），谁也不必知道别人。
  * <p>
- * <b>为什么不用 ThreadLocal</b>：当前执行是单线程的（ThreadLocal 也能work），但规划器下一步要支持
- * DAG 并行（同层步骤跑在不同线程上），届时 ThreadLocal 会静默丢数据。所以本对象<b>显式</b>沿调用链
- * 传递，同时塞进 Spring AI 的 advisor 上下文（{@link #CONTEXT_KEY}）——Advisor 只有这条路能看到它
- * （{@link org.luo.advisor.RoundTraceAdvisor} 从 {@code request.context()} 取，与 CONVERSATION_ID 同款机制）。
+ * <b>为什么不用 ThreadLocal</b>：规划器要做 DAG 并行（同层步骤跑在不同线程），ThreadLocal 会静默丢数据。
+ * 故本对象<b>显式</b>沿调用链传递，同时塞进 Spring AI 的 advisor 上下文（{@link #CONTEXT_KEY}）——
+ * Advisor 只有这条路能看到它（与 CONVERSATION_ID 同款机制）。
  * <p>
- * <b>纯旁路、绝不影响对话</b>：所有收集方法都只是内存写操作、不抛异常、不做 IO；落库由
- * {@link TraceService} 异步执行，失败只记日志。追踪数据缺失可以接受，对话出错不可以。
+ * <b>纯旁路、绝不影响对话</b>：收集方法都只是内存写、不抛异常、不做 IO；落库异步，失败只记日志。
  */
 @Getter
 public class RoundTrace {
 
-    /**
-     * 在 Spring AI advisor 上下文里传递本对象的键（与 {@code ChatMemory.CONVERSATION_ID} 同级）。
-     * Advisor 侧通过 {@code request.context().get(CONTEXT_KEY)} 取回本对象后往里写工具调用 / token。
-     */
+    /** 在 Spring AI advisor 上下文里传递本对象的键（与 {@code ChatMemory.CONVERSATION_ID} 同级）。 */
     public static final String CONTEXT_KEY = "luo.roundTrace";
 
     /** 工具调用明细单条的长度上限（args / result 各自截断，防止超长 JSON 撑爆 TEXT 列）。 */
@@ -43,12 +38,11 @@ public class RoundTrace {
     private final String traceId = UUID.randomUUID().toString();
     private final String conversationId;
     /**
-     * 本轮形态：agent=普通/智能体对话，planner=规划模式。
-     * 非 final：形态由 {@code ChatService.runRound} 选中策略后才确定（请求级 planner 开关可临时改变形态），
-     * 而 trace 在进入 runRound 之前就要建好（否则异常早退路径就没有对象可落库）。
+     * 本轮形态：agent=普通/智能体对话，planner=规划模式。非 final：形态由 {@code ChatService.runRound}
+     * 选中策略后才确定（请求级 planner 开关可临时改变），而 trace 在进入 runRound 前就要建好。
      */
     private String mode;
-    /** 用户本轮输入（构造时截断，见 {@link #USER_MESSAGE_LIMIT}）。 */
+    /** 用户本轮输入（构造时截断）。 */
     private final String userMessage;
 
     private final LocalDateTime startedAt = LocalDateTime.now();
@@ -62,8 +56,8 @@ public class RoundTrace {
     private String planJson;
     /**
      * 本轮实际用于知识库检索的问题（多轮查询改写的产物）。
-     * null = 未改写（未开 RAG / 首轮无历史 / 关闭改写 / 模型判定原话已自包含）。
-     * 单列一项是为了让「RAG 没命中」这类问题可归因：到底是改写跑偏了，还是知识库里确实没有。
+     * null = 未改写（未开 RAG / 首轮无历史 / 关闭改写 / 模型判定原话已自包含）——「没改写」本身就是信息，
+     * 单列一项是为了让「RAG 没命中」可归因：是改写跑偏了，还是知识库里确实没有。
      */
     private String retrievalQuery;
 
@@ -91,30 +85,25 @@ public class RoundTrace {
         this.mode = mode;
     }
 
-    /** 记录处理方来源与智能体（路由 / 绑定环节调用；重复调用以最后一次为准）。 */
+    /** 记录处理方来源与智能体（重复调用以最后一次为准）。 */
     public void route(String routeSource, String agentCode) {
         this.routeSource = routeSource;
         this.agentCode = agentCode;
     }
 
-    /** 记录规划模式产出的计划（JSON 文本，规划器输出）。 */
+    /** 记录规划模式产出的计划（JSON 文本）。 */
     public void plan(String planJson) {
         this.planJson = planJson;
     }
 
-    /**
-     * 记录本轮实际用于检索的问题（多轮查询改写产物）。
-     * 只在改写结果与用户原话确实不同时由调用方写入——null 表示「没改写」，本身就是有用信息。
-     */
+    /** 记录本轮实际用于检索的问题；调用方只在改写结果与用户原话不同时写入。 */
     public void retrievalQuery(String query) {
         this.retrievalQuery = chop(query, USER_MESSAGE_LIMIT);
     }
 
     /**
-     * 记录本轮 RAG 引用（<b>覆盖</b>语义）。
-     * <p>
-     * 用覆盖而非追加：规划模式每步各自编号从 [1] 开始，若跨步追加会出现重复序号，
-     * 与回答正文里的角标对不上。最终回答由最后一步产出，故只保留那份编号。
+     * 记录本轮 RAG 引用（<b>覆盖</b>语义）。用覆盖而非追加：规划模式每步各自从 [1] 编号，
+     * 跨步追加会出现重复序号、与正文角标对不上；最终回答由最后一步产出，故只保留那份编号。
      */
     public void citations(List<KbCitation> hits) {
         this.citations.clear();
@@ -124,10 +113,8 @@ public class RoundTrace {
     }
 
     /**
-     * 同步工具调用明细（<b>只增不减</b>语义）。
-     * <p>
-     * Advisor 在工具循环里每轮模型调用都会经过，传入的是「此刻完整历史里已执行的工具」——
-     * 这个列表随循环单调增长。故只在更长时替换，避免后一次调用（如最后一轮无工具调用）把已有记录清空。
+     * 同步工具调用明细（<b>只增不减</b>语义）。Advisor 每轮模型调用都经过，传入的是「此刻完整历史里
+     * 已执行的工具」（随循环单调增长）；故只在更长时替换，避免后一次调用（如最后一轮无工具）把已有记录清空。
      */
     public void syncToolCalls(List<ToolCall> calls) {
         if (calls != null && calls.size() > toolCalls.size()) {
@@ -160,7 +147,7 @@ public class RoundTrace {
         this.finishedAt = LocalDateTime.now();
     }
 
-    /** 引用条数（供 trace 落库与日志，避免调用方自己判空）。 */
+    /** 引用条数（供落库与日志用，避免调用方自己判空）。 */
     public int citationCount() {
         return citations.size();
     }
@@ -172,7 +159,7 @@ public class RoundTrace {
 
     /**
      * 只读视图：防止外部拿到内部可变列表（收集一律走 {@link #syncToolCalls}）。
-     * 方法名与 Lombok 会生成的 getter 同名，Lombok 检测到已存在则跳过生成，故不会冲突。
+     * 方法名与 Lombok 生成的 getter 同名，Lombok 检测到已存在则跳过生成，不会冲突。
      */
     public List<ToolCall> getToolCalls() {
         return Collections.unmodifiableList(toolCalls);
@@ -183,7 +170,7 @@ public class RoundTrace {
         return Collections.unmodifiableList(citations);
     }
 
-    /** 一条工具调用：工具名 + 入参 + 返回（入参与返回均截断，避免超长撑爆列）。 */
+    /** 一条工具调用：工具名 + 入参 + 返回（后两者均截断）。 */
     public record ToolCall(String name, String args, String result) {
         /** 从原始值构造并截断（args / result 可能很长，如完整 JSON 行集）。 */
         public static ToolCall of(String name, String args, String result) {

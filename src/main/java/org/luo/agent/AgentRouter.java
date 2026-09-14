@@ -18,18 +18,14 @@ import java.util.Map;
 import org.luo.service.AgentService;
 
 /**
- * 智能路由服务：对「未绑定智能体的普通会话」，根据消息内容判断是否应交给某个专属智能体（agent）处理。
+ * 智能路由服务：对「未绑定智能体的普通会话」，判断消息是否应交给某个专属智能体处理。
  * <p>
- * 使用裸 {@link ChatModel} 调用（不走 advisor、不写任何会话记忆）；判断失败或未命中一律回退普通对话，
- * 绝不阻断主流程。路由只影响本次回复的人设/模型参数，不会修改会话的 agentId。
+ * 用裸 {@link ChatModel} 调用（不走 advisor、不写记忆）；失败或未命中一律回退普通对话，不阻断主流程。
+ * 支持携带「待回答的追问」：追问进行中由编排层传入上一条追问文本，让模型区分「在回答追问」（continueTask）
+ * 与「开启新话题」，取代脆弱的关键词启发式。
  * <p>
- * 除基础路由外，还支持「携带待回答的追问」判断：追问进行中（CLARIFY 绑定）由编排层传入上一条追问文本，
- * 让模型区分用户本条消息是「在回答追问」（continueTask）还是「开启新话题」（正常路由），
- * 取代脆弱的关键词/语气词启发式。
- * <p>
- * 不使用 Jackson：强制模型输出 JSON 文本
- * {@code {"route":true,"agentCode":"编码"}} / {@code {"route":false}} / {@code {"route":false,"continue":true}}，
- * 解析用 Hutool 的 {@code JSONUtil}（规避 {@code ObjectMapper}）。
+ * 强制模型输出 JSON（{@code {"route":true,"agentCode":"编码"}} / {@code {"route":false}} /
+ * {@code {"route":false,"continue":true}}），用 Hutool {@code JSONUtil} 解析（规避 ObjectMapper）。
  */
 @Slf4j
 @Service
@@ -45,32 +41,19 @@ public class AgentRouter {
         this.promptProperties = promptProperties;
     }
 
-    /**
-     * 判断本次请求应路由到的智能体；未命中或判断失败返回 null（普通对话）。等价于 {@link #route(String, String)} 不带追问上下文。
-     */
+    /** 不带追问上下文的普通路由；未命中或失败返回 null。 */
     public Agent route(String message) {
         return route(message, null, null).agent();
     }
 
-    /**
-     * 携带「待回答的追问」上下文做路由决策。
-     *
-     * @param message         当前用户输入
-     * @param pendingQuestion 编排层正在等待用户回答的追问文本（可空；为空时退化为普通路由）
-     * @return {@link RouteDecision}：命中 agent（routeTo）/ 普通对话（none）/ 正在回答追问（continueTask）
-     */
+    /** 携带「待回答的追问」上下文做路由决策。 */
     public RouteDecision route(String message, String pendingQuestion) {
         return route(message, pendingQuestion, null);
     }
 
     /**
-     * 携带「待回答的追问」与「最近若干轮对话上下文」做路由决策。
-     *
-     * @param message         当前用户输入
-     * @param pendingQuestion 编排层正在等待用户回答的追问文本（可空；为空时退化为普通路由）
-     * @param recentContext   最近若干轮对话文本（可空；用于识别「承接上一轮的短追问」，
-     *                        如上一轮在查天气、用户只说「北京呢？」这类缺主语的短句，避免被误判为普通对话）
-     * @return {@link RouteDecision}：命中 agent（routeTo）/ 普通对话（none）/ 正在回答追问（continueTask）
+     * 携带「待回答的追问」与「最近对话上下文」做路由：后者用于识别「承接上一轮的短追问」
+     * （如上一轮查天气、本轮只说「北京呢？」），避免被误判为普通对话。
      */
     public RouteDecision route(String message, String pendingQuestion, String recentContext) {
         List<Agent> agents = agentService.listAgents();
@@ -80,14 +63,14 @@ public class AgentRouter {
         }
         if (message == null || message.isBlank()) return RouteDecision.none();
         try {
-            // 智能体清单文本与动态规划共用一处维护（AgentService.buildAgentListText），避免两处手拼漂移
+            // 智能体清单与动态规划共用一处维护，避免手拼漂移
             String list = agentService.buildAgentListText(agents);
-            // 追问上下文提示：仅当存在待回答的追问时追加，引导模型区分「回答追问」与「新话题」
+            // 追问上下文提示：仅当存在待回答的追问时追加
             String continuationHint = (pendingQuestion != null && !pendingQuestion.isBlank())
                     ? PromptProperties.render(promptProperties.routerContinuationHint(),
                             Map.of("pendingQuestion", pendingQuestion))
                     : "";
-            // 对话上下文：最近若干轮，用于识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）
+            // 对话上下文：用于识别承接上一轮的短追问
             String contextBlock = (recentContext != null && !recentContext.isBlank())
                     ? PromptProperties.render(promptProperties.routerContextBlock(),
                             Map.of("recentContext", recentContext))
@@ -113,10 +96,7 @@ public class AgentRouter {
         }
     }
 
-    /**
-     * 解析路由回复为三态决策：优先识别 {@code continue:true}（正在回答追问），其次 {@code route:true}（命中 agent），
-     * 其余一律普通对话。使用 Hutool {@code JSONUtil} 解析，规避 Jackson {@code ObjectMapper}。
-     */
+    /** 解析三态决策：优先 {@code continue:true}，其次 {@code route:true}，其余普通对话（Hutool JSONUtil）。 */
     private RouteDecision parseRouteDecision(String reply) {
         JSONObject obj;
         try {

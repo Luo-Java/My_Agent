@@ -15,15 +15,13 @@ import org.luo.entity.KnowledgeChunk;
 /**
  * Chroma 原生操作客户端（从门面抽出的「操作适配器」）。
  * <p>
- * 封装 Chroma 全部增删查：{@link #add}、{@link #delete}、{@link #search}、{@link #count}。
- * 把 Chroma 0.5 的嵌套响应拆包、余弦距离还原、多库 {@code $or} 合并、分批写入都藏在这一层，
- * 调用方看到的就是和 LangChain {@code similarity_search} 等价的一行。
+ * 封装 Chroma 全部增删查：{@link #add}、{@link #delete}、{@link #search}、{@link #count}；
+ * 把 Chroma 0.5 的嵌套响应拆包、余弦距离还原、多库 {@code $or} 合并、分批写入都藏在这一层。
+ * 无连接/降级逻辑（由 {@link ChromaConnection} 负责），任何异常向上抛、由门面统一降级。
  * <p>
- * 无连接/降级逻辑（由 {@code ChromaConnection} 负责），任何异常向上抛、由门面统一降级。
- * <p>
- * <b>相似度语义（重点）</b>：Chroma 0.5 cosine 空间 {@code distance = 2·(1 − cos)}，
- * 故其 score {@code = 2·cos − 1}，并非真实余弦；须用 {@link #toRealCosine} 还原
- * {@code realCos = (score+1)/2} 才能与 MySQL 余弦阈值（MIN_SCORE）同口径，否则相关结果被系统性滤掉。
+ * <b>相似度语义（重点）</b>：Chroma 0.5 cosine 空间 {@code distance = 2·(1 − cos)}，故其 score
+ * {@code = 2·cos − 1}，并非真实余弦；须用 {@link #toRealCosine} 还原 {@code realCos = (score+1)/2}
+ * 才能与 MySQL 余弦阈值（MIN_SCORE）同口径，否则相关结果被系统性滤掉。
  */
 public class ChromaClient {
 
@@ -50,11 +48,7 @@ public class ChromaClient {
         this.upsertBatchSize = Math.max(1, upsertBatchSize);
     }
 
-    /**
-     * upsert 知识块（按文档 id 幂等覆盖）。按 {@code upsertBatchSize} 分批，
-     * 因 {@code store.add()} 内部整批 embed，超模型单次上限会被 400 拒绝（见 ChromaConnection 的批大小配置说明）。
-     * 失败向上抛，由门面降级。
-     */
+    /** upsert 知识块（按文档 id 幂等覆盖）。按 {@code upsertBatchSize} 分批：{@code store.add()} 内部整批 embed，超上限会被 400 拒绝。 */
     public void add(List<ChromaDoc> docs) {
         if (docs == null || docs.isEmpty()) {
             return;
@@ -100,9 +94,6 @@ public class ChromaClient {
     /**
      * 多库合并检索：query 只向量化一次，按 kb_id 一次过滤（单库等值 / 多库 {@code $or}），命中按真实余弦过滤。
      *
-     * @param kbIds    目标知识库 ID（≥1 个）
-     * @param query    检索文本
-     * @param topK     返回候选数上限
      * @param minScore 余弦相似度最低阈值（与 MySQL 余弦检索同口径）
      */
     public List<ChromaHit> search(Collection<Long> kbIds, String query, int topK, double minScore) {
@@ -118,9 +109,7 @@ public class ChromaClient {
         return parseHits(resp, minScore);
     }
 
-    /**
-     * 构造 Chroma 的 where 过滤（按 kb_id 一次过滤所有目标库）：单库退化为单等值，多库用 {@code $or} 拼接。
-     */
+    /** 构造 Chroma 的 where 过滤（按 kb_id 一次过滤所有目标库）：单库退化单等值，多库用 {@code $or} 拼接。 */
     private Map<String, Object> buildWhere(Collection<Long> kbIds) {
         List<Map<String, Object>> ors = new ArrayList<>(kbIds.size());
         for (Long kbId : kbIds) {
@@ -132,9 +121,7 @@ public class ChromaClient {
         return Map.of("$or", ors);
     }
 
-    /**
-     * 解析 Chroma 原生 query 响应：拆双层列表 → 按 {@link #toRealCosine} 还原真实余弦 → 低于 minScore 丢弃。
-     */
+    /** 解析 Chroma 原生 query 响应：拆双层列表 → 按 {@link #toRealCosine} 还原真实余弦 → 低于 minScore 丢弃。 */
     private List<ChromaHit> parseHits(ChromaApi.QueryResponse resp, double minScore) {
         List<ChromaHit> hits = new ArrayList<>();
         if (resp == null || resp.ids() == null || resp.ids().isEmpty()
@@ -178,10 +165,7 @@ public class ChromaClient {
         return hits;
     }
 
-    /**
-     * Chroma score → 真实余弦：{@code (score+1)/2}。
-     * 背景见类注释（Chroma 0.5 cosine 空间 distance=2(1−cos)，score=2cos−1）。
-     */
+    /** Chroma score → 真实余弦：{@code (score+1)/2}（背景见类注释：distance=2(1−cos)，score=2cos−1）。 */
     private static double toRealCosine(double chromaScore) {
         return (chromaScore + 1) / 2.0;
     }

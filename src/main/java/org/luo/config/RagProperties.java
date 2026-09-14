@@ -5,26 +5,12 @@ import org.luo.infrastructure.rerank.RerankService;
 import org.luo.service.KbSearchService;
 
 /**
- * RAG 检索与精排配置（{@code agent.rag.*}）。
+ * RAG 检索与精排配置（{@code agent.rag.*}）：三段式「粗排召回 → 精排 → 截断」的可调参数。
  * <p>
- * 把「召回 → 精排 → 截断」三段式检索的可调参数集中在此，避免散落在 {@link KbSearchService}
- * 的常量里（改效果要重新编译）。分三组：
- * <ul>
- *   <li><b>召回（粗排）</b>：{@code recallK} 候选数、{@code recallMinScore} 召回下限。
- *       召回故意放宽（下限低于精排阈值），把「可能相关」的都捞进来交给精排判断；</li>
- *   <li><b>精排</b>：{@code rerankEnabled} 开关、{@code rerankModel} 模型、{@code rerankUrl} 端点、
- *       {@code rerankMinScore} 精排阈值（DashScope rerank 输出 0~1 的 relevance_score）。
- *       精排不可用（未配置 key / 超时 / 报错）时整体降级为按向量分截断，不影响对话；</li>
- *   <li><b>兜底</b>：{@code topK} 最终注入条数、{@code minScore} 精排不可用时沿用的向量余弦下限
- *       （与精排上线前一致，避免降级后资料质量骤降）；{@code fallbackMaxChunks} 限制
- *       「Chroma 不可用时回退 MySQL 余弦检索」这条降级路径一次最多扫描多少块
- *       （MySQL 里向量以 JSON 文本存储，无界扫描是 OOM 隐患）；</li>
- *   <li><b>查询改写</b>：{@code queryRewriteEnabled} 开关、{@code queryRewriteHistorySize} 参与改写的历史条数。
- *       多轮追问（「那它呢」）直接拿去检索会因指代不清而召回错误内容——<b>精排只能重排已召回的候选，
- *       救不回查错的东西</b>，故在检索前先把最近若干轮历史拼进 LLM 做一次指代消解，产出可独立检索的问题。</li>
- * </ul>
- * 精排复用 {@code spring.ai.openai.api-key}（DashScope 同一把 key），故本类不含 key 字段。
- * 紧凑构造器统一兜底默认值，故访问器返回的包装类型实际保证非空（调用处可直接拆箱）。
+ * 召回下限故意放宽，把「可能相关」的都交给精排判断；精排不可用（无 key / 超时 / 报错）时整体降级为
+ * 按向量分截断，不影响对话。注意 {@code rerankMinScore}（0~1）与 {@code minScore}（余弦）是两套
+ * <b>独立尺度</b>，不可互相换算。精排复用 {@code spring.ai.openai.api-key}，故本类不含 key 字段。
+ * 紧凑构造器统一兜底默认值，访问器返回的包装类型实际保证非空。
  *
  * @param rerankEnabled           是否启用精排；false=只用向量分（退化为改造前行为）
  * @param rerankModel             DashScope 精排模型，默认 gte-rerank-v2

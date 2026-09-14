@@ -1,2 +1,7 @@
 /.idea
 /target
+
+# 本地私有配置：含数据库口令与模型 API Key，绝不入库（由 application.yaml 的
+# spring.config.import 以 optional:file: 方式加载；部署改用环境变量注入）
+/application-local.yaml
+/config/application-local.yaml

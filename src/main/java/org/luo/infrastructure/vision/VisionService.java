@@ -32,33 +32,24 @@ import org.luo.dto.ChatRequest;
 /**
  * 多模态视觉识别服务：把图片转成文本描述（caption），供 ChatRequest.attachments 注入对话。
  * <p>
- * 采用 <b>Spring AI 原生多模态</b>：注入裸 {@link ChatModel} 直接 {@code call(Prompt)}，请求体由
- * {@link UserMessage#builder() UserMessage.builder().media(Media)} 承载图片，模型用 per-request
- * {@link OpenAiChatOptions} 覆盖为视觉模型（{@code agent.vision.model}，默认 qwen-vl-plus）。
+ * 采用 <b>Spring AI 原生多模态</b>：注入裸 {@link ChatModel} 直接 {@code call(Prompt)}，图片由
+ * {@code UserMessage.builder().media(Media)} 承载，per-request {@link OpenAiChatOptions} 覆盖为视觉模型
+ * （{@code agent.vision.model}，默认 qwen3.5-ocr）。
  * <p>
- * <b>为什么注入裸 ChatModel</b>（与 {@code AgentRouter} / {@code MemoryMergeService} /
- * {@code ParamFillingService} / {@code PromptService} 同一模式）：
- * <ul>
- *   <li>绕开 advisor 与记忆机制——视觉识别是同步、单轮、无状态的独立调用，不应污染会话记忆；</li>
- *   <li>per-request 覆盖 model，不改 yaml 里主对话的 qwen3.7-plus，避免把文本模型换成视觉模型带来的兼容风险；</li>
- *   <li>与项目既有 LLM 调用方式统一，不再手写 HTTP + JSON。</li>
- * </ul>
+ * <b>为什么注入裸 ChatModel</b>（与 AgentRouter / MemoryMergeService / ParamFillingService / PromptService
+ * 同一模式）：绕开 advisor 与记忆机制（视觉识别是同步、单轮、无状态的独立调用，不应污染会话记忆）；
+ * per-request 覆盖 model，不动 yaml 里主对话模型，避免文本模型换视觉模型的兼容风险。
  * <p>
- * <b>并发</b>：多图识别在 {@code visionExecutor} 线程池上并发执行（每图一次独立调用），
- * 结果按入参顺序回收，保证与 files <b>1:1 对齐</b>；单图失败/超时只影响该图（占位 caption），
- * 不影响其它图，也不抛错给调用方。
+ * <b>并发 + 逐图调用</b>：多图在 {@code visionExecutor} 上并发执行（每图一次独立调用），结果按入参顺序回收，
+ * 与 files <b>1:1 对齐</b>；单图失败/超时只影响该图（占位 caption），不抛错给调用方。
  * <p>
- * <b>为什么不是「一次请求传多图」</b>（设计决策，不要顺手改掉）：Spring AI {@code UserMessage.media(Media...)}
- * 与 dashscope 视觉模型都支持一次请求带多张图，但<b>一次请求只返回一段合并文本</b>，
- * 会丢失「哪段描述来自哪张图」的归属——而下游 {@code ChatController#extractAttachments}
- * 是按 {@code 图片N（文件名）：caption} <b>逐条带文件名标注</b>抽取为当轮材料块的
- * （如「工资条」与「聊天记录」需区分各自内容）。逐图调用因此保住了归属标注、单图失败隔离
- * 与单图识别质量；延迟由并发压平（N×t → ≈t），且每张图同样只传输一次、仅短指令重复 N 遍，
- * token 成本与一次调用基本相当。
- * 仅当未来需要<b>跨图联合对比</b>（模型同时看到多图才能判别的细微差异）时，才应改为合并调用。
+ * <b>为什么不是「一次请求传多图」</b>（设计决策，勿顺手改）：一次请求只返回一段合并文本，会丢失
+ * 「哪段描述来自哪张图」的归属——而下游 {@link ChatController#extractAttachments} 按
+ * {@code 图片N（文件名）：caption} 逐条带标注抽取（如「工资条」与「聊天记录」需区分各自内容）。
+ * 逐图调用保住了归属标注与单图失败隔离；延迟由并发压平（N×t → ≈t），每图同样只传一次、仅短指令重复 N 遍。
+ * 仅当未来需要<b>跨图联合对比</b>时才应改为合并调用。
  * <p>
- * <b>不进入 RAG / 不进入会话记忆</b>：caption 仅当轮注入上下文，不写入 chat_message 表、
- * 不入库 kb_chunk，刷新或重开会话后不会出现——保持对话存储的轻量。
+ * <b>不进入 RAG / 不进入会话记忆</b>：caption 仅当轮注入上下文，不写 chat_message、不入库 kb_chunk。
  */
 @Slf4j
 @Service
@@ -78,9 +69,7 @@ public class VisionService {
     }
 
     /**
-     * 识别多张图片为文本描述，每张图对应一个 caption（严格按入参顺序）。
-     * <p>
-     * 多图并发执行；单图失败不抛错，把 caption 置为占位文本并 warn；
+     * 识别多张图片为文本描述（严格按入参顺序）。多图并发执行；单图失败不抛错，caption 置为占位文本并 warn，
      * 保证调用方始终拿到与入参等长的结果列表（前端按 {@code captions[i] → attachments[i]} 对齐消费）。
      *
      * @param files 上传的文件列表（已过滤非图片）
@@ -108,10 +97,9 @@ public class VisionService {
     }
 
     /**
-     * 回收单个识别结果：超时/异常一律降级为占位 caption。
-     * <p>
-     * 超时在编排层控制（{@code agent.vision.timeoutSeconds}），不等同于底层 HTTP 客户端超时；
-     * 调用方尽早返回占位文本，避免整轮对话被单张图拖住。
+     * 回收单个识别结果：超时/异常一律降级为占位 caption。超时在编排层控制
+     * （{@code agent.vision.timeoutSeconds}），不等同于底层 HTTP 客户端超时；尽早返回占位文本，
+     * 避免整轮对话被单张图拖住。
      */
     private String await(CompletableFuture<String> future) {
         try {

@@ -18,16 +18,15 @@ import java.util.stream.Collectors;
 /**
  * 宽容的工具回调解析器：模型调用不存在的工具时，不再让框架抛异常打崩整轮对话。
  * <p>
- * 背景：{@code DefaultToolCallingManager} 对 {@code toolCallbackResolver.resolve()} 返回
- * {@code null} 的工具名会直接 {@code throw new IllegalStateException("No ToolCallback found...")}，
- * 异常冲出框架的工具循环，导致整轮对话以「对话出错」告终，模型得不到任何反馈，反思纠错回路失效。
+ * 背景：{@code DefaultToolCallingManager} 对 resolve() 返回 {@code null} 的工具名会直接
+ * {@code throw new IllegalStateException(...)}，异常冲出框架的工具循环，整轮对话以「对话出错」告终，
+ * 模型得不到任何反馈、反思纠错回路失效。
  * <p>
- * 本解析器对未命中的工具名返回一个<b>兜底 ToolCallback</b>：它的 {@code call()} 返回
- * 「该工具不存在 + 当前可用工具清单 + 近似名提示」作为工具结果喂回模型，让模型在 Spring AI
- * 自带的工具循环里自我纠正（正好接上 eduanalyst 提示词的 REFLECT 反思步骤）。
+ * 本解析器对未命中的工具名返回一个<b>兜底 ToolCallback</b>：其 {@code call()} 返回「该工具不存在 +
+ * 可用工具清单 + 近似名提示」作为工具结果喂回模型，让模型在 Spring AI 自带的工具循环里自我纠正
+ * （正好接上 eduanalyst 提示词的 REFLECT 反思步骤）。
  * <p>
- * 通过 {@code @Bean/@Component} 提供，利用自动配置的 {@code @ConditionalOnMissingBean}
- * 替换默认解析器，并被注入 {@code ToolCallingManager}。
+ * 通过 {@code @Component} 提供，利用自动配置的 {@code @ConditionalOnMissingBean} 替换默认解析器。
  */
 @Slf4j
 @Component
@@ -92,10 +91,7 @@ public class LenientToolCallbackResolver implements ToolCallbackResolver {
         return prev[b.length()];
     }
 
-    /**
-     * 兜底工具回调：工具定义用「请求的工具名」占位（保证 ToolResponse 记录的是模型调用的名字），
-     * {@code call()} 返回给模型的纠正信息，让模型在框架的工具循环里自行选择正确工具重试。
-     */
+    /** 兜底工具回调：工具定义用「请求的工具名」占位（保证 ToolResponse 记录的是模型调用的名字），call() 返回纠正信息。 */
     private record UnknownToolCallback(String requestedName, String available, List<String> suggestions)
             implements ToolCallback {
 

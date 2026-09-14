@@ -19,11 +19,8 @@ import java.util.Map;
  * 对话附件处理接口：上传任意文件（图片 / 文档）→ AttachmentService 转成纯文本描述 + 原文件落盘。
  * <p>
  * 前端在用户点发送前把本轮所有附件一次性发给本端点，拿到每项 {@code type + content + storedName + size} 后，
- * 再随 {@code ChatRequest.attachments} 发到 {@code /api/chat/stream}。其中：
- * <ul>
- *   <li>{@code content}（解析文本）仅当轮注入 LLM 上下文，不进会话记忆；</li>
- *   <li>{@code storedName/size}（落盘元数据）写入消息的 attachments_json，仅服务历史回看 / 下载，不进 LLM 上下文。</li>
- * </ul>
+ * 再随 {@code ChatRequest.attachments} 发到 {@code /api/chat/stream}。其中 {@code content}（解析文本）
+ * 仅当轮注入 LLM 上下文；{@code storedName/size}（落盘元数据）写入消息的 attachments_json，仅服务历史回看。
  */
 @Slf4j
 @RestController
@@ -37,13 +34,11 @@ public class AttachmentController {
     }
 
     /**
-     * 批量处理附件：每张 / 每个文件产生一个结果，顺序与入参一致。
-     * <p>
-     * 单文件解析失败不会让整体失败：该文件的结果会被替换为占位说明（{@code type="file"}），
-     * 前端可继续把结果发到对话接口，由 LLM 决定如何处理。
+     * 批量处理附件：每张 / 每个文件产生一个结果，顺序与入参一致。单文件解析失败不会让整体失败：
+     * 该文件的结果替换为占位说明（{@code type="file"}），前端可继续把结果发到对话接口。
      *
-     * @param files 上传的文件（multipart/form-data，字段名 {@code files}，可多选）
-     * @return {@code {"results":[{"type","filename","content","storedName","size","url"}, ...]}} 数组与入参顺序对齐
+     * @param files 上传文件（multipart/form-data，字段名 {@code files}，可多选）
+     * @return {@code {"results":[{type,filename,content,storedName,size,url}, ...]}}，与入参顺序对齐
      */
     @PostMapping("/process")
     public Map<String, Object> process(@RequestParam("files") List<MultipartFile> files) {

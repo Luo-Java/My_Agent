@@ -14,14 +14,13 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Chroma <b>连接生命周期</b>管理：只负责把 Chroma 连上并提供一个随时可用的 {@link ChromaClient}，以及状态自检；
- * 不含实体转换与检索编排（在 {@link ChromaVectorStoreService}）。要点：
+ * Chroma <b>连接生命周期</b>管理：只负责连上 Chroma、提供随时可用的 {@link ChromaClient} 与状态自检
+ * （实体转换与检索编排在 {@link ChromaVectorStoreService}）。两个要点：
  * <ul>
  *   <li><b>lazy + 冷却重试</b>：首次使用才连；失败进 {@code chroma.retry-interval-seconds}（默认 60s）冷却，
- *       冷却期内 {@link #connected} 返回 null（调用方降级），冷却后自动重试——「先起应用后起 Chroma」无需重启。</li>
+ *       冷却期内 {@link #connected} 返回 null（调用方降级），到期自动重试——「先起应用后起 Chroma」无需重启。</li>
  *   <li><b>命名空间 + cosine 空间校正</b>：显式 default_tenant/default_database，建库前用原生 HTTP 幂等预建
- *       cosine 集合（见 {@link #ensureCollection}）。否则 Spring AI 2.0 默认命名空间 + 不认 400 InvalidCollection
- *       会导致初始化必失败；且 Chroma 0.5 不从 metadata 读 space，必须用原生 HTTP 建 cosine。</li>
+ *       cosine 集合（见 {@link #ensureCollection}），否则 Spring AI 2.0 初始化必失败。</li>
  * </ul>
  */
 @Slf4j
@@ -37,9 +36,9 @@ public class ChromaConnection {
     private String collectionName;
 
     /**
-     * Chroma 租户名。必须显式指定（不要用 Spring AI 默认 SpringAiTenant）：
-     * 本地 Chroma 0.5.x 只有 default_tenant/default_database，且 getCollection 对不存在的 collection 返回
-     * 400 InvalidCollection（非 404），Spring AI 只认 404 → 初始化必失败。配合 {@link #ensureCollection} 原生预建解决。
+     * Chroma 租户名。必须显式指定（不要用 Spring AI 默认 SpringAiTenant）：本地 Chroma 0.5.x 只有
+     * default_tenant/default_database，且 getCollection 对不存在的 collection 返回 400 InvalidCollection
+     * （非 404），Spring AI 只认 404 → 初始化必失败。配合 {@link #ensureCollection} 原生预建解决。
      */
     @Value("${chroma.tenant:default_tenant}")
     private String tenant;
@@ -48,18 +47,15 @@ public class ChromaConnection {
     @Value("${chroma.database:default_database}")
     private String database;
 
-    /** 连接失败后的重试冷却秒数：冷却期内 {@link #connected} 不再触发连接（避免每轮都连一次拖慢响应），到期自愈、无需重启。 */
+    /** 连接失败后的重试冷却秒数：冷却期内不再触发连接（避免每轮都连一次拖慢响应），到期自愈、无需重启。 */
     @Value("${chroma.retry-interval-seconds:60}")
     private long retryIntervalSeconds;
 
-    /**
-     * 单批 upsert 文档数（受 Embedding 模型单次上限约束，非 Chroma 体积限制）。
-     * {@code store.add()} 整批 embed，超上限被 400：DashScope text-embedding-v3 单次 ≤ 20 条。默认 10 留余量，换模型后调 {@code chroma.upsert-batch-size}。
-     */
+    /** 单批 upsert 文档数（受 Embedding 单次上限约束，非 Chroma 体积限制）：DashScope text-embedding-v3 单次 ≤ 20 条，默认 10 留余量。 */
     @Value("${chroma.upsert-batch-size:10}")
     private int upsertBatchSize;
 
-    /** 「副本未同步」提示的限频间隔（毫秒）：避免上传/检索高频调用刷屏，同时保证异常可见。 */
+    /** 「副本未同步」提示的限频间隔（毫秒）：避免高频调用刷屏，同时保证异常可见。 */
     private static final long SKIP_LOG_INTERVAL = 5 * 60 * 1000L;
 
     private final ObjectProvider<EmbeddingModel> embeddingProvider;
@@ -84,8 +80,7 @@ public class ChromaConnection {
     }
 
     /**
-     * 取已连接的客户端；未连接（冷却/失败）返回 null 并限频打印跳过提示。内部先 {@link #ensureConnected()}。
-     * 各公开方法只需一行 {@code ChromaClient c = connection.connected("写入"); if (c == null) return ...;}。
+     * 取已连接的客户端；未连接（冷却/失败）返回 null 并限频打印跳过提示（内部先 {@link #ensureConnected()}）。
      *
      * @param op 操作名（写入/删除/检索），仅用于降级日志
      */
@@ -98,10 +93,7 @@ public class ChromaConnection {
         return chromaClient;
     }
 
-    /**
-     * 惰性建连并构造 {@link ChromaClient}。失败进 {@link #retryIntervalSeconds} 秒冷却，冷却内返回、到期重试——
-     * 「先起应用后起 Chroma」无需重启自愈。DCL 防止并发重复建连。
-     */
+    /** 惰性建连并构造 {@link ChromaClient}；失败进冷却，冷却内返回、到期重试（DCL 防并发重复建连）。 */
     private void ensureConnected() {
         if (chromaClient != null) {
             return;
@@ -119,7 +111,7 @@ public class ChromaConnection {
             try {
                 EmbeddingModel model = embeddingProvider.getIfAvailable();
                 if (model == null) {
-                    // 未配置 embedding 属配置问题、不会自行恢复：同样进冷却，避免每次都取一遍 bean
+                    // 未配置 embedding 属配置问题、不会自恢复：同样进冷却，避免每次取 bean
                     markFailed("未配置 Embedding 模型（spring.ai.openai.embedding），后续检索走 MySQL");
                     return;
                 }
@@ -157,9 +149,7 @@ public class ChromaConnection {
         nextRetryAt = System.currentTimeMillis() + Math.max(1, retryIntervalSeconds) * 1000L;
     }
 
-    /**
-     * 副本不可用时的限频提示：chromaClient 为 null 时调用，保证「文件入 MySQL 但向量副本没写」可见，又不刷屏。
-     */
+    /** 副本不可用时的限频提示：保证「文件入 MySQL 但向量副本没写」可见又不刷屏。 */
     private void logSkipped(String op) {
         long now = System.currentTimeMillis();
         if (now - lastSkipLogAt < SKIP_LOG_INTERVAL) {
@@ -170,9 +160,7 @@ public class ChromaConnection {
                 op, lastError == null ? "未初始化" : lastError);
     }
 
-    /**
-     * 运行状态自检（GET /api/kb/chroma/status）：baseUrl / tenant / database / collection / connected / documentCount(-1=未知) / lastError。
-     */
+    /** 运行状态自检（GET /api/kb/chroma/status）：baseUrl / tenant / database / collection / connected / documentCount(-1=未知) / lastError。 */
     public Map<String, Object> status() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("baseUrl", baseUrl);
@@ -201,12 +189,12 @@ public class ChromaConnection {
      * <p>
      * <b>为什么 build 前必须做</b>：Spring AI 2.0 的 afterPropertiesSet 先 getCollection，而 Chroma 0.5.x 对不存在的
      * collection 返回 400 InvalidCollection（非 404），Spring AI 只认 404 → 抛 "Collection does not exist."，
-     * initializeSchema(true) 永远没机会建库。这里预先创建拉回正轨，新装 Chroma 也能自愈。
+     * initializeSchema(true) 永远没机会建库。
      * <p>
      * <b>为什么原生 HTTP 建库</b>：Chroma 0.5.x 不再从 metadata 读 hnsw:space（会建成 l2），必须走
      * configuration.hnsw.space 才能建成 cosine。原生建库优先、Spring AI 建库兜底。
      * <p>
-     * 存量集合：l2 且<b>为空</b>则删后按 cosine 重建（零损失）；非空保留并换算阈值。任一步失败不抛错，交给 build 统一降级。
+     * 存量集合：l2 且为空则删后按 cosine 重建（零损失）；非空保留并换算阈值。任一步失败不抛错，交给 build 统一降级。
      */
     private void ensureCollection(ChromaApi api) {
         try {
@@ -304,9 +292,7 @@ public class ChromaConnection {
         }
     }
 
-    /**
-     * 探测集合实际空间（cosine/l2）：真实空间在 configuration_json 里，只能原生 HTTP 读取。失败返回 null（按 cosine 处理）。
-     */
+    /** 探测集合实际空间（cosine/l2）：真实空间在 configuration_json 里，只能原生 HTTP 读；失败返回 null（按 cosine 处理）。 */
     private String detectSpace() {
         try {
             String s = cn.hutool.http.HttpRequest.get(collectionsUrl(collectionName)).timeout(5000).execute().body();
@@ -335,7 +321,7 @@ public class ChromaConnection {
         return trimSlash(baseUrl) + "/api/v1/collections?tenant=" + tenant + "&database=" + database;
     }
 
-    /** 单个集合地址（原生 GET / DELETE）：/api/v1/collections/{name}。 */
+    /** 单个集合地址（原生 GET / DELETE）。 */
     private String collectionsUrl(String name) {
         return trimSlash(baseUrl) + "/api/v1/collections/" + name + "?tenant=" + tenant + "&database=" + database;
     }

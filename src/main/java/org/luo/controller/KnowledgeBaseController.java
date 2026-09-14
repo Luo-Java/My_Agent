@@ -3,6 +3,7 @@ package org.luo.controller;
 import org.luo.dto.AddChunksRequest;
 import org.luo.dto.CreateKbRequest;
 import org.luo.dto.KbChunkPageResult;
+import org.luo.dto.KbRechunkResult;
 import org.luo.entity.KbFile;
 import org.luo.entity.KnowledgeBase;
 import org.luo.enums.ChunkStrategy;
@@ -27,36 +28,15 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.luo.exception.AiErrorCode;
-import org.luo.service.KbService.FileIngestResult;
 
 /**
- * 知识库管理接口（RAG 知识库：全局库 + 每个智能体一个专属库）。
+ * 知识库管理接口（RAG：全局库 + 每个智能体一个专属库）。
  * <p>
- * GET    /api/kb                          - 全部知识库列表（全局库置顶，不存在时自动创建）
- * GET    /api/kb/global                   - 全局知识库（不存在时自动创建）
- * GET    /api/kb/chunk-strategies         - 全部分片策略元数据（strategies: key/label/desc；
- *                                          defaultOverlap/maxOverlap: 重叠字数默认值与上限，供前端渲染下拉）
- * POST   /api/kb                          - 创建知识库（body.agentId 非空 = 智能体专属库；null = 普通库）
- * PUT    /api/kb/{id}                     - 重命名 / 更新说明
- * DELETE /api/kb/{id}                     - 删除知识库（连同其全部知识块与文件）
- * GET    /api/kb/{id}/chunks              - 知识块分页（?offset=&limit=）
- * POST   /api/kb/{id}/chunks              - 批量添加知识（文本自动分块 + 向量化入库，保留兼容，前端已不展示）
- * DELETE /api/kb/{id}/chunks/{cid}        - 删除单个知识块
- * GET    /api/kb/{id}/files               - 该库的文件列表（每个知识库维护一份文件清单）
- * POST   /api/kb/{id}/upload              - 上传文件导入知识（multipart，支持 txt/md/csv/pdf/docx/xlsx；
- *                                           ?chunkStrategy= 覆盖分片策略（fixed/paragraph/recursive/markdown，
- *                                           缺省继承该库「知识库设置」里的默认策略，默认 recursive）；
- *                                           ?overlap= 覆盖相邻块重叠字数（0=不重叠，缺省继承库默认 60）；
- *                                           解析后按策略分块向量化并登记文件（保存原文与策略/重叠，
- *                                           支持后续不重传直接切换）；同名文件=替换重传；逐文件返回结果，
- *                                           单个失败不影响其它）
- * DELETE /api/kb/{id}/files/{fid}         - 删除文件（连同其全部知识块）
- * POST   /api/kb/{id}/files/{fid}/rechunk - 对文件重新分片（body.strategy=新策略、body.overlap=重叠字数，
- *                                           缺省沿用文件当前值；读保存的原文重切，不要求重新上传）
- * POST   /api/kb/chroma/sync              - Chroma 幂等回填（body.kbId 缺省=全部库；按 chunk id 覆盖，
- *                                           首次启用 / Chroma 故障恢复后把 MySQL 存量块同步到副本）
- * GET    /api/kb/chroma/status            - Chroma 状态自检（连接状态 / 命名空间 / collection 文档数，
- *                                           用于确认上传的文件是否真的进到了向量副本）
+ * GET/POST /api/kb、GET /api/kb/global、PUT/DELETE /api/kb/{id}；
+ * GET/POST /api/kb/{id}/chunks、DELETE /api/kb/{id}/chunks/{cid}；
+ * GET /api/kb/chunk-strategies；GET /api/kb/{id}/files、POST /api/kb/{id}/upload、
+ * DELETE /api/kb/{id}/files/{fid}、POST /api/kb/{id}/files/{fid}/rechunk；
+ * POST /api/kb/chroma/sync、GET /api/kb/chroma/status。
  */
 @RestController
 @RequestMapping("/api/kb")
@@ -70,19 +50,19 @@ public class KnowledgeBaseController {
         this.documentParser = documentParser;
     }
 
-    /** 全部知识库列表（调用前确保全局库存在，全局库恒在列表首位）。 */
+    /** 全部知识库列表（调用前确保全局库存在，全局库恒在首位）。 */
     @GetMapping
     public List<KnowledgeBase> list() {
         return kbService.listKbs();
     }
 
-    /** 获取全局知识库（可在任意会话的「资料库」选择器中选用；不存在则自动创建）。 */
+    /** 获取全局知识库（不存在则自动创建）。 */
     @GetMapping("/global")
     public KnowledgeBase global() {
         return kbService.getOrCreateGlobal();
     }
 
-    /** 全部分片策略元数据 + 重叠字数默认值/上限（前端渲染分片方式与重叠下拉；动态新增策略无需改前端）。 */
+    /** 全部分片策略元数据 + 重叠字数默认值/上限（前端渲染下拉；动态新增策略无需改前端）。 */
     @GetMapping("/chunk-strategies")
     public Map<String, Object> chunkStrategies() {
         List<Map<String, String>> list = new ArrayList<>();
@@ -130,15 +110,13 @@ public class KnowledgeBaseController {
     }
 
     /**
-     * 上传文件导入知识（multipart/form-data，参数名 files，可多文件）。
-     * 每个文件独立：解析 → 分块（策略/重叠缺省继承该库「知识库设置」的默认配置，也可用请求参数覆盖）→
-     * 向量化入库 → 在文件列表登记（保存原文/策略/重叠）；
-     * 单文件失败不影响其它，结果逐条返回：
-     * [{ fileName, status: ok|error, added, fileId?, chunkStrategy?, chunkOverlap?, message? }]
-     * 同一库内同名文件 = 替换重传（旧知识块清空后写入新内容）。
+     * 上传文件导入知识（multipart/form-data，参数名 files，可多文件）。每个文件独立：解析 → 分块 →
+     * 向量化入库 → 登记文件列表。单文件失败不影响其它，逐条返回
+     * {@code [{fileName, status: ok|error, added, fileId?, chunkStrategy?, chunkOverlap?, message?}]}。
+     * 同库内同名文件 = 替换重传。
      *
-     * @param chunkStrategy 分片策略 key，可选：fixed/paragraph/recursive/markdown；缺省继承库默认（知识库设置），未知 key 回退 recursive
-     * @param overlap       相邻块重叠字数；缺省继承库默认（知识库设置），0 = 不重叠，上限 {@link ChunkingService#MAX_OVERLAP}
+     * @param chunkStrategy 策略 key：fixed/paragraph/recursive/markdown；缺省继承库默认，未知回退 recursive
+     * @param overlap       重叠字数；缺省继承库默认，0 = 不重叠，上限 {@link ChunkingService#MAX_OVERLAP}
      */
     @PostMapping(value = "/{id}/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Map<String, Object> upload(@PathVariable Long id,
@@ -157,16 +135,14 @@ public class KnowledgeBaseController {
             r.put("fileName", fileName);
             try {
                 String text = documentParser.parse(file);
-                KbService.FileIngestResult res =
-                        kbService.registerFileWithStatus(id, fileName, file.getSize(), text, chunkStrategy, overlap);
-                KbFile saved = res.file();
+                KbFile saved = kbService.registerFile(id, fileName, file.getSize(), text, chunkStrategy, overlap);
                 r.put("status", "ok");
                 r.put("fileId", saved.getId());
                 r.put("added", saved.getChunkCount());
                 r.put("chunkStrategy", saved.getChunkStrategy());
                 r.put("chunkOverlap", saved.getChunkOverlap());
-                // false = 只进了 MySQL（源），向量副本未同步：前端应提示可用「同步到 Chroma」回填
-                r.put("chromaSynced", res.chromaSynced());
+                // 刻意不回传「向量副本是否已同步」：副本写入已延后到事务提交之后（见 ChromaSyncSupport），
+                // 本方法返回时结果尚未产生，回传恒真/恒假的标志只会误导；副本实况以 /api/kb/chroma/status 为准
             } catch (AiBusinessException e) {
                 r.put("status", "error");
                 r.put("message", e.getMessage());
@@ -181,20 +157,18 @@ public class KnowledgeBaseController {
         return Map.of("results", results);
     }
 
-    /** 某知识库的文件列表（文件是知识的上传与管理单元，删除文件会连带删除其知识块）。 */
+    /** 某知识库的文件列表（文件是知识的上传与管理单元，删文件会连带删其知识块）。 */
     @GetMapping("/{id}/files")
     public List<KbFile> files(@PathVariable Long id) {
         return kbService.listFiles(id);
     }
 
     /**
-     * 对库内已入库文件重新分片（动态切换分片策略 / 重叠字数）：读文件入库时保存的原文 →
-     * 按 body 的 strategy / overlap 重切 → 删旧块写新块。不要求重新上传文件；
-     * 文件列表每行的「重新分片」按钮调此接口。
+     * 对库内已入库文件重新分片（切换策略 / 重叠，不要求重传）：读保存的原文 → 按 body 重切 → 删旧块写新块。
      *
-     * @param body JSON：{"strategy":"paragraph","overlap":60}；strategy 缺省 / 未知回退 recursive；
-     *             overlap 缺省沿用文件当前重叠字数（0 = 不重叠）
-     * @return 重新分片后的知识块数与生效的策略/重叠
+     * @param body JSON：{"strategy":"paragraph","overlap":60}；strategy 缺省/未知回退 recursive，
+     *             overlap 缺省沿用文件当前值（0 = 不重叠）
+     * @return 重新分片后的块数与生效的策略/重叠
      */
     @PostMapping("/{id}/files/{fileId}/rechunk")
     public Map<String, Object> rechunk(@PathVariable Long id,
@@ -209,10 +183,12 @@ public class KnowledgeBaseController {
                 // 非法数值按缺省处理（沿用文件当前重叠）
             }
         }
-        int added = kbService.rechunkFile(id, fileId, strategy, overlap);
-        return Map.of("chunkCount", added,
-                "chunkStrategy", ChunkStrategy.fromKey(strategy).getKey(),
-                "chunkOverlap", overlap == null ? null : overlap);
+        // 直接返回服务层的「生效值」：overlap 缺省时由文件当前配置补齐。
+        // 切勿回显入参 overlap —— 它为 null 时 Map.of 会抛 NPE（缺省调用必 500）。
+        KbRechunkResult r = kbService.rechunkFile(id, fileId, strategy, overlap);
+        return Map.of("chunkCount", r.chunkCount(),
+                "chunkStrategy", r.strategyKey(),
+                "chunkOverlap", r.overlap());
     }
 
     /** 删除库中的文件（连带删除该文件解析出的全部知识块并回减 doc_count）。 */
@@ -224,7 +200,7 @@ public class KnowledgeBaseController {
 
     /**
      * Chroma 幂等回填：把 MySQL 存量知识块分批 upsert 到 Chroma（按 chunk id 覆盖，重复调用安全；
-     * 也可用于 Chroma 故障恢复后把副本补齐）。body 形如 {"kbId": 1}；kbId 缺省 / null = 全部库。
+     * 也用于故障恢复后补齐副本）。body 形如 {"kbId": 1}；kbId 缺省/null = 全部库。
      *
      * @return {synced: 成功回填的知识块数}
      */
@@ -245,8 +221,8 @@ public class KnowledgeBaseController {
     }
 
     /**
-     * Chroma 状态自检：确认向量副本是否可用、collection 里到底有多少条向量。
-     * 排查「上传的文件有没有进 Chroma」时先看这里：connected=true 且 documentCount 与 MySQL 知识块数接近即正常。
+     * Chroma 状态自检：确认向量副本是否可用、collection 里有多少条向量。
+     * connected=true 且 documentCount 与 MySQL 知识块数接近即正常。
      *
      * @return {connected, documentCount(-1=未知), baseUrl, tenant, database, collection, lastError}
      */

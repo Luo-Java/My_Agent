@@ -1,54 +1,32 @@
 # 项目长期记忆（My_Agent）
 
+> 逐日明细见 `YYYY-MM-DD.md`；**架构细节 / 组件契约 / Chroma 全套坑 → `ARCHITECTURE.md`（按需查阅）**。
+> 本文件只留高频结论与红线（注入上限约 3KB，务必克制、勿把细节搬回来）。
+
 ## 约定与偏好
-- **解析 LLM JSON 禁用 Jackson `ObjectMapper`**：一律用 Hutool `cn.hutool.json.JSONUtil`/`JSONObject`（pom 已引 `cn.hutool:hutool-all:5.8.38`）。跨轮参数抽取、路由结果皆同。
-- **直接执行、小步快跑**：每次改动必须真实编译验证（Maven 在 `D:\software\Java\maven`，本地仓库同路径 `repository`，离线 `-o` 可用；启动器 `java -cp boot/plexus-classworlds-2.11.0.jar` 绕损坏 mvn 脚本，**launcher 模板见 `.workbuddy/memory/run_mvn.sh`**）。
-- **离线打包必加 `-Dmaven.legacyLocalRepo=true`**（Maven 3.9 resolver 内部属性，2026-09-07 验证）：绕过 resolver 对 `_remote.repositories` 来源 strict 校验，否则 plugin transitive 依赖离线 fail。run_mvn.sh 已固化。
-- **打包后不启动项目验证**（用户明确要求）：构建只到 `mvn package`，运行验证由用户在 IDE 自启；确需验证接口提示用户自启后 curl。
-- **DDL 变更必须同步 `sql/schema.sql` 与 `alter.sql`**：schema.sql 是建库权威定义（spring.sql.init 已注释），alter.sql 只补存量库；两处列状态须一致，禁止只改 alter 不动 schema。
-- **构建追求零代码告警**：`spec.tools(ToolCallback[])` 会触发 javac「最后一个参数使用了不准确的变量类型的 varargs 方法的非 varargs 调用」提示；**`@SuppressWarnings("varargs")` 实测无效**，正确做法是显式转 `(Object[]) tools`（语义不变，数组仍按 varargs 展开）。2026-09-12 修掉后构建达到零代码告警。
-- **前端样式三条硬约束**（`static/css/style.css`，2026-09-12 整改后固化）：① **禁止小数像素字号**（如 `12.5px`/`11.5px`）——Windows 上触发亚像素渲染导致笔画发虚，字号一律整数；② 最小字号 **12px**（辅助说明类），正文 13px 起；③ 辅助文字一律用变量 `--text-soft`（已由 `#8a93a3` 加深至 `#5f6b7d`，约 5.5:1 对比度），**禁止再硬编码浅灰文字色**。另：改静态资源后需 **Ctrl+F5 强刷**才生效（浏览器缓存）。
-- **前端视觉核验习惯**：改动 UI 后用 `show_widget` 渲染改动前后的对比预览给用户确认，再让用户强刷实测（用户对"丑/看不清"类反馈敏感，需要看到实际效果而非文字描述）。
+- LLM JSON **禁用 Jackson**，一律 Hutool `JSONUtil`/`JSONObject`。
+- Maven 在 `D:\software\Java\maven`（仓库同路径，离线 `-o`）；启动器 `.workbuddy/memory/run_mvn.sh`；**离线必加 `-Dmaven.legacyLocalRepo=true`**。
+- **打包后不启动项目**：只到 `mvn package`，运行由用户在 IDE 自启。
+- **DDL 变更必须同步 `sql/schema.sql` 与 `alter.sql`**（schema=建库权威，alter=补存量）。
+- 构建追求零告警：varargs 提示用显式 `(Object[]) tools`（`@SuppressWarnings("varargs")` 实测无效）。
+- **前端三条硬约束**：禁小数像素字号；最小 12px、正文 13px 起；辅助文字用变量 `--text-soft`。改静态资源 Ctrl+F5；**UI 改动先 `show_widget` 出预览**再让用户强刷。
 
-## 已知缺陷 / 坑
-- **Spring AI 2.0.0：`stream()` + `@Tool` 必崩 `NoSuchElementException`**（`OpenAiChatModel$ChunkMerger` 对工具调用 `Optional` 直接 `.get()`）。带工具智能体改用 `call()` 走完工具循环后再 `Flux.fromIterable(...).delayElements(...)` 模拟流式。
-- **Spring AI 2.0 的 LLM 超时只有全局一处（2026-09-12 实测）**：`spring.ai.openai.timeout`（默认 60s）+ `spring.ai.openai.max-retries`（默认 **3** → 失败最多尝试 4 次）。由 `OpenAiChatAutoConfiguration` 在建 `OpenAiSetup.setupSyncClient` 时固化，**运行时改不了**。`OpenAiChatOptions` 里那个 `timeout` 字段是**死字段**（`OpenAiChatModel.java` 全文无 timeout 引用）——**per-request 超时做不到，不要再尝试**。已显式收紧 `max-retries: 1`。
-- **`application.yaml` 里的自定义前缀（`agent.*` 等）必须写顶层**：曾缩进 2 格挂到 `spring:` 下 → 实际键变成 `spring.agent.rag.*`，与 `@ConfigurationProperties("agent.rag")` 对不上 → **整段配置静默失效**（默认值恰好与 yaml 相同，长期未暴露；改 `rerank-enabled` 也无任何效果）。新增配置段后用 `grep -n "^[a-z][a-z-]*:" application.yaml` 核对顶层键。
-- **Edit 工具：同一条消息里对同一文件发多个 Edit，第二个会被静默丢弃**（工具报 success 但未落盘，2026-09-12 连踩两次：application.yaml 的 `app.sse` 段、RagProperties 的 record 头）。同一文件的多处改动必须**分条消息串行**发，改完用 `grep` 复核落盘。
-- **记忆窗口 = 预算 + 下限 + 单条截断，三重约束**：`MemoryProperties`(`agent.memory.*`) + `DbChatMemory.computeWindowStart(history, props)`。缺下限时「单条消息自己超预算」会把起点推到列表末尾 → **整个历史窗口塌缩为空**（模型「突然失忆」、重复问已知信息）。**`MemoryMergeService` 必须注入同一份 `MemoryProperties`** 计算合并边界，否则摘要区间与实际上下文窗口错位（重复摘要/静默丢记忆）。
-- **RAG 兜底路径必须设扫描上限**：`kb_chunk.embedding` 存的是 1024 维向量 JSON 文本，MySQL 回退检索无 `LIMIT` 会把整库向量连同文本读进堆（OOM 隐患）。`agent.rag.fallback-max-chunks` 默认 2000，触顶 `warn` 带真实总数——降级不许静默。
-- **SSE 传输层兜底**：`/api/chat/stream` 有一轮完整的前置链（路由→参数抽取→改写→检索）**完全不发字节**，易被反向代理当空闲切断 → 故 `ChatController` 有独立心跳（`app.sse.heartbeat-seconds`，发 `StreamEvent.TYPE_PING`，前端天然忽略未知类型）+ 有限超时（`app.sse.timeout-seconds`，原先 `0L` 表示永不超时会把「上游卡死」变成「连接永久泄漏」）。心跳**刻意不用 `Flux.merge/interval`**——无限流会让 emitter 永不 complete。
-- **记忆读写的真实时机（2026-09-12 读源码核实，勿再误判）**：`MessageChatMemoryAdvisor.before()` **既读又写**——先 `chatMemory.get(cid)` 注入历史，**紧接着 `chatMemory.add(cid, userMessage)` 落库用户消息**；`after()` 落库 assistant 消息。工具循环在 **`OpenAiChatModel` 内部**（`ToolCallingManager`），**不经过 ChatClient 的 advisor 链**（项目未挂 `ToolCallAdvisor`）→ **一轮 `call()` 的 `before/after` 各只执行 1 次**，「工具循环 N 次读库」这个说法是错的。**推论：不要做「请求级缓存整个 `get()` 结果」**——缓存须在 `add` 时失效，而 `add` 紧跟 `get`，几无收益；ThreadLocal 方案一旦清理遗漏（boundedElastic 线程复用）会让下一轮静默读到上一轮历史（丢本轮用户消息），风险远大于毫秒级收益。当前真实重复读仅「同一轮 `buildHistoryContextText` + advisor `before` 各读一次相同的 `getRecentHistory(200)`」，同样不值得做。
+## 环境 / 工具坑
+- Bash 报 `ls/find/dirname: command not found` → 先 `export PATH="/c/Users/802302/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`。
+- 同一条消息对**同一文件**发多个 Edit，第二个会被静默丢弃（报 success 未落盘）→ 同文件改动**分条消息串行 + grep 复核**；**更推荐一次 Python 脚本批量精确替换**（`\r\n` 归一、每处 `assert count==1`、写回按原换行还原）。
 
-## 架构要点
-- 多 Agent 平台（Spring Boot 4 + Spring AI 2.0 + MyBatis-Plus）。`ChatService` 编排门面；参数补全/路由/记忆合并/提示词分别在 `ParamFillingService`/`AgentRouter`/`MemoryMergeService`/`PromptService`。
-- Agent 参数：paramSchema(JSON 数组) 驱动对话追问补全，上限 `ParamFillingService.MAX_CLARIFY=3`；跨轮靠 DBChatMemory 累积，不改动 Conversation 结构。
-- **前置链并行预取（2026-09-12 起，延迟批次）**：一轮首字前「智能路由 → 参数抽取 → 查询改写」本为 3 个串行模型往返；因**改写只依赖用户原话 + 会话历史**，改为在 `AgentRoundHandler.handle` **最前**发起异步预取（`ChatComposer.prefetchRetrievalQuery`，线程池 `roundPrefetchExecutor`），与路由/参数抽取并行，正式回答前经 `resolveQuery` join（**超时 10s / 中断 / 异常一律回退用户原话**）。**预取只加速、不承担正确性**；`ragOn(conv)==false` 返回 `null`（零额外调用）；`buildRequest` 加 8 参重载、原 7 参版委托传 null（其他调用点零改动）。代价：走追问分支时预取结果作废（可接受）。**规划模式不预取**（有意，回退概率低）。**`ParamFillingService` 历史读取已改有界** `getRecentHistory(cid, HISTORY_SCAN_LIMIT=50)`（原 `getHistory` 是全量 selectList）。
-- **按智能体装配工具（2026-09-12 起）**：`agent.tools_json` VARCHAR(1000) 控制该智能体可挂哪些工具——**NULL/空 = 不限制（挂 ToolRegistry 全量，存量数据无需迁移、行为不变）**、`[]` = 不挂任何工具、`["名"]` = 白名单（按 `ToolDefinition.name()` 匹配；`@Tool` 未指定 name 时**即方法名**，改名会使既有白名单失配并 warn 忽略）。`ToolRegistry.resolve(toolsJson)` 为唯一解析入口（未知名忽略、非法 JSON 回退全量，绝不中断对话），**`ChatComposer.decorateRequest` 是唯一挂载点**（此前为「agent 非空即挂全量」）。工具清单 `GET /api/agent/tools` 返回 `ToolInfo(name,description,group=Provider类名)`，前端三态 all/none/custom。**坑**：`AgentService.applyFields` 里 toolsJson 的 `null` 是**有意义取值**（=全部工具），必须原样 set，不可套用其他字段的「跳过空值」写法，否则无法从白名单改回全部。
-- **会话级 RAG 纯开关 + 自动多库 + 三段式检索（2026-09-12 升级，勿回退）**：conversation 只存 `rag_enabled` TINYINT(1) DEFAULT 0。开启走 `KbSearchService.buildKbContext(ragEnabled, agent, query)` → 返回 **`KbContext(text, citations)`**（不再是裸 String！）：
-  - ① **粗排召回**：`ragTargets`=通用全局库(`kb.agent_id IS NULL`, 只查不建)+路由/绑定 agent 专属库；多库一次合并检索(Chroma 单 collection 按 kb_id OR 一次查完、query 只向量化一次)，召回 `agent.rag.recall-k`(默认 20) 条，下限用**宽松**的 `recall-min-score`(默认 0.10)。无命中回退 MySQL 全量余弦。
-  - ② **精排**：`infrastructure/rerank/RerankService` 调 **DashScope 原生 text-rerank**（`POST /api/v1/services/rerank/text-rerank/text-rerank`，**不在 OpenAI 兼容路径下**，Spring AI 2.0 无 rerank 抽象 → 用 Hutool `HttpRequest` 手写；api-key 复用 `spring.ai.openai.api-key`）。按 `rerank-min-score`(默认 0.20) 过滤取 `top-k`(3)。**精排不可用/失败返回 null → 降级为「向量分降序 + `min-score`(0.25) 截断」**（= 改造前行为）；精排成功但候选全被滤掉时**直接返回空、不退回向量分**（判定不相关就别污染上下文）。**阈值分两套尺度**：rerank 分 0~1 与余弦不同尺度，配置项独立。
-  - ③ **编号注入**：命中块渲染成 `[n] [库名|来源] 内容`，套 `prompts.yaml` 的 `agent.prompt.kb-context` 模板（{items} 为变量值，知识内容里的花括号安全）；同趟产出与编号 1:1 的 `dto/KbCitation`。PUT `/api/chat/conversation/{id}/rag` 更新开关。
-- **RAG 引用溯源（2026-09-12 起）**：`KbCitation`(index/chunkId/kbId/kbName/source/score) 由 `KbSearchService.render` 与资料块**同趟产出**（拆两次算会导致序号与来源漂移）。传递链：`ChatComposer.ComposedRequest(spec, citations)` → `RoundResult.citations` → `ChatService`，出口三处**同一份 JSON**（`KbCitation.toJson/parse` 是唯一序列化点）：① 落库 `chat_message.citations_json`（仅 assistant 消息，`ConversationService.attachCitationsToLatestAssistantMessage(cid, 水位, json)`）；② SSE 新事件类型 `StreamEvent.citations`（正文推完后发一次）；③ `agent_trace.citations_json`。历史经 `MessageDto.citations` 回传。**红线同附件**：独立列、`DbChatMemory.get()` 只读 content、零 token。**规划模式只回传最后一步的引用**（每步各自从 [1] 编号，跨步合并会重复序号）。
-- **链路追踪 agent_trace（2026-09-12 起，纯旁路）**：`trace/RoundTrace` 是一轮的可变收集器（路由结论/计划/RAG 引用/工具调用/token/耗时），**显式沿调用链传递**（`RoundHandler.handle(..., trace)`），并经 `ChatComposer.decorateRequest` 塞进 **Spring AI advisor 上下文**（键 `RoundTrace.CONTEXT_KEY`，与 CONVERSATION_ID 同款机制）——**刻意不用 ThreadLocal 做主上下文**：规划器下一步要做 DAG 并行，ThreadLocal 会静默丢数据。`advisor/RoundTraceAdvisor`(order `MAX_VALUE-90`，比 ToolUsageLoggingAdvisor 更靠内、在工具循环之内) 从 `request.context()` 取 trace，采集工具调用（AssistantMessage.toolCalls 取 args + ToolResponseMessage 取 result，按序对齐、截断 300 字；`syncToolCalls` **只增不减**避免末轮空集覆盖）与 token（`ChatResponseMetadata.getUsage()` 累加）。**token 用 ThreadLocal 只做 before→after 的同线程过渡**（单次调用窗口内，DAG 下也安全）——因为 `after(ChatClientResponse)` 不一定带得到 context，用 `response.context()` 优先、ThreadLocal 兜底。落库 `trace/TraceService.saveAsync`（`traceExecutor`，回复产出后异步、失败只记日志、队列满宁可丢追踪）。查询 `GET /api/trace?conversationId=&limit=` 与 `GET /api/trace/{traceId}`，返回 `dto/TraceDto`（JSON 列已解析为列表）。**本表删掉对话照常跑**；`chat_message` 水位守卫复用：`ChatService.needsWatermark` = 有附件 **或** `conv.ragEnabled`（引用只可能在 RAG 开启时出现，避免常规路径多一次查库）。
-- **知识库以「文件」为管理单元**：`kb_file`(kb_id+file_name 唯一，≤200 字符)。上传→`KbService.registerFile` 解析分块向量化入库并登记；同名重传=替换(全成功才删旧写新，事务回滚)；rechunk(`POST /{id}/files/{fid}/rechunk`)可不重传换策略/重叠重切。
-- **分片 `ChunkingService`+`ChunkStrategy`**：4 策略(fixed/paragraph/recursive 默认/ markdown 标题感知)；overlap 默认 60(0 关闭, ≤200)；kb 级默认策略继承，上传/rechunk 显式参数可覆盖。
-- **治理轮 2026-09-03**：`app.api-key`(env `APP_API_KEY`)→`ApiKeyInterceptor` 校验 `/api/**` 带 `X-Api-Key`(兼容 Bearer)，401 常量比较；`KbService` 拆出 `KbSearchService`(检索收敛点)；`ParamFillingService` 无状态 DB 重放设计(每轮 getHistory 全量重放，天然跨重启一致)。
-- **多模态 `VisionService`(2026-09-07 起)**：Spring AI 原生多模态(`UserMessage.media`)，per-request `OpenAiChatOptions.model=qwen-vl-plus` 覆盖主对话模型；多图并发(`visionExecutor` + 按序 1:1 回收)保归属标注 + 失败隔离。
-- **对话附件（2026-09-10 起，2026-09-12 定型）三通道分离，勿混**：① **纯提问** `message`（可空）→ 走记忆 Advisor + 路由/RAG 查询，唯一落 `chat_message.content`；② **解析文本** `material`（图片 caption / 文档文本，单附件截 30000 字）→ `ChatController.attachmentMaterial` → `ChatComposer.withMaterial` 注入**当轮 system**，仅当轮可见；③ **展示元数据** `attachmentsJson`（type/filename/storedName/size，**不含正文**）→ 落 `chat_message.attachments_json` 独立列，仅 `/api/chat/history` 读取渲染缩略图/下载。**红线**：`DbChatMemory.get()` 只读 `content` → 记忆窗口永远干净、附件不重复耗 token。入口：`POST /api/chat/attachment/process`（`AttachmentService` 解析 + `AttachmentStorageService` 落盘）；静态访问 `/files/**`（`AttachmentWebConfig`，**不带 `/api` 前缀**否则 `<img>` 无法带 X-Api-Key 被 401）；落盘目录 `app.attachment.dir`（默认 `./data/attachments`）。`ChatService/stream/chat` 加 `attachmentsJson` 参数，runRound 后经 `ConversationService.attachToLatestUserMessage(cid, 水位, json)` 写「本轮新增」用户消息（水位守卫防误挂）。
-- **包结构（2026-09-10 按角色重排，全在 `org.luo` 基包）**：`service`=业务服务(Agent/Conversation/Kb/Chat/KbSearch/Chunking)；`infrastructure`=外部集成(chroma: ChromaConnection+ChromaClient+ChromaVectorStoreService / vision: VisionService / document: DocumentParserService / attachment: AttachmentService+AttachmentStorageService / **rerank: RerankService(2026-09-12)**)；`agent`=智能体核心(AgentRouter/ParamFilling/MemoryMerge/Prompt/Planner + handler: Round/PlannerRound/AgentRound/RoundResult)；`chat`=ChatComposer；`advisor`=ToolUsageLoggingAdvisor + **RoundTraceAdvisor**；`trace`=RoundTrace + TraceService(2026-09-12)。Spring 默认扫描 `org.luo` + `@MapperScan("org.luo.mapper")`，搬子包不影响 bean 注册。**搬包脚本务必保留 `org/luo/` 目录前缀**，否则目录与 package 声明错位（2026-09-10 踩过）。
-- **`RoundResult` 现为 4 元组**(reply/clarified/needSaveExchange/**citations**)；新增会话形态实现 `RoundHandler` 时必须按新签名 `handle(conv, cid, message, material, progress, trace)` 实现。
-- **`@ConfigurationProperties` 记录须登记进 `MyAgentApplication` 的 `@EnableConfigurationProperties`**（现含 PromptProperties/VisionProperties/RagProperties/**MemoryProperties**），否则不生效。配置记录用紧凑构造器兜默认值 → 访问器返回的包装类型保证非空，调用处可直接拆箱。
-- **会话记忆窗口（2026-09-12）**：`agent.memory.recent-tokens=4000`(上下文预算, 字符近似) / `min-keep-messages=2`(防塌缩下限, 0=关闭) / `max-message-chars=4000`(单条截断, 0=不截断)，见 `config/MemoryProperties`。参数已从 `DbChatMemory` 的常量抽出，`DbChatMemory` 与 `MemoryMergeService` 共同注入该配置（**必须同一份**）。
-- **`ChatService` 收尾顺序（勿乱）**：*推完回复 → 推 citations 事件 → 落库附件/引用 → 异步落库追踪 → 异步合并记忆*。一切旁路数据都排在用户看到答案之后。
-
-## Chroma 接入（2026-09-10 多次修复，勿回退）
-- 官方 `spring-ai-chroma-store` 2.0.0 模块(非 starter)；本机 `http://127.0.0.1:8000`，yaml `chroma.base-url/collection-name/tenant/database`，默认 collection `kb_chunks`。
-- **命名空间必须 `default_tenant/default_database`**：Spring AI 2.0 默认 `SpringAiTenant` 在 Chroma 0.5.x 不存在，且其 `afterPropertiesSet` 先 `getCollection()`，0.5.x 对不存在集合返回 **400 InvalidCollection 而非 404** → Spring AI 只处理 404 → 抛「Collection xxx does not exist.」→ `initializeSchema(true)` 没机会建库（新装必复现）。故 build 前 `ensureCollection()` 幂等预建。
-- **集合必须 cosine 空间**：0.5.x 不从 metadata `hnsw:space` 读空间(会建成 l2 让命中被 MIN_SCORE 滤掉)，须原生 `POST /api/v1/collections` 传 `configuration.hnsw_configuration.space=cosine`(+`_type`，1.x 用 `hnsw`)；`detectSpace()` 发现 l2 且**空集合**自动删建，非空保留。
-- **冷却重试**：`nextRetryAt` + `chroma.retry-interval-seconds`(默认 60)，「先起应用后起 Chroma」自动自愈，不永久降级。
-- **upsert 批大小受 Embedding 模型限制**：`ChromaVectorStore.add()` 整批 embed，DashScope `text-embedding-v3` 单次 ≤20 → `chroma.upsert-batch-size` 默认 **10**。
-- **绝不静默降级**：`store()` 为 null 时 `logSkipped(op)` 限频 warn；`status()` 暴露 connected/space/documentCount/lastError；`GET /api/kb/chroma/status`；`POST /api/kb/chroma/sync` 幂等回填。写入侧 `registerFile` 返回 `FileIngestResult(file,chromaSynced)`，upload 响应带 `chromaSynced`，前端详情顶部状态条+「同步本库」按钮。
-- **相似度语义坑（已修）**：Chroma 0.5 cosine 空间 `distance = 2·(1−cos)`，`score = 1−distance = 2·cos−1`，**非真实余弦**；须还原 `realCos = (score+1)/2` 再与 `MIN_SCORE=0.25` 同口径，否则相关结果全被滤掉。
-- **绕过 Spring AI 阈值**：`similaritySearch` 强制 `threshold∈[0,1]`(传 -1 抛异常)，且 0.0 只留 `cos≥0.5` 丢 `[0.25,0.5)`；故检索直接 `api.queryCollection` 自算 `embedding.embed(query)` + `where.$or` 多库合并，自过滤。
-- **代码结构（2026-09-10 三层拆分，勿回退）**：① `ChromaClient`=Chroma 全量操作(add/delete/query/count)适配，持有 api/embedding/ChromaVectorStore/collectionId，封装 `add(List<ChromaDoc>)`/`delete(ids)`/`search`/`count`+拆包/余弦还原/多库 OR/分批写+`ChromaDoc`/`ChromaHit` 记录；② `ChromaConnection`(@Service)=连接生命周期：lazy+冷却重试(`nextRetryAt`/`markFailed`/`logSkipped`)、`ensureCollection` 全套原生 HTTP 建库/空间校正(`detectSpace`/`createCollectionNative`/`postCollection`/`hnswConfig`/`deleteCollectionNative`/`countQuietly`/`collectionsUrl`/`chop`)、`connected(op)` 取客户端或降级、`status()`；③ `ChromaVectorStoreService`(@Service)=纯业务门面，注入 `ChromaConnection`，只做 `KnowledgeChunk→ChromaDoc` 转换 + 经 `connection.connected(op)` 取客户端委托 `ChromaClient` + 降级 warn，对外 upsert/delete/search/status 契约不变。`KbSearchService` 用 `ChromaClient.ChromaHit`。调用方一行 `search(kbIds,query,topK,minScore)` 等同 LangChain `similarity_search`。
+## 红线（改代码前先看；完整论证在 ARCHITECTURE.md）
+- **`Map.of` 拒 null（NPE 高发）**：`spec.call().content()` 标 `@Nullable`；控制器回显**可选入参**（如 rechunk `overlap`，缺省=null）要回显服务层解析后的生效值。
+- **Spring AI 2.0**：`stream()`+`@Tool` 必崩 → 带工具走 `call()` 后切片模拟流式；LLM 超时**只有全局一处**、运行时改不了（`OpenAiChatOptions.timeout` 是死字段）。
+- **记忆**：摘要侧与注入侧必须同一份 `MemoryProperties` + 同一 `DbChatMemory.SQL_FETCH_LIMIT`，否则中间段「既不摘要也不注入」；`before()` 既读又写、工具循环不过 advisor 链 → **不做请求级缓存**。
+- **`chat_message` 排序一律带 id tiebreaker**（`created_at` 秒级）；**不要依赖 `plusNanos`**（被静默截断）。
+- **Chroma 副本写入一律经 `ChromaSyncSupport.afterCommit`**（事务内直写会在回滚后留孤儿向量 / 幽灵引用）；删除侧顺序 **先取 chunkIds → 删 MySQL → 提交后删向量**，不可换；sync 回填 upsert-only、不清孤儿。
+- **降级不许静默**：RAG 的 MySQL 回退必有 `LIMIT`（`embedding` 为 1024 维向量 JSON，无界=OOM）；SSE 必须有心跳 + 有限超时。
+- **精排阈值口径不得随候选条数变化**：候选非空且精排可用就必须走精排（含仅 1 条），否则阈值从 0.20 静默变 0.25。
+- **RAG 引用 / 命中数的唯一接线点**：`ChatService.runRound` 出口调 `trace.citations(...)`（Advisor 采集不到检索产物）——漏掉则 `citations_json` 恒 NULL。
+- **打字机总时长必须封顶**：`ChatService` 固定帧间隔 + 分片按长度自适应（`TYPING_MAX_MS`/`TYPING_FRAME_MS`）；勿写固定 4 字/片（延迟随长度线性累加）。
+- **鉴权**：`app.api-key`(env `APP_API_KEY`) → 只拦 `/api/**`（`/files/**` 不拦）；**密钥一律不进仓库**，本地值放 `application-local.yaml`（gitignore，经 `optional:file:` 引入），主 yaml 不留空占位符（会覆盖本地值）。
+- **SSE 心跳必须用独立调度器**（`sseHeartbeatScheduler` + `scheduleWithFixedDelay`）；跑 Reactor `parallel()` 会连带打字机与全站心跳一起卡死。
+- **`/files/**` 免鉴权 + 浏览器按后缀推断 Content-Type** → 附件后缀必须白名单化（`SAFE_EXTENSIONS` 外统一落 `.bin`）；`isImage` 还要挡 `image/svg+xml`。
+- **`clearMessages` 必须与摘要水位一起归零**（`summary`/`core_facts`/`summarized_count`），否则摘要指向不存在的历史。
+- **`agent_code.md` 归档必须原子写**（临时文件 + `ATOMIC_MOVE`）；`deleteAgent` 解绑会话用**单条批量 UPDATE**（`agent_id` 与 `agent_bind_source` 一起清），别逐条 `updateById`。

@@ -23,41 +23,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
-import org.luo.agent.handler.PlannerRoundHandler;
 import org.luo.chat.ChatComposer;
 import org.luo.infrastructure.chroma.ChromaVectorStoreService;
 import org.luo.infrastructure.rerank.RerankService;
 
 /**
- * 知识库检索服务（RAG 检索收敛点，从 KbService 拆出）。
+ * 知识库检索服务（RAG 检索收敛点，只读不写；写入/管理侧见 {@link KbService}）。
  * <p>
- * 只做一件事：把「会话级 RAG 开关 + 路由 agent」翻译成本轮要注入系统提示词的「[知识库资料]」文本，
- * 外加这段话引用了哪些来源（{@link KbCitation}，供前端渲染角标）。
+ * 把「会话级 RAG 开关 + 路由 agent」翻译成注入系统提示词的「[知识库资料]」文本 + 引用来源
+ * （{@link KbCitation}）。开启后自动多库检索：全局「通用知识库」（{@code kb.agent_id IS NULL}）
+ * + 本轮路由/绑定智能体的专属库。
  * <p>
- * 检索与否由会话级开关（conversation.rag_enabled）决定；开启后自动多库检索：
- * <ul>
- *   <li>「通用知识库」（全局，{@code kb.agent_id IS NULL}）——存在即查，任何对话都可命中；</li>
- *   <li>本轮路由/绑定到的智能体的专属库（agent 非空且其库存在）——查得到即查。</li>
- * </ul>
- * <p>
- * <b>三段式检索（重点）</b>：{@code 粗排召回 → 精排 → 编号注入}。
- * <ol>
- *   <li><b>粗排</b>：目标库合并后<b>一次</b>向量检索（Chroma 单 collection 按 kb_id OR 过滤一次查完，
- *       query 只向量化一次；Chroma 不可用 / 无命中整体回退 MySQL 全量余弦），召回
- *       {@code agent.rag.recall-k} 条候选，下限用宽松的 {@code recall-min-score}
- *       （宁可多召回，交给精排判断）；</li>
- *   <li><b>精排</b>：{@link RerankService} 对候选做交叉编码精排，按 {@code rerank-min-score} 过滤后取
- *       {@code top-k} 条。精排不可用（未配置 key / 超时 / 报错）时自动降级为「按向量分 + 严格
- *       {@code min-score} 截断」，即精排上线前的原始行为——精排是增强，不是依赖；</li>
- *   <li><b>编号注入</b>：命中块按顺序编号后套用 {@code prompts.yaml} 的 {@code agent.prompt.kb-context}
- *       模板（提示词外置），并在同一趟循环里产出与编号一一对应的 {@link KbCitation} 列表。</li>
- * </ol>
- * <p>
- * 注入点：{@link ChatComposer#buildKbContext} 透传（普通对话绑定 agent、兜底 null），
- * 规划模式每步经 ChatComposer 传当步步骤 agent。检索/向量化/精排任何一步失败都只降级
- * 绝不阻断对话——RAG 是增强，不是依赖。
- * <p>
- * 对应写入/管理侧见 {@link KbService}（建库、文件上传分块、Chroma 双写与 sync），本服务只读不写。
+ * <b>三段式检索</b>：① 粗排召回（多库合并一次检索，宽松下限）→ ② 精排（{@link RerankService}，
+ * 不可用则降级为向量分 + 严格 {@code min-score} 截断）→ ③ 编号注入（套 {@code agent.prompt.kb-context}
+ * 模板，同趟产出与编号一一对应的引用）。注入点：{@link ChatComposer#buildKbContext} 透传。
+ * 任何一步失败都只降级、绝不阻断对话——RAG 是增强，不是依赖。
  */
 @Slf4j
 @Service
@@ -88,18 +68,12 @@ public class KbSearchService {
     }
 
     /**
-     * 组装本轮请求的知识库资料（核心 RAG 入口，供 ChatComposer / PlannerRoundHandler 注入系统提示词）。
-     * <p>
-     * 检索与否由<b>会话级 RAG 开关</b>（conversation.rag_enabled）决定；开启后<b>自动多库检索</b>，
-     * 无需手动选库，目标库为「通用知识库」+「本轮路由/绑定智能体的专属库」。
-     * 命中经精排后收敛到 {@code top-k} 条注入，避免资料过长稀释回答。
-     * 目标库不存在 / 为空 / 检索失败 / 无命中 / embedding 未配置一律返回 {@link KbContext#EMPTY}，
-     * 由调用方原样继续——知识库故障绝不阻断对话。
+     * 组装本轮知识库资料（核心 RAG 入口，供 ChatComposer 注入系统提示词）。
+     * 无可用库 / 检索失败 / 无命中 / embedding 未配置一律返回 {@link KbContext#EMPTY}，知识库故障不阻断对话。
      *
-     * @param ragEnabled 会话级 RAG 开关（null/false = 不使用 RAG）
-     * @param agent      本轮路由/绑定的智能体（null = 普通对话，只查全局库）；用于叠加检索其专属库
-     * @param query      用户当前问题（检索语义由它驱动）
-     * @return 资料文本 + 引用来源；无资料时返回 {@code KbContext.EMPTY}（text 为空串、citations 为空表）
+     * @param ragEnabled 会话级 RAG 开关（null/false = 不使用）
+     * @param agent      本轮路由/绑定的智能体（null = 只查全局库）
+     * @param query      用户当前问题
      */
     public KbContext buildKbContext(Boolean ragEnabled, Agent agent, String query) {
         if (!Boolean.TRUE.equals(ragEnabled) || query == null || query.isBlank()) return KbContext.EMPTY;
@@ -122,11 +96,7 @@ public class KbSearchService {
 
     // ==================== ① 粗排召回 ====================
 
-    /**
-     * 解析 RAG 检索目标库（存在才加入，避免查空库）：全局「通用知识库」 + 当前智能体的专属库。
-     *
-     * @param agent 本轮路由/绑定的智能体；null = 只查全局库
-     */
+    /** 解析目标库（存在才加入）：全局「通用知识库」+ 当前智能体专属库。 */
     private List<KnowledgeBase> ragTargets(Agent agent) {
         List<KnowledgeBase> targets = new ArrayList<>(2);
         KnowledgeBase global = globalKb();   // 只查不创建，避免检索触发建库
@@ -143,7 +113,7 @@ public class KbSearchService {
         return targets;
     }
 
-    /** 全局「通用知识库」（agent_id IS NULL，不存在返回 null）；与 KbService.getGlobal 同款查询，检索侧自含避免循环依赖。 */
+    /** 全局「通用知识库」（agent_id IS NULL，不存在返回 null）；自含查询避免与 KbService 循环依赖。 */
     private KnowledgeBase globalKb() {
         return kbMapper.selectOne(new QueryWrapper<KnowledgeBase>()
                 .isNull("agent_id").last("LIMIT 1"));
@@ -158,19 +128,10 @@ public class KbSearchService {
     }
 
     /**
-     * 多库统一<b>粗排召回</b>：一次请求跨全部目标库，召回 {@code recall-k} 条候选。
-     * <p>
-     * Chroma 优先（where kb_id 过滤全部目标库 + 余弦 TopK），整体失败 / 无命中回退 MySQL 余弦
-     * （留存向量兜底，检索不依赖 Chroma 可用性；该路径<b>有界扫描</b>，
-     * 上限见 {@code agent.rag.fallback-max-chunks}，避免把整库向量文本拉进堆）。相比逐库遍历：
-     * query 只向量化一次（embedding 为远程 API，省去 N-1 次重复调用），Chroma 只往返一次；
-     * 且回退不再逐库独立判定，命中分数天然同源可比。
-     * <p>
-     * 下限用<b>宽松</b>的 {@code recall-min-score} 而非精排阈值：这一阶段的目标是「别漏」，
-     * 判相关性交给精排（无精排时才回落到严格的 {@code min-score}，见 {@link #refine}）。
-     *
-     * @param targets 目标库（≥1，来自 {@link #ragTargets(Agent)}）
-     * @param query   检索文本
+     * 多库统一粗排召回：一次跨全部目标库，召回 {@code recall-k} 条候选。
+     * Chroma 优先（kb_id 过滤 + 余弦 TopK），失败/无命中回退 MySQL 余弦（<b>有界扫描</b>，
+     * 上限 {@code agent.rag.fallback-max-chunks}，避免把整库向量文本拉进堆）。
+     * 下限用宽松的 {@code recall-min-score}：这一阶段目标是「别漏」，判相关性交给精排。
      */
     private List<Hit> searchAll(List<KnowledgeBase> targets, String query) {
         Map<Long, KnowledgeBase> byId = new LinkedHashMap<>();
@@ -181,14 +142,14 @@ public class KbSearchService {
         int recall = props.recallK();
         double floor = props.recallMinScore();
 
-        // —— Chroma 优先：跨库一次查，候选量 = recallK（多库合并后的总量），Java 侧统一排序 ——
+        // Chroma 优先：跨库一次查，候选量 = recallK；Java 侧统一排序
         List<ChromaHit> chromaHits = chromaStore.search(kbIds, query, recall, floor);
         if (!chromaHits.isEmpty()) {
             List<Hit> hits = new ArrayList<>(chromaHits.size());
             for (ChromaHit h : chromaHits) {
                 KnowledgeBase kb = byId.get(h.kbId());
                 if (kb == null) {
-                    continue;   // 归属库不在本次目标内（理论上不可能），防御跳过
+                    continue;   // 归属库不在目标内（理论不可能），防御跳过
                 }
                 KnowledgeChunk c = new KnowledgeChunk();
                 c.setId(h.chunkId());
@@ -204,11 +165,8 @@ public class KbSearchService {
             return hits;
         }
 
-        // —— 回退 MySQL：一次 IN 查询（**有界**）目标库块，query 只向量化一次 ——
-        // 有界化理由：kb_chunk.embedding 是以 JSON 文本存储的 1024 维向量，无界 selectList 会把
-        // 目标库全部块连同向量文本一次性读进堆（还要逐条 JSON 解析）——库一大就是几百 MB 级压力，
-        // 属 OOM 隐患。兜底路径本就是「Chroma 不可用」时的降级方案，宁可牺牲部分召回完整性，
-        // 也要保证不把应用拖垮；被截断时打 warn（带真实总数），不让降级静默发生。
+        // 回退 MySQL：一次 IN 查询（有界）。kb_chunk.embedding 是 JSON 文本存的 1024 维向量，
+        // 无界读取会把整库向量拉进堆（OOM）；被截断时打 warn 带真实总数，降级不静默。
         int scanCap = props.fallbackMaxChunks();
         List<KnowledgeChunk> all = chunkMapper.selectList(new QueryWrapper<KnowledgeChunk>()
                 .select("id", "kb_id", "content", "source", "embedding")
@@ -224,22 +182,21 @@ public class KbSearchService {
         }
         float[] queryVec = embedOne(query);
         if (queryVec == null) return List.of();
-        // top-K 小顶堆：只留分数最高的 recall 个候选，避免为全部块分配分数数组与命中对象；
-        // 向量文本在评分后即可被 GC 回收，峰值内存与「扫描块数」而非「库总量」成正比。
+        // top-K 小顶堆：峰值内存与「扫描块数」而非「库总量」成正比，向量文本评分后可被 GC 回收
         PriorityQueue<Hit> heap = new PriorityQueue<>(Math.min(recall, all.size()) + 1,
                 Comparator.comparingDouble(Hit::score));
         double best = -1;
         for (KnowledgeChunk c : all) {
             double[] vec = parseVector(c.getEmbedding());
             if (vec == null) {
-                continue;   // 该块无向量 / 向量损坏，跳过
+                continue;   // 无向量 / 向量损坏，跳过
             }
             double s = cosine(queryVec, vec);
             if (s > best) {
-                best = s;   // 仅用于日志：整轮扫描到的最高分（不受下限影响）
+                best = s;   // 仅日志：整轮最高分（不受下限影响）
             }
             if (s < floor) {
-                continue;   // 低于宽松下限，不参与候选
+                continue;   // 低于宽松下限
             }
             KnowledgeBase kb = byId.get(c.getKbId());
             if (kb == null) {
@@ -247,11 +204,11 @@ public class KbSearchService {
             }
             heap.offer(new Hit(kb, c, s));
             if (heap.size() > recall) {
-                heap.poll();   // 弹出当前最小，堆内恒为 top-recall
+                heap.poll();   // 弹出最小，堆内恒为 top-recall
             }
         }
         List<Hit> hits = new ArrayList<>(heap);
-        hits.sort((a, b) -> Double.compare(b.score(), a.score()));   // 降序，与 Chroma 分支口径一致
+        hits.sort((a, b) -> Double.compare(b.score(), a.score()));   // 降序，与 Chroma 分支一致
         if (log.isDebugEnabled()) {
             log.debug("RAG 粗排：回退 MySQL（{} 库扫描 {} 块）召回 {} 块，最高分={}",
                     kbIds.size(), all.size(), hits.size(),
@@ -263,21 +220,18 @@ public class KbSearchService {
     // ==================== ② 精排 ====================
 
     /**
-     * 对粗排候选做<b>精排</b>并按 {@code top-k} 收敛：
-     * <ul>
-     *   <li>精排可用 → 交叉编码打分，丢弃低于 {@code rerank-min-score} 的候选，取前 {@code top-k}；
-     *       若候选被全部滤掉，视为「本轮没有相关资料」直接返回空（<b>不退回向量分</b>——
-     *       精排既然判定都不相关，把低分向量块塞进上下文只会污染回答）；</li>
-     *   <li>精排不可用 / 调用失败 → 降级为「按向量分降序 + 严格 {@code min-score} 截断」，
-     *       即精排上线前的原始行为，保证降级后资料质量不骤降。</li>
-     * </ul>
+     * 精排并按 {@code top-k} 收敛：可用 → 交叉编码打分，丢弃低于 {@code rerank-min-score} 的候选，取前 top-k
+     * （被全滤掉即「本轮无相关资料」，<b>不退回向量分</b>）；不可用/失败 → 降级为向量分降序 +
+     * 严格 {@code min-score} 截断（精排上线前的原始行为）。
      */
     private List<Hit> refine(List<Hit> recalled, String query) {
         List<Hit> sorted = new ArrayList<>(recalled);
         sorted.sort((a, b) -> Double.compare(b.score(), a.score()));   // 兜底顺序 = 向量分降序
         int topK = props.topK();
 
-        if (sorted.size() > 1 && rerankService.available()) {
+        // 不按候选条数走不同阈值：早期写 size() > 1，导致「仅 1 条候选」落到兜底分支、
+        // 阈值从 rerank-min-score(0.20) 静默变 min-score(0.25)。精排是 query↔单条文档独立打分，与候选数无关。
+        if (!sorted.isEmpty() && rerankService.available()) {
             List<String> docs = new ArrayList<>(sorted.size());
             for (Hit h : sorted) {
                 docs.add(h.chunk().getContent());
@@ -320,10 +274,8 @@ public class KbSearchService {
     // ==================== ③ 编号注入 + 引用来源 ====================
 
     /**
-     * 把命中块渲染成带编号的资料块（套 {@code agent.prompt.kb-context} 模板），
-     * 同趟产出与编号一一对应的 {@link KbCitation} 列表（序号从 1 开始，与正文角标一致）。
-     * <p>
-     * 模板缺失（yaml 被改坏 / 未配置）时回退为空串 → 调用方视为无资料，不会注入半截提示词。
+     * 渲染带编号的资料块（套 {@code agent.prompt.kb-context} 模板），同趟产出与编号一一对应的引用列表。
+     * 模板缺失时回退空串 → 调用方视为无资料。资料正文作为模板变量值注入，不会被 ST 二次解析。
      */
     private KbContext render(List<Hit> hits) {
         StringBuilder items = new StringBuilder(512);
@@ -340,7 +292,6 @@ public class KbSearchService {
             items.append("] ").append(h.chunk().getContent()).append("\n");
             citations.add(new KbCitation(no, h.chunk().getId(), h.kb().getId(), h.kb().getName(), source, h.score()));
         }
-        // 资料正文作为模板「变量值」注入，不会被 ST 引擎二次解析（知识内容里的花括号是安全的）
         String block = PromptProperties.render(promptProperties.kbContext(),
                 Map.of("items", items.toString().strip()));
         if (block == null || block.isBlank()) {
@@ -406,14 +357,7 @@ public class KbSearchService {
         return dot / (Math.sqrt(na) * Math.sqrt(nb));
     }
 
-    /**
-     * 本轮知识库资料的组装结果：注入系统提示词的文本 + 该文本引用了哪些来源。
-     * <p>
-     * 两者必须<b>一起产出</b>（同一趟循环生成编号），否则编号与引用列表会漂移。
-     *
-     * @param text      注入 system 的资料块（已含 [n] 行首编号；无资料时为空串）
-     * @param citations 与 text 中 [n] 一一对应的引用来源（无资料时为空表）
-     */
+    /** 资料组装结果：注入 system 的文本 + 一一对应的引用来源。两者必须同趟产出，否则编号与来源漂移。 */
     public record KbContext(String text, List<KbCitation> citations) {
         /** 无资料（RAG 关闭 / 无库 / 无命中 / 失败）：文本为空串、引用为空表。 */
         public static final KbContext EMPTY = new KbContext("", List.of());

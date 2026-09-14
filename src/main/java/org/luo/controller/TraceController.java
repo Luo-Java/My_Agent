@@ -17,15 +17,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 链路追踪查询接口（可观测性）。
+ * 链路追踪查询接口（可观测性，只读）。用于回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」
+ * 「调了哪些工具、花了多少 token、耗时多久」。数据由 {@link TraceService} 在本轮回复产出后异步落库，本接口不参与写入。
  * <p>
- * 只读，用于回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「调了哪些工具、花了多少 token、
- * 耗时多久」。数据本身由 {@link TraceService} 在本轮回复产出后异步落库，本接口不参与写入。
- * <p>
- * GET /api/trace                      - 追踪列表（可按 conversationId 过滤，按时间倒序）
- * GET /api/trace/{traceId}            - 单轮详情
- * <p>
- * 走统一 {@code /api/**} 鉴权（ApiKeyInterceptor），与其它业务接口一致。
+ * GET /api/trace（列表，可按 conversationId 过滤，时间倒序）、GET /api/trace/{traceId}（单轮详情）；
+ * 走统一 {@code /api/**} 鉴权（ApiKeyInterceptor）。
  */
 @RestController
 @RequestMapping("/api/trace")
@@ -37,25 +33,14 @@ public class TraceController {
         this.traceService = traceService;
     }
 
-    /**
-     * 查询追踪记录，按时间倒序。
-     *
-     * @param conversationId 会话 ID（可选；不传则查全部会话，调试用）
-     * @param limit          条数（可选，默认 50，上限 200）
-     * @return 追踪列表（JSON 字段已解析为结构化列表）
-     */
+    /** 查询追踪记录（时间倒序）。conversationId 可选（不传查全部，调试用）；limit 默认 50、上限 200。 */
     @GetMapping
     public List<TraceDto> list(@RequestParam(required = false) String conversationId,
                               @RequestParam(required = false) Integer limit) {
         return traceService.list(conversationId, limit).stream().map(TraceController::toDto).toList();
     }
 
-    /**
-     * 查询单轮追踪详情。
-     *
-     * @param traceId 本轮追踪 ID
-     * @return 详情；不存在返回 null（前端按 200 + null 处理即可，调试接口不做 404 语义）
-     */
+    /** 查询单轮追踪详情；不存在返回 null（前端按 200 + null 处理即可，调试接口不做 404 语义）。 */
     @GetMapping("/{traceId}")
     public TraceDto get(@PathVariable String traceId) {
         AgentTrace t = traceService.get(traceId);

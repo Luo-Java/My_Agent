@@ -15,20 +15,16 @@ import java.util.List;
 import java.util.concurrent.Executor;
 
 /**
- * 链路追踪服务：把 {@link RoundTrace} 收集到的一轮事实落库，并提供查询。
- * <p>
- * <b>三条不可破的原则</b>：
- * <ol>
- *   <li><b>异步</b>：落库走 {@code traceExecutor}，在回复产出之后执行，绝不挡在用户看到答案之前；</li>
- *   <li><b>旁路</b>：不参与任何对话逻辑，业务代码也从不读取 agent_trace——删掉整张表对话照常运行；</li>
- *   <li><b>不抛错</b>：从提交任务到 INSERT 全链路 try/catch，失败只记日志（队列满时宁可丢追踪也不影响对话）。</li>
- * </ol>
+ * 链路追踪服务：把 {@link RoundTrace} 收集到的一轮事实落库，并提供查询。三条不可破的原则：
+ * ① <b>异步</b>——落库走 {@code traceExecutor}，在回复产出之后执行，绝不挡在用户看到答案之前；
+ * ② <b>旁路</b>——不参与任何对话逻辑，业务代码从不读 agent_trace，删掉整张表对话照常运行；
+ * ③ <b>不抛错</b>——从提交任务到 INSERT 全链路 try/catch，失败只记日志（队列满时宁可丢追踪）。
  */
 @Slf4j
 @Service
 public class TraceService {
 
-    /** 单次查询上限：避免调用方传个巨大 limit 把整表拉出来。 */
+    /** 单次查询上限：避免调用方传巨大 limit 把整表拉出来。 */
     private static final int MAX_LIMIT = 200;
     private static final int DEFAULT_LIMIT = 50;
 
@@ -41,10 +37,8 @@ public class TraceService {
     }
 
     /**
-     * 异步落库一轮追踪。调用方在回复产出<b>之后</b>调用即可，本方法立即返回。
-     * <p>
-     * 会先把 {@link RoundTrace#finish()} 收口（记录总耗时）——必须在此刻定格，不能等异步线程里再算，
-     * 否则耗时里会混进排队等待时间。
+     * 异步落库一轮追踪（调用方在回复产出<b>之后</b>调用，本方法立即返回）。会先调
+     * {@link RoundTrace#finish()} 收口总耗时——必须在此刻定格，不能等异步线程里再算，否则耗时混进排队等待时间。
      *
      * @param trace 本轮追踪上下文；null 直接忽略（如异常早退路径）
      */

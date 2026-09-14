@@ -15,7 +15,13 @@ import java.nio.file.Paths;
  * <p>
  * 刻意<b>不使用 {@code /api} 前缀</b>：{@link ApiSecurityConfig} 对 {@code /api/**} 强制校验
  * X-Api-Key，而浏览器 {@code <img src>} / 直链下载无法附带自定义头，走 {@code /api} 会 401。
- * 本映射是只读静态资源，仅为本地/内网回看服务；若需更强隔离，可另加网关鉴权。
+ * <p>
+ * 本映射是只读静态资源，仅为本地/内网回看服务。由于它<b>免鉴权</b>、且浏览器按文件后缀推断
+ * Content-Type 决定「渲染」还是「下载」，落盘后缀已由
+ * {@link org.luo.infrastructure.attachment.AttachmentStorageService} 白名单化
+ * （非图片/文档后缀统一落成 {@code .bin} = application/octet-stream），
+ * 避免上传 {@code .html}/{@code .svg} 后被同源渲染成页面或执行脚本。
+ * 若需更强隔离，可另加网关鉴权。
  */
 @Slf4j
 @Configuration

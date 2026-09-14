@@ -13,19 +13,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 提示词集中配置（外置）。
+ * 提示词集中配置（外置）。所有静态 / 含动态变量的提示词模板统一收编到
+ * {@code src/main/resources/prompts.yaml}（经 {@code spring.config.import} 导入），本类以
+ * {@code @ConfigurationProperties(prefix = "agent.prompt")} 绑定；改 yaml 即可，无需重新编译。
  * <p>
- * 所有散落在 Java 代码里的静态提示词 / 含动态变量的提示词模板，统一收编到
- * {@code src/main/resources/prompts.yaml}（经 {@code spring.config.import} 导入），
- * 本类通过 {@code @ConfigurationProperties(prefix = "agent.prompt")} 绑定。
- * 使用时改 yaml 即可，无需重新编译 Java（改配置后重启服务生效）。
- * <p>
- * 多行提示词在 yaml 里用字面量块标量 {@code |} 书写，绑定为 {@link List}&lt;String&gt;
- * （每个列表元素对应一行，块标量的缩进由 YAML 解析器按首行去缩进）。本类用 getter
- * 把列表重新拼接为带 {@code \n} 的完整文本，调用方直接拿到可用字符串。
- * <p>
- * 含动态变量的提示词用 {@code {占位符}} 标记，由 {@link #render(String, Map)}（Spring AI StTemplateRenderer /
- * ST4 引擎）统一渲染；提示词里需要输出字面大括号（如 JSON 示例）时用 {@code \{ \}} 转义。
+ * 多行提示词在 yaml 里用字面量块标量 {@code |} 书写，绑定为 {@link List}&lt;String&gt;（每元素一行），
+ * 本类用 getter 把列表拼回带 {@code \n} 的完整文本。含动态变量的提示词用 {@code {占位符}} 标记，
+ * 由 {@link #render(String, Map)}（Spring AI StTemplateRenderer / ST4）统一渲染；需输出字面大括号时用
+ * {@code \{ \}} 转义。
  */
 @Getter
 @Setter
@@ -135,14 +130,10 @@ public class PromptProperties {
     /**
      * 用 {@code {占位符}} 语法渲染提示词模板，填充 {@code vars} 中的变量。
      * <p>
-     * 相较手写 {@code .replace("{x}", v)}，本方法走 Spring AI 官方模板引擎（ST4），
-     * 语义统一、未来模板若需要条件/循环等高级特性也可自然扩展。
+     * 注意：模板中的字面大括号（如 JSON 示例 {@code {"route":true}}）必须写成 {@code \{ \}} 转义，
+     * 否则会被 ST 当占位符解析。
      * <p>
-     * 注意：模板中的字面大括号（如 JSON 示例 {@code {"route":true}}）必须写成 {@code \{ \}}
-     * 转义，否则会被 ST 当作占位符解析（{@link ValidationMode#NONE} 下会原样/异常处理，
-     * 正确转义才能保证输出字面花括号）。
-     * <p>
-     * <b>容错</b>：渲染失败（如 yaml 遗漏转义大括号、模板语法错误）时回退返回原模板并记 WARN，
+     * <b>容错</b>：渲染失败（遗漏转义大括号、模板语法错误）时回退返回原模板并记 WARN，
      * 保证「提示词配置错误不阻断对话」——路由/规划/参数抽取全走本方法，一次误改 yaml 不应打崩整轮对话。
      *
      * @param template 含 {@code {占位符}} 的模板文本

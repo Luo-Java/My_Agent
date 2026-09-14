@@ -9,8 +9,8 @@ import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
 
 /**
- * 智能体（Agent）实体：可在页面创建的各类 AI 角色。
- * 绑定到会话后，其 systemPrompt / model / temperature 会决定该会话的对话人设与模型参数。
+ * 智能体（Agent）实体：可在页面创建的各类 AI 角色。绑定到会话后，其 systemPrompt / model / temperature
+ * 会决定该会话的对话人设与模型参数。
  */
 @Data
 @NoArgsConstructor
@@ -46,21 +46,21 @@ public class Agent {
     private String avatarColor;
 
     /**
-     * 参数清单（JSON）：声明该智能体执行任务所需的参数，用于对话中的「追问 / 参数补全」。
-     * 例如：[{"key":"targetLang","label":"目标语言","required":true,"hint":"如：英语/日语","options":["英语","日语","韩语"]}]
+     * 参数清单（JSON）：声明该智能体执行任务所需的参数，用于对话中的「追问 / 参数补全」，
+     * 如 {@code [{"key":"targetLang","label":"目标语言","required":true,"hint":"如：英语/日语"}]}；
      * 为空表示不启用参数补全（走普通对话）。
      */
     private String paramSchema;
 
     /**
-     * 工具装配（JSON 数组）：声明该智能体可用的工具白名单，实现「按智能体装配工具」。
+     * 工具装配（JSON 数组）：声明该智能体可用的工具白名单（按 {@code ToolDefinition.name()} 匹配，
+     * {@code @Tool} 未指定 name 时即方法名；可用值见 {@code GET /api/agent/tools}）。
      * <ul>
-     *   <li>{@code null} / 空 —— 不限制，挂载全部工具（默认值，兼容历史数据，行为与改造前一致）；</li>
-     *   <li>{@code "[]"} —— 不挂任何工具（纯聊天 / 文案类智能体，避免被无关工具干扰）；</li>
+     *   <li>{@code null} / 空 —— 不限制，挂载全部工具（默认值，兼容历史数据）；</li>
+     *   <li>{@code "[]"} —— 不挂任何工具；</li>
      *   <li>{@code ["queryWeatherByDate","chart_echarts"]} —— 仅挂白名单内工具。</li>
      * </ul>
-     * 元素为工具名，取 {@code ToolDefinition.name()}（{@code @Tool} 未指定 name 时即方法名），
-     * 可用值见 {@code GET /api/agent/tools}。解析与匹配见 {@code ToolRegistry#resolve(String)}。
+     * 解析与匹配见 {@code ToolRegistry#resolve(String)}。
      */
     private String toolsJson;
 

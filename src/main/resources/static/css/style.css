@@ -2193,3 +2193,7 @@ button {
 
 .trace-tool-text { color: var(--text-soft); word-break: break-all; width: 100%; }
 
+/* 顶栏「访问密钥」按钮：复用 .trace-btn 外观，但紧贴右侧「追踪」按钮
+   （.trace-btn 自带 margin-left:auto 会把整组推到最右，这里抵消掉自身的那份，避免两按钮被拉开）。 */
+.key-btn { margin-left: 0; }
+.key-btn-on { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }

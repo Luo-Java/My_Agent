@@ -14,18 +14,13 @@ import java.util.List;
 /**
  * 对话附件处理：把任意上传文件转成可注入对话的纯文本（{@link ChatAttachment#content()}）。
  * <p>
- * 按文件类型确定性分派（依据 MIME / 扩展名，不做「是否该调 AI」的猜测，避免写死意图判断）：
- * <ul>
- *   <li>{@code image/*} → 委托 {@link VisionService} 用视觉模型识别为 caption（保留逐图并发与归属标注）；</li>
- *   <li>文本 / 文档（txt/md/csv/json/xml/yml/properties/log/sql/pdf/docx/xlsx）→ 委托 {@link DocumentParserService}
- *       解析为纯文本；</li>
- *   <li>不支持的二进制（zip/exe/ppt/...）→ 降级为占位说明，仍记录文件名，让 LLM 知道有文件但读不到内容。</li>
- * </ul>
- * 单文件解析失败（超限、抽不出文本、格式不支持）不抛错给调用方：转为占位 {@code ChatAttachment}
- * （{@code type="file"}），保证返回列表与入参等长、前端按序对齐消费。
+ * 按文件类型确定性分派（依据 MIME / 扩展名，不做「是否该调 AI」的猜测）：{@code image/*} → 委托
+ * {@link VisionService} 识别为 caption；文本/文档 → 委托 {@link DocumentParserService} 解析为纯文本；
+ * 不支持的二进制 → 降级为占位说明（仍记文件名，让 LLM 知道有文件但读不到内容）。
+ * 单文件解析失败不抛错给调用方：转为占位 {@code ChatAttachment}（type=file），保证返回列表与入参等长。
  * <p>
- * <b>注入长度保护</b>：文档解析文本在 {@code DocumentParserService} 已截断到 50 万字符（知识库分块用），
- * 这里再截断到 {@code MAX_INLINE_CHARS}，避免大文档直接灌入对话上下文撑爆输入上限 / 浪费 token。
+ * <b>注入长度保护</b>：文档解析文本在 DocumentParserService 已截断到 50 万字符（知识库分块用），
+ * 这里再截断到 {@code MAX_INLINE_CHARS}，避免大文档灌入上下文撑爆输入上限 / 浪费 token。
  * <p>
  * <b>原文件落盘</b>：解析的同时把原文件交给 {@link AttachmentStorageService} 落盘，回填 storedName/size；
  * 落盘仅服务历史回看 / 下载，与 LLM 上下文无关（落盘失败不影响本轮解析结果）。
@@ -49,10 +44,8 @@ public class AttachmentService {
     }
 
     /**
-     * 处理一批上传文件，返回与入参顺序对齐的附件列表。
-     * <p>
-     * 每个文件先解析为文本（图片→视觉、文档→解析），同时把原文件落盘（供历史回看 / 下载）；
-     * 落盘失败不影响本轮解析（storedName 留空），保证返回列表与入参等长、前端按序对齐消费。
+     * 处理一批上传文件，返回与入参顺序对齐的附件列表。每个文件先解析为文本（图片→视觉、文档→解析），
+     * 同时把原文件落盘（供历史回看 / 下载）；落盘失败不影响本轮解析（storedName 留空）。
      *
      * @param files 上传文件（multipart/form-data，字段名 {@code files}）
      * @return 与 files 等长的 {@link ChatAttachment} 列表（每项 type ∈ image/text/file）
@@ -93,14 +86,19 @@ public class AttachmentService {
     /** 是否图片：优先按 MIME，MIME 缺失时按扩展名兜底（防止浏览器未带 MIME 时图片被误判为不支持）。 */
     private static boolean isImage(MultipartFile f) {
         String mime = f.getContentType();
-        if (mime != null && mime.startsWith("image/")) return true;
+        if (mime != null && mime.startsWith("image/")) {
+            // 必须排除 svg（MIME 为 image/svg+xml）：它是「可内嵌脚本的 XML」，既不适合视觉模型识别，
+            // 落盘也会被白名单转成 .bin（缩略图必然显示不出来）→ 不挡会白跑一次视觉调用。
+            return !mime.toLowerCase(java.util.Locale.ROOT).contains("svg");
+        }
         String name = f.getOriginalFilename();
         if (name == null) return false;
         int idx = name.lastIndexOf('.');
         if (idx < 0) return false;
         String ext = name.substring(idx + 1).toLowerCase(java.util.Locale.ROOT);
+        // 同样刻意不含 svg：落盘后经免鉴权的 /files/** 同源访问会成为脚本执行入口。
         return switch (ext) {
-            case "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg" -> true;
+            case "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif" -> true;
             default -> false;
         };
     }

@@ -23,26 +23,20 @@ import java.util.concurrent.RejectedExecutionException;
 import org.luo.service.ConversationService;
 
 /**
- * 会话记忆合并服务：对话结束后，将「溢出窗口的旧消息」与「已有摘要/关键事实」合并，
- * 一次 LLM 调用同时产出更新后的滚动摘要与用户核心信息，回写 conversation 表。
+ * 会话记忆合并服务：对话结束后把「溢出窗口的旧消息」与已有摘要/关键事实合并，一次 LLM 调用同时产出
+ * 更新后的滚动摘要与用户核心信息，回写 conversation 表。
  * <p>
- * 使用裸 {@link ChatModel} 直接调用（不走 advisor），否则 advisor 会把摘要指令当作对话消息写入记忆造成污染。
- * 失败一律回退到已有记忆，保证主流程不被打断、长期记忆不丢。
+ * 用裸 {@link ChatModel} 直接调用（不走 advisor，否则摘要指令会被当作对话消息写入记忆）；失败一律回退
+ * 已有记忆，不打断主流程。
  * <p>
- * <b>数据保留契约</b>：合并只把窗口外消息<b>排除出主模型上下文</b>并回写摘要/关键事实，
- * <b>不删除 chat_message 行</b>（历史仍可全量回放）。{@link ParamFillingService} 的澄清重放
- * （追问计数 / 参数抽取）依赖该保留语义——若未来改为物理归档旧消息，需同步其实现，
- * 否则跨轮参数补全会静默断裂。
+ * <b>数据保留契约</b>：只把窗口外消息<b>排除出主模型上下文</b>，<b>不删除 chat_message 行</b>。
+ * {@link ParamFillingService} 的澄清重放依赖该语义——若改为物理归档旧消息，需同步其实现。
  */
 @Slf4j
 @Service
 public class MemoryMergeService {
 
-    /**
-     * 批量记忆合并阈值：累计溢出这么多条消息才触发一次 LLM 记忆合并（摘要 + 关键事实）。
-     * 值越大调用越少（默认 6 条 ≈ 每 3 轮一次），但批次之间溢出的消息会暂时缺席上下文；
-     * 值越小记忆越细但调用越频繁（设为 1 即回到每轮合并）。可调。
-     */
+    /** 批量合并阈值：累计溢出这么多条才触发一次 LLM 合并（默认 6 ≈ 每 3 轮一次）；设为 1 即每轮合并。 */
     private static final int SUMMARY_BATCH_SIZE = 6;
 
     private final ConversationService conversationService;
@@ -51,17 +45,10 @@ public class MemoryMergeService {
     private final String memoryMergeSystem;
     /** 记忆合并专用线程池：与对话主链路（Reactor boundedElastic）隔离，合并再慢也不挤占对话执行线程。 */
     private final Executor memoryMergeExecutor;
-    /**
-     * 记忆窗口配置：与 {@code DbChatMemory} 共用同一份参数计算窗口边界。
-     * 必须注入而非各写一份默认值——两处参数一旦不一致，「被摘要掉的区间」就会与实际
-     * 上下文窗口错位（重复摘要或静默丢记忆）。
-     */
+    /** 记忆窗口配置：与 {@code DbChatMemory} 共用同一份——两处参数不一致会让「被摘要区间」与窗口错位。 */
     private final MemoryProperties memoryProperties;
 
-    /**
-     * 正在合并中的会话集合：同一会话的记忆合并互斥，避免用户连发消息时并发触发多次 LLM 合并、
-     * 相互覆盖摘要（跳过的那次不会丢，下一轮对话结束时会再检查一遍）。
-     */
+    /** 合并中的会话：同一会话互斥，避免连发消息时并发触发多次合并相互覆盖（跳过的那次下一轮会重查）。 */
     private final Set<String> merging = ConcurrentHashMap.newKeySet();
 
     public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
@@ -76,13 +63,8 @@ public class MemoryMergeService {
     }
 
     /**
-     * 异步触发记忆合并：<b>不阻塞对话主流程</b>。
-     * <p>
-     * 合并达到阈值时需要一次额外的 LLM 调用（秒级），若同步执行会挡在「用户看到回复」之前。
-     * 因此本方法把检查与合并整体丢到 {@link #memoryMergeExecutor 专用线程池} 执行，调用方（回复已返回/已推送后）立即返回。
-     * 同一会话已有合并在进行中时直接跳过本次。
-     *
-     * @param conversationId 会话 ID
+     * 异步触发记忆合并，<b>不阻塞对话主流程</b>：检查与合并整体丢到专用线程池（秒级 LLM 调用若同步执行
+     * 会挡在用户看到回复之前），调用方立即返回。同一会话已有合并在进行中则跳过本次。
      */
     public void maybeMergeMemoryAsync(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -91,9 +73,7 @@ public class MemoryMergeService {
             return;
         }
         try {
-            // 专用线程池 + CompletableFuture：runAsync 提交，whenComplete 统一收尾
-            // （释放合并占位 + 兜底记录未预期异常），比手写 try/finally 更声明式。
-            // maybeMergeMemory 内部已 catch 业务异常，这里仅兜底，正常路径 ex 为 null。
+            // runAsync 提交、whenComplete 统一收尾（释放占位 + 兜底记录异常）；maybeMergeMemory 内部已 catch
             CompletableFuture.runAsync(() -> maybeMergeMemory(conversationId), memoryMergeExecutor)
                     .whenComplete((v, ex) -> {
                         merging.remove(conversationId);
@@ -102,28 +82,32 @@ public class MemoryMergeService {
                         }
                     });
         } catch (RejectedExecutionException e) {
-            // 提交被线程池拒绝（队列满/已关闭）：runAsync 的 execute 会同步抛出，此时任务未进队、
-            // whenComplete 永远不会触发，必须在这里释放 merging 占位，否则该会话后续轮次永远跳过合并。
-            // 本次不合并可接受：下一轮对话结束会再检查。
+            // 线程池拒绝时任务未入队、whenComplete 不会触发，必须在此释放占位，否则该会话后续永远跳过合并
             merging.remove(conversationId);
             log.warn("记忆合并任务提交被拒绝，本次跳过：会话={}，原因={}", conversationId, e.getMessage());
         }
     }
 
     /**
-     * 对话结束后检查：历史是否溢出窗口达到合并阈值，若是则触发一次 LLM 记忆合并。
-     * 本轮消息已由 advisor 通过 ChatMemory 落库，这里基于全量历史计算窗口起点，
-     * 窗口之外的旧消息由「滚动摘要 + 用户核心信息」接管，之后不再进入上下文。
+     * 检查历史是否溢出窗口达阈值，是则触发一次 LLM 合并。
+     * <b>窗口口径必须与 {@link DbChatMemory#get()} 同源</b>：取同一段「最近 {@value DbChatMemory#SQL_FETCH_LIMIT} 条」
+     * 列表、调同一个 {@link DbChatMemory#computeWindowStart}，再换算回全量绝对索引
+     * （{@code total - recent.size() + startInRecent}）。早期实现分别在「全量」与「截断」列表上算起点，
+     * 历史超过预取上限后两把尺子错位，中间那段既不进摘要也不进上下文（模型「忘了前面几轮」）。
      */
     public void maybeMergeMemory(String conversationId) {
         try {
-            List<ChatMessage> history = conversationService.getHistory(conversationId);
-            int windowStart = DbChatMemory.computeWindowStart(history, memoryProperties);
+            Conversation conv = conversationService.getConversation(conversationId);
+            if (conv == null) return;
+            int total = conversationService.countMessages(conversationId);
+            if (total <= 0) return;
+            List<ChatMessage> recent = conversationService.getRecentHistory(conversationId,
+                    DbChatMemory.SQL_FETCH_LIMIT);
+            int startInRecent = DbChatMemory.computeWindowStart(recent, memoryProperties);
+            int windowStart = total - recent.size() + startInRecent;   // 换算成全量历史索引
             if (windowStart <= 0) {
                 return; // 全部历史都在 token 预算内，无需合并
             }
-            Conversation conv = conversationService.getConversation(conversationId);
-            if (conv == null) return;
             int alreadySummarized = conv.getSummarizedCount() == null ? 0 : conv.getSummarizedCount();
             int newOverflow = windowStart - alreadySummarized;
             if (newOverflow < SUMMARY_BATCH_SIZE) {
@@ -136,7 +120,9 @@ public class MemoryMergeService {
                 log.warn("记忆状态不一致：已覆盖条数={} >= 窗口起点={}，跳过合并", alreadySummarized, windowStart);
                 return;
             }
-            List<ChatMessage> delta = history.subList(alreadySummarized, windowStart);
+            // 只取「尚未摘要的那一段」（按全量索引区间开窗），长会话下不再整段历史读进内存
+            List<ChatMessage> delta = conversationService.getMessagesRange(
+                    conversationId, alreadySummarized, windowStart);
             SummaryResult sr = summarize(conv.getSummary(), conv.getCoreFacts(), delta);
             conversationService.updateMemory(conversationId, sr.summary, sr.coreFacts, windowStart);
             log.info("记忆合并完成：合并 {} 条，已覆盖条数={}", delta.size(), windowStart);
@@ -146,13 +132,8 @@ public class MemoryMergeService {
     }
 
     /**
-     * 将"新增溢出的历史"与"已有摘要/关键事实"合并，一次 LLM 调用同时产出：
-     * 更新后的滚动摘要 + 更新后的用户核心信息（关键事实清单）。
-     *
-     * @param existingSummary   之前的滚动摘要（首次为 {@code null}）
-     * @param existingCoreFacts 已提取的用户核心信息（首次为 {@code null}）
-     * @param newMessages       新溢出到记忆池的消息列表（按时间正序）
-     * @return 合并结果（摘要 + 核心信息）；LLM 调用失败时两者均回退原值
+     * 把「新增溢出的历史」与「已有摘要/关键事实」合并，一次 LLM 调用同时产出新摘要与新核心信息；
+     * LLM 失败时两者均回退原值。
      */
     private SummaryResult summarize(String existingSummary, String existingCoreFacts, List<ChatMessage> newMessages) {
         try {
@@ -185,10 +166,7 @@ public class MemoryMergeService {
         }
     }
 
-    /**
-     * 解析 LLM 返回的「摘要 + 关键事实」两段式文本，容错处理格式偏差：
-     * 找不到分隔符时整段视为摘要、关键事实保留旧值；关键事实为"无"时置为 null。
-     */
+    /** 解析「摘要 + 关键事实」两段式文本：找不到分隔符则整段视为摘要、关键事实保留旧值；"无" 置 null。 */
     private SummaryResult parseSummaryResult(String reply, String existingSummary, String existingCoreFacts) {
         String text = reply.trim();
         int idx = text.indexOf("## 关键事实");

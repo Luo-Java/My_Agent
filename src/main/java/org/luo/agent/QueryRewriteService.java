@@ -17,25 +17,18 @@ import java.util.List;
 /**
  * 检索查询改写（RAG 多轮指代消解）。
  * <p>
- * <b>为什么需要它</b>：知识库检索此前<b>直接把用户原话当检索问题</b>。但多轮对话里用户大量使用指代与省略
- * （「那它呢」「这个怎么算」「换成三年级呢」），这类短句单独拿去向量化，语义是残缺的——大概率召回一堆
- * 无关块。而<b>精排只能重排「已经召回来的候选」</b>：如果正确答案在召回阶段就没进来，精排再准也无从补救。
- * 所以改写必须发生在检索<b>之前</b>，它是精排的前置条件，不是替代品。
+ * 多轮对话里用户大量使用指代与省略（「那它呢」「换成三年级呢」），这类短句单独向量化语义残缺、召回一堆
+ * 无关块；而<b>精排只能重排「已经召回来的候选」</b>，召回阶段没进来的精排再准也无从补救。所以改写必须
+ * 发生在检索<b>之前</b>，它是精排的前置条件，不是替代品。
  * <p>
- * <b>做法</b>：取该会话最近 {@code agent.rag.query-rewrite-history-size} 条历史，连同本轮原话交给一次 LLM 调用，
- * 让它只做「补全指代与省略的主语/宾语」，产出一句语义完整、可独立检索的问题。提示词见
- * {@code prompts.yaml} 的 {@code agent.prompt.query-rewrite-system}（外置，改配置无需编译）。
+ * 做法：取该会话最近 {@code agent.rag.query-rewrite-history-size} 条历史，连同本轮原话交给一次 LLM 调用，
+ * 只做「补全指代与省略」，产出一句可独立检索的问题（提示词外置在 prompts.yaml，改配置无需编译）。
  * <p>
- * <b>零成本短路</b>（三层，避免为不需要改写的场景白花一次模型调用）：
- * <ol>
- *   <li>配置关闭（{@code agent.rag.query-rewrite-enabled=false}）→ 原话返回；</li>
- *   <li>会话未开 RAG → 由调用方（{@link org.luo.chat.ChatComposer}）直接跳过，根本不进本服务；</li>
- *   <li><b>首轮无历史</b> → 没有任何可消解的上下文，直接原话返回（最常见的省钱点）。</li>
- * </ol>
+ * <b>零成本短路</b>（避免为不需要改写的场景白花一次调用）：配置关闭 → 原话返回；会话未开 RAG → 调用方
+ * 直接跳过；<b>首轮无历史</b> → 无可消解上下文，原话返回（最常见的省钱点）。
  * <p>
- * <b>绝不阻断对话</b>：模型异常 / 返回空 / 结果明显跑偏，一律回退用户原话——改写是增强，不是依赖。
- * 与路由判定、参数抽取、规划、记忆合并同款：走<b>裸 {@code ChatModel}</b>（不经 Advisor、不挂工具、不写记忆），
- * 故不计入 {@code agent_trace} 的 token 口径（那口径只统计「回答成本」）。
+ * <b>绝不阻断对话</b>：模型异常 / 返回空 / 结果跑偏一律回退原话。与路由、参数抽取、规划、记忆合并同款：
+ * 走<b>裸 {@code ChatModel}</b>（不经 Advisor、不挂工具、不写记忆），故不计入 agent_trace 的 token 口径。
  */
 @Slf4j
 @Service
@@ -72,14 +65,8 @@ public class QueryRewriteService {
     }
 
     /**
-     * 把用户本轮原话改写为可独立检索的问题。
-     * <p>
-     * 任何一步不如意（开关关闭 / 无历史 / 调用异常 / 结果为空或跑偏）都返回<b>用户原话</b>，
-     * 保证调用方拿到的永远是「一个可以拿去检索的字符串」，无需判空。
-     *
-     * @param conversationId 会话 ID（用于读取最近历史）
-     * @param message        用户本轮原话
-     * @return 改写后的问题；未改写时即原话
+     * 把用户本轮原话改写为可独立检索的问题。任何一步不如意（开关关闭 / 无历史 / 调用异常 / 结果为空或跑偏）
+     * 都返回<b>用户原话</b>，保证调用方拿到的永远是「一个可拿去检索的字符串」，无需判空。
      */
     public String rewrite(String conversationId, String message) {
         if (message == null || message.isBlank()) return message;
@@ -102,10 +89,7 @@ public class QueryRewriteService {
         }
     }
 
-    /**
-     * 取最近若干条历史拼成「用户：xxx / 助手：yyy」文本；不含本轮（本轮此刻尚未落库）。
-     * 读取失败或内容为空返回空串（调用方据此跳过改写）。
-     */
+    /** 取最近若干条历史拼成「用户：xxx / 助手：yyy」文本（不含本轮，此刻尚未落库）；失败或为空返回空串。 */
     private String recentHistoryText(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return "";
         // getRecentHistory 走 (conversation_id, created_at) 索引 + LIMIT，长会话也不会全量拉取
@@ -136,15 +120,11 @@ public class QueryRewriteService {
     }
 
     /**
-     * 清洗模型输出并做跑偏护栏，任何一步不达标即回退原话：
-     * <ul>
-     *   <li>空/空白 → 原话；</li>
-     *   <li>只取第一段非空行（模型偶尔会多写一行解释）；</li>
-     *   <li>剥掉「改写为：」这类前缀与成对包裹的引号；</li>
-     *   <li>长度超过「原话 3 倍」且超过 {@value #MIN_LENGTH_CEILING} 字 → 判定为在回答问题而非改写，回退原话。</li>
-     * </ul>
-     * 最后一条护栏很关键：改写器一旦「开始回答」，注入的知识库资料就会跟着跑偏，
-     * 而这类失败是静默的——宁可退回用户原话，也不要把一段解释当检索问题用。
+     * 清洗模型输出并做跑偏护栏，任何一步不达标即回退原话：空 → 原话；只取第一段非空行；剥掉「改写为：」
+     * 这类前缀与成对引号；长度超过「原话 3 倍」且超过 {@value #MIN_LENGTH_CEILING} 字 → 判定在回答问题，回退。
+     * <p>
+     * 长度护栏很关键：改写器一旦「开始回答」，注入的知识库资料就会跟着跑偏，而这类失败是静默的——
+     * 宁可退回用户原话，也不要把一段解释当检索问题用。
      */
     private static String sanitize(String rephrased, String original) {
         if (rephrased == null || rephrased.isBlank()) return original;

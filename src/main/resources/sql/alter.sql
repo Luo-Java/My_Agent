@@ -74,3 +74,9 @@ CREATE TABLE IF NOT EXISTS agent_trace (
 -- 值为多轮查询改写（指代消解）的产物；NULL 表示未改写（未开 RAG / 首轮无历史 / 关闭改写 / 模型判定原话已自包含）。
 -- 单独留痕是为了让「RAG 没命中」可归因：究竟是改写跑偏了，还是知识库里确实没有。
 ALTER TABLE agent_trace ADD COLUMN retrieval_query VARCHAR(1000) DEFAULT NULL COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）' AFTER user_message;
+
+-- ============ 以下为「无需执行」的说明项（第二批修复，2026-09-14）============
+-- chat_message.created_at 维持 DATETIME（秒级），列定义**不做任何变更**，存量库无需执行语句。
+-- 原因：同一轮落库的 user/assistant 两条消息写入的是同一个秒值（原代码的 plusNanos 纳秒偏移会被该列静默截断），
+-- 因此先后顺序不能依赖时间精度，改由自增主键 id 兜底——所有读取路径已统一为 ORDER BY created_at, id
+-- （getHistory / getRecentHistory / getMessagesRange）。schema.sql 中该列的注释已同步修正。

@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
     content         TEXT                                 COMMENT '消息内容（用户提问或AI回复文本）',
     attachments_json TEXT        DEFAULT NULL            COMMENT '本轮附件元数据（JSON数组：type/filename/storedName/size）；仅用于历史展示，不参与记忆读取（DbChatMemory.get 不读此列，零 token 开销）',
     citations_json   TEXT        DEFAULT NULL            COMMENT '本轮 RAG 引用来源（JSON数组：index/kbName/source/chunkId/score）；仅 assistant 消息、仅用于历史展示与前端角标，不参与记忆读取',
-    created_at      DATETIME                             COMMENT '消息写入时间（同一轮用户与助手相差纳秒级以保证顺序）',
+    created_at      DATETIME                             COMMENT '消息写入时间；同一轮消息的先后顺序由自增主键 id 兜底（查询统一 ORDER BY created_at, id）',
     PRIMARY KEY (id),
     -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
     INDEX idx_conv_created (conversation_id, created_at)

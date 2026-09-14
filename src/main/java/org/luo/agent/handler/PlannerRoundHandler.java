@@ -23,18 +23,15 @@ import java.util.function.Consumer;
 import org.luo.service.KbSearchService;
 
 /**
- * 规划模式会话策略：由动态规划器（PlannerService）在运行时根据用户目标产出多智能体步骤，
- * 再顺序执行（前一步输出作为后一步输入）。规划器不预配置步骤、不追问参数，对用户最友好。
+ * 规划模式会话策略：动态规划器（PlannerService）在运行时根据用户目标产出多智能体步骤，再顺序执行
+ * （前一步输出作为后一步输入）；不预配置步骤、不追问参数。
  * <p>
- * 与普通对话策略（AgentRoundHandler）的关键差异在<b>记忆写入契约</b>：
- * 本策略全程使用无记忆的 {@link ChatComposer#internalChatClient()}（避免「指令+上一步输出」
- * 这类合成串污染会话历史），在回复产出后由 {@link #savePlannerExchange} 显式补写
- * 「用户原话 → 最终回复」整对（{@link RoundResult#needSaveExchange()} 为 true）。
- * 执行过程通过 {@code progress} 回调实时对外播报（规划中 / 计划清单 / 每步开始与完成），
- * 这些文本<b>只用于展示，不写入会话记忆</b>——记忆里只有「用户原话 → 最终回复」。
+ * 与普通对话策略的关键差异在<b>记忆写入契约</b>：本策略全程用无记忆的
+ * {@link ChatComposer#internalChatClient()}（避免「指令+上一步输出」这类合成串污染历史），
+ * 回复产出后由 {@link #savePlannerExchange} 显式补写「用户原话 → 最终回复」整对。
+ * 执行过程经 {@code progress} 回调实时播报，<b>只用于展示、不写入记忆</b>。
  * <p>
- * <b>RAG 引用只取最后一步</b>：每一步各自检索、各自从 [1] 开始编号，若跨步合并会出现重复序号、
- * 与最终回答正文的角标对不上。最终回答由最后一步产出，故只回传那份引用（见 {@link StepsOutcome}）。
+ * <b>RAG 引用只取最后一步</b>：每步各自检索、各自从 [1] 编号，跨步合并会出现重复序号、与最终回答角标对不上。
  */
 @Slf4j
 @Service
@@ -72,16 +69,13 @@ public class PlannerRoundHandler implements RoundHandler {
     }
 
     /**
-     * 规划模式会话处理。规划为空（无可用智能体 / 目标与任何智能体无关）→ 回退普通助手直接回答；
-     * 计划中的智能体编码不存在 → 跳过该步；全部不存在 → 回退普通回答；执行复用 {@link #executeSteps}，
-     * 记忆由 {@link #savePlannerExchange} 统一落库，工具全程挂载。
+     * 规划模式会话处理：规划为空或计划中的智能体全不存在 → 回退通用助手直接回答（走带记忆的 chatClient，
+     * 记忆由 Advisor 自动落库）；否则顺序执行 spec，记忆由 {@link #savePlannerExchange} 统一补写。
      * <p>
-     * 本方法<b>不写记忆</b>：是否需要显式落库由返回值的 {@code needSaveExchange} 告知调用方
-     * （见 {@link PlannerOutcome}）。
+     * 本方法<b>不写记忆</b>：是否需显式落库由返回值的 {@code needSaveExchange} 告知调用方。
      *
      * @param progress 进度回调（流式接口传事件推送，同步接口传空回调）
      * @param trace    本轮追踪上下文（可为 null）：记录计划与最终处理方
-     * @return 本轮结果（回复文本 + 是否需显式写记忆 + RAG 引用）
      */
     private PlannerOutcome handlePlannerConversation(Conversation conv, String conversationId, String message,
                                                      String material, Consumer<String> progress, RoundTrace trace) {
@@ -95,7 +89,6 @@ public class PlannerRoundHandler implements RoundHandler {
                 trace.plan("[]");
                 trace.route(SRC_NONE, null);   // 实际由通用助手处理
             }
-            // 回退路径走带记忆的 chatClient，记忆由 Advisor 自动落库，无需显式补写
             return answerDefault(conv, conversationId, message, material, trace);
         }
         List<StepSpec> specs = new ArrayList<>();
@@ -140,21 +133,16 @@ public class PlannerRoundHandler implements RoundHandler {
             return answerDefault(conv, conversationId, message, material, trace);
         }
         progress.accept("✅ 全部步骤执行完毕，已生成最终结果");
-        // 多步规划：执行期间所有步骤都用 internalChatClient（不写记忆），避免「指令+上一步输出」这类合成串
-        // 污染会话历史；需由调用方在回复推送后显式补写「用户原话 → 最终回复」整对（needSaveExchange=true）。
+        // 多步执行期全程不写记忆，需由调用方在回复推送后显式补写「用户原话 → 最终回复」整对
         return new PlannerOutcome(executed.reply(), true, executed.citations());
     }
 
     /**
-     * 顺序执行一组步骤（智能体 + 指令）：前一步输出作为后一步输入。
+     * 顺序执行一组步骤（智能体 + 指令），前一步输出作为后一步输入：
      * <ul>
-     *   <li>第 1 步输入 = firstInput（用户原始目标），并注入长期记忆与已确认参数（paramBlock）；</li>
-     *   <li>后续步骤输入 = 本步指令 + 上一步输出；</li>
-     *   <li>所有步骤均用无记忆 ChatClient，不写会话历史，避免中间产物/合成串污染；
-     *       最后一步额外注入近期窗口历史（historyContext）以替代记忆 Advisor 的上下文读取，保证回答连贯；</li>
-     *   <li>执行结束后由 {@link #savePlannerExchange} 把「用户原话 → 最终回复」整对落库；</li>
-     *   <li>任一步骤失败/返回空则沿用上一步结果；全部失败返回 null；</li>
-     *   <li>每步的开始/完成/失败通过 {@code progress} 回调实时播报，这些文本只用于展示、不进记忆。</li>
+     *   <li>第 1 步输入 = 用户原始目标 + 长期记忆 + 已确认参数（paramBlock）；后续步骤输入 = 本步指令 + 上一步输出；</li>
+     *   <li>所有步骤均用无记忆 ChatClient（中间产物不写历史）；最后一步额外注入近期窗口历史以替代 Advisor 的上下文读取；</li>
+     *   <li>任一步失败/返回空则沿用上一步结果，全部失败返回 null；每步进展经 {@code progress} 播报（不进记忆）。</li>
      * </ul>
      *
      * @return 最终回复 + 产出该回复那一步的 RAG 引用（无引用为空表）
@@ -174,7 +162,16 @@ public class PlannerRoundHandler implements RoundHandler {
             boolean isLast = (i == steps.size() - 1);
             String stepTag = "步骤 " + (i + 1) + "/" + steps.size() + " · " + s.agent().getName();
             progress.accept("▶ " + stepTag + " 执行中…");
-            String userInput = (i == 0) ? firstInput : "上一步的输出：\n" + previous;
+            // 前序步骤可能全部失败/返回空（previous 仍为 null）：不能把字面量 "null" 拼进提示词，
+            // 否则模型会「续写一个不存在的产物」。改为回落原始目标并显式说明。
+            String userInput;
+            if (i == 0) {
+                userInput = firstInput;
+            } else if (previous == null) {
+                userInput = "（上一步未产出可用结果，请基于原始目标作答）\n" + firstInput;
+            } else {
+                userInput = "上一步的输出：\n" + previous;
+            }
             // 附件材料仅注入首步（用户原始目标所在步），后续步以上一步产物为输入，避免重复放大
             if (i == 0 && material != null && !material.isBlank()) {
                 userInput = userInput + "\n\n[本轮附件材料] 以下为用户本轮上传的内容（图片已识别、文档已解析为文本），"
@@ -184,12 +181,9 @@ public class PlannerRoundHandler implements RoundHandler {
                 userInput = s.instruction() + "\n\n" + userInput;
             }
             try {
-                // 所有步骤都不挂记忆 Advisor：中间产物绝不写入会话历史
-                // 长期记忆（核心信息/历史摘要）对所有步骤注入：用户偏好应贯穿整条流水线；
-                // 已确认参数只在第一步注入（后续步骤以上一步产物为输入，无关参数只会造成干扰）；
-                // 最后一步追加近期窗口历史，保持与单智能体对话一致的上下文连贯性。
-                // 知识库检索跟随会话级 RAG 开关：开启后自动查「全局库 + 本步骤 agent 的专属库」，
-                // 未开启则不检索（用户选择的「纯开关 + 自动多库」语义，见 KbSearchService.buildKbContext）
+                // 长期记忆对所有步骤注入（用户偏好应贯穿整条流水线）；已确认参数只在第一步注入
+                // （后续步骤以上一步产物为输入，无关参数只会干扰）；最后一步追加近期窗口历史。
+                // 知识库检索跟随会话级 RAG 开关：开启后自动查「全局库 + 本步骤 agent 的专属库」。
                 KbSearchService.KbContext kb = composer.buildKbContext(composer.ragOn(conv), s.agent(), userInput);
                 String system = composer.applyRealtimeRule(composer.buildSystemPrompt(s.agent())
                         + kb.text()
@@ -220,8 +214,7 @@ public class PlannerRoundHandler implements RoundHandler {
         return new StepsOutcome(last, lastCitations);
     }
 
-    /** 通用助手兜底回答（无智能体绑定、不挂载工具）：用于规划模式回退、或规划目标与任何智能体无关时。
-     *  附件材料 material 仅当轮注入 system，不进会话记忆；RAG 引用随结果一并带回。 */
+    /** 通用助手兜底回答（无智能体绑定、不挂载工具）：用于规划回退或目标无关时。附件材料仅当轮注入 system；RAG 引用随结果带回。 */
     private PlannerOutcome answerDefault(Conversation conv, String conversationId, String message,
                                          String material, RoundTrace trace) {
         ChatComposer.ComposedRequest composed =
@@ -243,11 +236,7 @@ public class PlannerRoundHandler implements RoundHandler {
         return arr.toString();
     }
 
-    /**
-     * 把规划模式的一轮对话（用户原话 + 最终回复）写入会话记忆。
-     * 顺序执行期间各步骤都走无记忆 ChatClient、不落库，故在这里统一补写，
-     * 否则 chat_message 里存的是被污染的「指令+上一步输出」，而非用户真正的问题。
-     */
+    /** 把规划模式一轮（用户原话 + 最终回复）写入会话记忆：执行期间各步骤走无记忆 ChatClient，故在此统一补写。 */
     private void savePlannerExchange(String conversationId, String userMessage, String assistantReply) {
         try {
             chatMemory.add(conversationId, List.of(
@@ -262,11 +251,9 @@ public class PlannerRoundHandler implements RoundHandler {
     /**
      * 规划模式一轮的产出。
      *
-     * @param reply            最终回复文本
-     * @param needSaveExchange 是否需要显式把「用户原话 → 最终回复」写入记忆：
-     *                         多步执行为 {@code true}（执行期全程不写记忆）；
-     *                         回退到通用助手为 {@code false}（记忆 Advisor 已自动落库，重复写会出现两遍）
-     * @param citations        最终回复引用到的 RAG 来源（取产出该回复那一步的引用；无则为空表）
+     * @param needSaveExchange 是否需显式写「用户原话 → 最终回复」：多步执行为 true（执行期全程不写记忆）；
+     *                         回退通用助手为 false（Advisor 已自动落库，重复写会出现两遍）
+     * @param citations        最终回复引用的 RAG 来源（取产出该回复那一步；无则为空表）
      */
     private record PlannerOutcome(String reply, boolean needSaveExchange, List<KbCitation> citations) {
     }
@@ -275,7 +262,7 @@ public class PlannerRoundHandler implements RoundHandler {
     private record StepsOutcome(String reply, List<KbCitation> citations) {
     }
 
-    /** 顺序执行的一个步骤：执行哪个智能体 + 给它的补充指令（被 executeSteps 消费）。 */
+    /** 顺序执行的一个步骤：执行哪个智能体 + 给它的补充指令。 */
     private record StepSpec(Agent agent, String instruction) {
     }
 }

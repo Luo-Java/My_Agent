@@ -34,18 +34,10 @@ import java.util.List;
 import org.luo.service.ChatService;
 
 /**
- * 会话管理接口（与对话业务分离）。
+ * 会话管理接口（与对话业务分离，send/stream 见 ChatController）。
  * <p>
- * 只负责会话本身的增删改查与历史读取；实际对话（send/stream）见 ChatController。
- * 所有会话持久化委托给 ConversationService，智能体名称查询委托给 AgentService。
- * <p>
- * POST   /api/chat/conversation      - 开启新会话，返回会话 ID
- * PUT    /api/chat/conversation/{id} - 重命名会话
- * PUT    /api/chat/conversation/{id}/planner - 更新会话智能规划开关（enabled=true/false，绑定智能体的会话不可开启）
- * PUT    /api/chat/conversation/{id}/rag - 更新会话 RAG 开关（enabled=true/false）
- * DELETE /api/chat/conversation/{id} - 删除会话及其全部消息
- * GET    /api/chat/conversations     - 会话列表（按最近更新倒序）
- * GET    /api/chat/history           - 读取某会话的历史消息
+ * POST/PUT/DELETE /api/chat/conversation[/{id}]、PUT …/{id}/planner、PUT …/{id}/rag、
+ * GET /api/chat/conversations、GET /api/chat/history。
  */
 @Slf4j
 @RestController
@@ -60,13 +52,7 @@ public class ConversationController {
         this.agentService = agentService;
     }
 
-    /**
-     * 开启新会话，返回会话 ID。
-     * 可绑定某个智能体或标记为规划模式（二者互斥）：绑定时以其名称作为会话初始标题。
-     *
-     * @param req 可选：{@code agentId} 绑定的智能体 ID；{@code planner} 规划模式
-     * @return 新会话信息（id / title / createdAt / agentId / planner / ragEnabled）
-     */
+    /** 开启新会话并返回会话 ID；绑定智能体与规划模式互斥（绑定时以其名称作为会话初始标题）。 */
     @PostMapping("/conversation")
     public NewConversationResponse createConversation(@RequestBody(required = false) CreateConversationRequest req) {
         Boolean planner = (req == null) ? null : req.planner();
@@ -85,12 +71,7 @@ public class ConversationController {
         return new NewConversationResponse(c.getId(), c.getTitle(), c.getCreatedAt(), c.getAgentId(), false, c.getRagEnabled());
     }
 
-    /**
-     * 重命名会话。
-     *
-     * @param conversationId 会话 ID
-     * @param request        新标题（自动 trim）
-     */
+    /** 重命名会话（新标题自动 trim）。 */
     @PutMapping("/conversation/{conversationId}")
     public void renameConversation(@PathVariable String conversationId,
                                    @RequestBody RenameConversationRequest request) {
@@ -98,11 +79,8 @@ public class ConversationController {
     }
 
     /**
-     * 更新会话的 RAG 开关（输入框「📚 RAG」开关 = 是否使用知识库检索，写回会话，刷新后保持上次选择）。
-     * 开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，无需手动选库；关闭则不使用 RAG。
-     *
-     * @param conversationId 会话 ID
-     * @param request        {enabled: true=开启 / false=关闭}
+     * 更新会话 RAG 开关（输入框「📚 RAG」写回会话，刷新后保持上次选择）。开启后每轮自动检索
+     * 「通用知识库 + 路由到智能体时其专属库」，无需手动选库；关闭则不使用 RAG。
      */
     @PutMapping("/conversation/{conversationId}/rag")
     public void updateRagEnabled(@PathVariable String conversationId, @RequestBody(required = false) RagEnabledRequest request) {
@@ -110,32 +88,21 @@ public class ConversationController {
     }
 
     /**
-     * 更新会话的智能规划开关（输入框「🧭 智能规划」开关写回，与 RAG 开关对称、拨动即持久化）。
-     * planner 与 agentId 互斥：会话已绑定智能体时开启规划会被拒绝（前端置灰，后端防御校验）。
-     *
-     * @param conversationId 会话 ID
-     * @param request        {enabled: true=开启规划模式 / false=普通对话}
+     * 更新会话智能规划开关（输入框「🧭 智能规划」写回，与 RAG 开关对称）。planner 与 agentId 互斥：
+     * 会话已绑定智能体时开启规划会被拒绝（前端置灰，后端防御校验）。
      */
     @PutMapping("/conversation/{conversationId}/planner")
     public void updatePlannerEnabled(@PathVariable String conversationId, @RequestBody(required = false) PlannerEnabledRequest request) {
         conversationService.updatePlannerSwitch(conversationId, (request == null) ? null : request.enabled());
     }
 
-    /**
-     * 删除会话及其全部消息。
-     *
-     * @param conversationId 要删除的会话 ID
-     */
+    /** 删除会话及其全部消息。 */
     @DeleteMapping("/conversation/{conversationId}")
     public void deleteConversation(@PathVariable String conversationId) {
         conversationService.deleteConversation(conversationId);
     }
 
-    /**
-     * 会话列表，按最近更新时间倒序。
-     *
-     * @return 会话摘要列表（id / title / updatedAt / agentId / planner）
-     */
+    /** 会话列表，按最近更新时间倒序。 */
     @GetMapping("/conversations")
     public List<ConversationSummary> listConversations() {
         return conversationService.listConversations().stream()
@@ -145,13 +112,8 @@ public class ConversationController {
     }
 
     /**
-     * 读取某会话的历史消息（按时间正序）。
-     * <p>
-     * 用户消息会附带本轮附件展示元数据（仅文件名/类型/缩略图 URL，不含正文）；助手消息会附带本轮
-     * RAG 引用来源（[n] 角标与来源列表）。两者都不参与记忆读取，仅供前端渲染，对 LLM 上下文与 token 零影响。
-     *
-     * @param conversationId 会话 ID
-     * @return 会话 ID + 消息列表
+     * 读取某会话的历史消息（按时间正序）。用户消息附带本轮附件展示元数据，助手消息附带本轮 RAG 引用来源；
+     * 两者都不参与记忆读取，仅供前端渲染，对 LLM 上下文与 token 零影响。
      */
     @GetMapping("/history")
     public HistoryResponse history(@RequestParam String conversationId) {

@@ -18,17 +18,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 教育数据分析 SQL 执行工具（只读）。
  * <p>
- * 仅允许对业务数据表执行 <b>SELECT / 含 WITH 的只读查询</b>（表与 agent 系统同库，见 {@link SqlSafety#ALLOWED_TABLES}），
- * 严禁任何写操作，且拒绝多语句（含 {@code ;} 的 SQL），从工具层堵死模型生成破坏性 SQL 的可能。
- * 安全校验（只读关键字 + 业务表白名单）统一走 {@link SqlSafety}。
+ * 仅允许对业务数据表执行 SELECT / 含 WITH 的只读查询，严禁写操作且拒绝多语句（含 {@code ;}），
+ * 从工具层堵死模型生成破坏性 SQL 的可能；安全校验（只读关键字 + 业务表白名单）统一走 {@link SqlSafety}。
  * <p>
- * 失败时返回<b>分类诊断</b>（列名错/表错/语法错/歧义等 + SQL 涉及表的真实列名提示），
- * 给模型的反思纠错回路提供燃料。同时带两层重试保护：
- * <ul>
- *   <li>同一 SQL 连续失败 {@value #MAX_SAME_SQL_FAILS} 次直接拒绝，逼模型换写法；</li>
- *   <li>{@value #FAIL_WINDOW_MS / 1000} 秒窗口内失败超 {@value #MAX_WINDOW_FAILS} 次触发熔断，防止死循环烧 token。</li>
- * </ul>
- * 结果统一以 JSON 数组（每行一个对象）字符串返回给模型，最多 {@value #MAX_ROWS} 行。
+ * 失败时返回<b>分类诊断</b>（列名错/表错/语法错/歧义等 + 涉及表的真实列名），给模型反思纠错回路提供燃料；
+ * 同时带两层重试保护：同一 SQL 连续失败 {@value #MAX_SAME_SQL_FAILS} 次即拒绝，
+ * {@value #FAIL_WINDOW_MS / 1000} 秒窗口内失败超 {@value #MAX_WINDOW_FAILS} 次触发熔断（防死循环烧 token）。
+ * 结果统一以 JSON 数组字符串返回，最多 {@value #MAX_ROWS} 行。
  */
 @Slf4j
 @Service
@@ -46,10 +42,24 @@ public class SqlQueryTool implements ToolProvider {
     /** 窗口内失败次数上限，超过则熔断。 */
     private static final int MAX_WINDOW_FAILS = 10;
 
+    /**
+     * 失败计数表的容量上限（条）。模型每改写一次 SQL 就产生<u>新的</u> key，而 {@link #failCounts}
+     * 原先只在「同一条 SQL 成功」与「全局熔断」时清理 → 失败过的不同 SQL 会长期驻留。
+     * 超过本上限时按<b>最早插入</b>顺序淘汰，让表占用恒定；淘汰的是最久远记录，对防死循环无影响。
+     */
+    private static final int MAX_TRACKED_SQL = 500;
+
     private final JdbcTemplate jdbcTemplate;
 
-    /** 同一 SQL 的失败计数（key=规范化 SQL），成功后清除。 */
+    /** 同一 SQL 的失败计数（key=规范化 SQL），成功后清除；容量由 {@value #MAX_TRACKED_SQL} 兜底。 */
     private final Map<String, AtomicInteger> failCounts = new ConcurrentHashMap<>();
+
+    /**
+     * {@link #failCounts} 的键插入顺序（FIFO），仅用于容量淘汰。执行成功时<b>不</b>回删本队列：
+     * 队列自身按容量自限，残留 key 在淘汰时对 {@code failCounts} 做一次无效 remove 即可（幂等）。
+     * 由此 {@code failCounts} 的键集合恒为本队列的子集，两张结构的占用都有上界。
+     */
+    private final ConcurrentLinkedDeque<String> failKeys = new ConcurrentLinkedDeque<>();
 
     /** 近期失败时间戳队列，用于窗口熔断；执行成功后清空（证明模型已走出失败循环）。 */
     private final ConcurrentLinkedDeque<Long> recentFailTimes = new ConcurrentLinkedDeque<>();
@@ -131,11 +141,19 @@ public class SqlQueryTool implements ToolProvider {
             while (!recentFailTimes.isEmpty() && now - recentFailTimes.peekFirst() > FAIL_WINDOW_MS) {
                 recentFailTimes.pollFirst();
             }
-            int fails = failCounts.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+            // 首次失败时登记插入顺序（get 为 null 表示表中还没有它），供容量淘汰使用
+            AtomicInteger counter = failCounts.get(key);
+            if (counter == null) {
+                counter = failCounts.computeIfAbsent(key, k -> new AtomicInteger());
+                failKeys.addLast(key);
+            }
+            int fails = counter.incrementAndGet();
+            evictOldestFailureCounts(key);
             log.warn("SQL 工具执行失败（同 SQL 第 {} 次）：{}，耗时 {} ms，SQL=\n{}", fails, msg, cost, trimmed);
             if (recentFailTimes.size() >= MAX_WINDOW_FAILS) {
                 recentFailTimes.clear();
                 failCounts.clear();
+                failKeys.clear();
                 log.warn("SQL 工具熔断：{} 秒内失败超过 {} 次，暂停 SQL 执行", FAIL_WINDOW_MS / 1000, MAX_WINDOW_FAILS);
                 return "已熔断：检测到连续多次 SQL 执行失败，已暂停执行。请停下当前循环，向用户说明遇到的问题，不要继续重试。";
             }
@@ -144,9 +162,27 @@ public class SqlQueryTool implements ToolProvider {
     }
 
     /**
-     * 把执行失败信息转成「可行动的诊断」：按 MySQL 错误类型分类给建议，并附上 SQL 涉及表的真实列名，
-     * 让模型不需要再靠猜就能修正。这是反思纠错回路的核心燃料。
+     * 失败计数表的容量淘汰：{@link #failKeys} 超过 {@value #MAX_TRACKED_SQL} 时按最早插入顺序丢弃，
+     * 同步清掉 {@link #failCounts} 对应计数（remove 幂等）。与窗口熔断互补：窗口管「短时间内连续失败」，
+     * 本方法管「长期累计的<u>不同</u>失败 SQL」。
+     *
+     * @param keepKey 本次刚登记的 key；它位于队尾，正常不会被淘汰（防御性判断）
      */
+    private void evictOldestFailureCounts(String keepKey) {
+        while (failKeys.size() > MAX_TRACKED_SQL) {
+            String oldest = failKeys.pollFirst();
+            if (oldest == null) {
+                return;
+            }
+            if (oldest.equals(keepKey)) {
+                failKeys.addLast(oldest);   // 放回队尾，交由下次淘汰处理（正常不会走到）
+                return;
+            }
+            failCounts.remove(oldest);
+        }
+    }
+
+    /** 把执行失败信息转成「可行动的诊断」：按 MySQL 错误类型分类给建议，并附上涉及表的真实列名（反思纠错回路的核心燃料）。 */
     private String diagnoseFailure(String sql, String msg, int fails) {
         StringBuilder sb = new StringBuilder();
         sb.append("查询执行失败（同 SQL 第 ").append(fails).append(" 次，最多 ").append(MAX_SAME_SQL_FAILS).append(" 次）：").append(msg).append("\n");

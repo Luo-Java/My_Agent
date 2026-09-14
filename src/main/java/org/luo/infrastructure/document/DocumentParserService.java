@@ -32,17 +32,11 @@ import java.util.Locale;
 import org.luo.service.KbService;
 
 /**
- * 知识库文件解析：把上传的文档（txt/md/csv 等纯文本 + pdf/docx/xlsx）抽取为纯文本，
- * 交由 {@link KbService} 自动分块 + 向量化入库。
+ * 知识库文件解析：把上传文档抽取为纯文本，交 {@link KbService} 分块 + 向量化入库。
  * <p>
- * 支持的类型与解析方式：
- * <ul>
- *   <li>{@code .txt / .md / .csv / .json / .xml / .yml / .properties / .log}：按文本解码（UTF-8 优先，非法字节回退 GBK）；</li>
- *   <li>{@code .pdf}：Apache PDFBox 文本抽取；</li>
- *   <li>{@code .docx}：POI XWPF 抽取段落 + 表格行；</li>
- *   <li>{@code .xlsx}：POI XSSF 逐工作表逐行取值（单元格经 {@link DataFormatter} 格式化为文本）。</li>
- * </ul>
- * 不支持的扩展名 / 超限文件 / 抽不出文本的文件会抛出 {@link AiBusinessException}（由调用方逐文件隔离处理）。
+ * 支持 txt/md/csv/json/xml/yml/properties/log（文本解码，UTF-8 优先、非法字节回退 GBK）、pdf（PDFBox）、
+ * docx（POI XWPF 段落 + 表格行）、xlsx（POI XSSF 逐表逐行，单元格经 DataFormatter 转文本）。
+ * 不支持的类型 / 超限文件 / 抽不出文本会抛 {@link AiBusinessException}（由调用方逐文件隔离处理）。
  */
 @Slf4j
 @Service
@@ -61,9 +55,9 @@ public class DocumentParserService {
     private static final DataFormatter DATA_FORMATTER = new DataFormatter(Locale.ROOT);
 
     /**
-     * 解析单个上传文件为纯文本（已去除首尾空白、限制最大字符数）。
+     * 解析单个上传文件为纯文本（已去首尾空白、限制最大字符数）。
      *
-     * @throws AiBusinessException 不支持的类型 / 文件为空或超限 / 提取不到文本时抛出
+     * @throws AiBusinessException 不支持的类型 / 文件为空或超限 / 提取不到文本
      */
     public String parse(MultipartFile file) {
         if (file == null || file.isEmpty()) {

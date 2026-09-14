@@ -24,12 +24,8 @@ import java.util.List;
 /**
  * 智能体管理接口。
  * <p>
- * GET    /api/agent                 - 智能体列表（按最近更新倒序）
- * GET    /api/agent/{id}            - 单个智能体详情
- * GET    /api/agent/tools           - 可用工具清单（供「工具装配」选择界面使用）
- * POST   /api/agent                 - 创建智能体
- * DELETE /api/agent/{id}            - 删除智能体（同时解除会话绑定）
- * POST   /api/agent/generate-prompt - 用 AI 根据名称/描述生成系统提示词
+ * GET /api/agent、GET /api/agent/{id}、GET /api/agent/{by-code}/{code}、GET /api/agent/tools、
+ * POST /api/agent/generate-prompt（AI 生成提示词）、POST /api/agent、PUT/DELETE /api/agent/{id}。
  */
 @RestController
 @RequestMapping("/api/agent")
@@ -55,10 +51,7 @@ public class AgentController {
         return agentService.getAgent(id);
     }
 
-    /**
-     * 按智能体编码查询（多智能体协作路由入口）。
-     * 注意：/by-code 为字面量路径，优先于 /{id} 匹配，二者互不冲突。
-     */
+    /** 按智能体编码查询（多智能体协作路由入口）。注意：/by-code 为字面量路径，优先于 /{id} 匹配，二者不冲突。 */
     @GetMapping("/by-code/{code}")
     public Agent getByCode(@PathVariable String code) {
         Agent a = agentService.getByCode(code);
@@ -68,10 +61,7 @@ public class AgentController {
         return a;
     }
 
-    /**
-     * 可用工具清单（供智能体编辑弹窗的「工具装配」区域展示，前端按 group 分组）。
-     * 注意：{@code /tools} 为字面量路径，Spring 匹配优先级高于 {@code /{id}}，不会被当作 ID 解析。
-     */
+    /** 可用工具清单（供智能体编辑弹窗的「工具装配」展示，前端按 group 分组）。/tools 为字面量路径，不会被当作 ID。 */
     @GetMapping("/tools")
     public List<ToolRegistry.ToolInfo> tools() {
         return toolRegistry.getAvailableTools();
@@ -100,12 +90,7 @@ public class AgentController {
         agentService.deleteAgent(id);
     }
 
-    /**
-     * 用 AI 生成系统提示词（不落库，仅返回文本供前端预览后随保存提交）。
-     *
-     * @param req 名称（必填）+ 描述（可选）
-     * @return 生成的提示词
-     */
+    /** 用 AI 生成系统提示词（不落库，仅返回文本供前端预览后随保存提交）。名称必填、描述可选。 */
     @PostMapping("/generate-prompt")
     public GeneratePromptResponse generatePrompt(@RequestBody GeneratePromptRequest req) {
         String prompt = promptService.generateAgentPrompt(req.name(), req.description());

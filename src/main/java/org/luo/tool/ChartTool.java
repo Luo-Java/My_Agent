@@ -14,11 +14,10 @@ import java.util.List;
 /**
  * 图表工具集：
  * <ul>
- *   <li>{@link #chart_histogram}：把一组数值渲染成 Unicode 块状文本直方图（旧版，纯文本兜底）；</li>
- *   <li>{@link #chart_echarts}：生成 ECharts option JSON（柱状图/折线图/饼图/直方图），
- *       返回 ```echarts 代码块，前端识别后渲染为真正的交互图表。</li>
+ *   <li>{@link #chart_echarts}：生成 ECharts option JSON（柱状图/折线图/饼图/直方图），返回 ```echarts
+ *       代码块，前端识别后渲染为真正的交互图表；</li>
+ *   <li>{@link #chart_histogram}：把一组数值渲染成 Unicode 块状文本直方图（纯文本兜底）。</li>
  * </ul>
- * <p>
  * 分桶、计数、百分比、均值/中位数等统计全部由工具精确计算，避免模型手算算术错误。
  */
 @Slf4j
@@ -33,10 +32,7 @@ public class ChartTool implements ToolProvider {
 
     // ==================== ECharts 图表（推荐） ====================
 
-    /**
-     * 生成 ECharts 图表 JSON：支持 bar（柱状图）、line（折线图）、pie（饼图）、histogram（直方图）。
-     * 返回一个 ```echarts 代码块，模型须原样嵌入回复，前端会把它渲染成真正的交互图表。
-     */
+    /** 生成 ECharts 图表 JSON（bar/line/pie/histogram），返回 ```echarts 代码块，模型须原样嵌入回复。 */
     @Tool(description = "生成 ECharts 图表 JSON（柱状图/折线图/饼图/直方图），返回一个 ```echarts 代码块，把它原样嵌入回复即可在前端渲染成真正的图表。\n" +
             "用法：先用 query 取到数据，再调用本工具生成图表。\n" +
             "参数：type 图表类型（bar 柱状图 / line 折线图 / pie 饼图 / histogram 直方图，默认 bar）；title 图表标题；\n" +
@@ -225,10 +221,7 @@ public class ChartTool implements ToolProvider {
 
     // ==================== 文本直方图（旧版兜底） ====================
 
-    /**
-     * 把一组数值渲染成 Unicode 块状文本直方图（分布图），返回纯文本。
-     * 供模型在无法渲染 ECharts 的极端场景兜底使用；一般场景优先用 {@link #chart_echarts}。
-     */
+    /** 把一组数值渲染成 Unicode 块状文本直方图，供模型在无法渲染 ECharts 的极端场景兜底（一般场景优先 {@link #chart_echarts}）。 */
     @Tool(description = "把一组数值渲染成文本直方图（分布图），返回纯文本图表（含分桶计数、百分比、均值/中位数等统计）。\n" +
             "适合「成绩分布」「直方图」等场景。用法：先用 query 查询拿到数值列表，再把数值数组（JSON 文本）传给本工具。\n" +
             "参数：title 图表标题；data 数值数组 JSON（如 [78,85,92,60,73]）；bucketSize 分桶宽度（默认 10，成绩分布用 10 即可）；\n" +
@@ -293,10 +286,7 @@ public class ChartTool implements ToolProvider {
     private record BinResult(int lo, int hi, int[] counts, int buckets, int total) {
     }
 
-    /**
-     * 对数值分桶：桶边界自动取整（floor(最小/bs)*bs ~ ceil(最大/bs)*bs），
-     * 分桶数超过 {@link #MAX_BUCKETS} 时抛 {@link IllegalArgumentException}。
-     */
+    /** 对数值分桶：桶边界自动取整（floor(最小/bs)*bs ~ ceil(最大/bs)*bs），桶数超过 {@link #MAX_BUCKETS} 时抛异常。 */
     private BinResult bucketize(List<Double> values, int bs, Integer min, Integer max) {
         double dataMin = values.stream().mapToDouble(Double::doubleValue).min().orElse(0);
         double dataMax = values.stream().mapToDouble(Double::doubleValue).max().orElse(0);

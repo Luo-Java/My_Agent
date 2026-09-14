@@ -36,13 +36,7 @@ public class ConversationService {
         this.chatMessageMapper = chatMessageMapper;
     }
 
-    /**
-     * 创建新会话，可绑定某个智能体（其名称作为会话初始标题）。
-     *
-     * @param agentId   绑定的智能体 ID；null 表示使用默认助手
-     * @param agentName 智能体名称，用于设置会话初始标题
-     * @return 新建的会话记录
-     */
+    /** 创建新会话，可绑定智能体（其名称作为初始标题）。 */
     @Transactional
     public Conversation createConversation(Long agentId, String agentName) {
         log.info("创建会话：agentId={}", agentId);
@@ -62,30 +56,19 @@ public class ConversationService {
         return c;
     }
 
-    /**
-     * 创建新会话（默认助手，不绑定智能体）。
-     *
-     * @return 新建的会话记录
-     */
+    /** 创建新会话（默认助手，不绑定智能体）。 */
     public Conversation createConversation() {
         return createConversation(null, null);
     }
 
-    /**
-     * 创建新会话（支持绑定智能体或标记为规划模式会话）。
-     *
-     * @param agentId   绑定的智能体 ID；null 表示不绑定智能体
-     * @param agentName 智能体名称，用于设置会话初始标题
-     * @param planner   是否规划模式会话（true 时以「🧭 智能规划」为标题，与 agentId 互斥）
-     * @return 新建的会话记录
-     */
+    /** 创建新会话：可绑定智能体或标记为规划模式（planner 优先，与 agentId 互斥）。 */
     @Transactional
     public Conversation createConversation(Long agentId, String agentName, boolean planner) {
         log.info("创建会话：agentId={}，planner={}", agentId, planner);
         Conversation c = new Conversation();
         c.setId(UUID.randomUUID().toString());
         if (planner) {
-            // 规划模式会话：不参与 Agent 路由，由 ChatService 交给动态规划器编排多智能体步骤
+            // 规划模式会话：不参与 Agent 路由
             c.setPlanner(true);
             c.setTitle("🧭 智能规划");
         } else if (agentId != null) {
@@ -102,22 +85,13 @@ public class ConversationService {
         return c;
     }
 
-    /**
-     * 创建规划模式会话（动态规划器，运行时由 LLM 规划多智能体步骤）。
-     *
-     * @return 新建的会话记录
-     */
+    /** 创建规划模式会话。 */
     @Transactional
     public Conversation createPlannerConversation() {
         return createConversation(null, null, true);
     }
 
-    /**
-     * 重命名会话（手动修改标题）。
-     *
-     * @param conversationId 会话 ID
-     * @param title          新标题（自动 trim）
-     */
+    /** 重命名会话（标题自动 trim）。 */
     @Transactional
     public void renameConversation(String conversationId, String title) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -128,13 +102,7 @@ public class ConversationService {
                 .set(Conversation::getTitle, title == null ? "" : title.trim()));
     }
 
-    /**
-     * 更新会话的规划模式标记（输入框「智能规划」开关写回会话，刷新后保持上次选择）。
-     * 仅更新 planner 单列，避免把不相关的内存态覆盖回数据库。
-     *
-     * @param conversationId 会话 ID
-     * @param planner        true=规划模式，false=普通对话
-     */
+    /** 更新 planner 单列（不覆盖其他内存态字段）。 */
     public void updatePlanner(String conversationId, boolean planner) {
         if (conversationId == null || conversationId.isBlank()) return;
         conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
@@ -144,12 +112,8 @@ public class ConversationService {
     }
 
     /**
-     * 更新会话的智能规划开关（输入框「🧭 智能规划」开关写回，拨动即持久化，与 RAG 开关对称）。
-     * 仅更新 planner 单列。planner 与 agentId 互斥：开启规划且会话已绑定智能体时拒绝。
-     *
-     * @param conversationId 会话 ID
-     * @param enabled        true=规划模式，false=普通对话；null 按 false 处理
-     * @throws AiBusinessException 开启规划但会话已绑定智能体（planner 与 agentId 互斥）
+     * 前端「🧭 智能规划」开关写回（仅 planner 单列）。<b>planner 与 agentId 互斥</b>：
+     * 开启规划且会话已绑定智能体时抛 {@link AiBusinessException}。
      */
     @Transactional
     public void updatePlannerSwitch(String conversationId, Boolean enabled) {
@@ -169,14 +133,7 @@ public class ConversationService {
         log.debug("更新会话规划开关：id={}，enabled={}", conversationId, on);
     }
 
-    /**
-     * 更新会话的 RAG 开关（输入框「📚 RAG」开关写回会话，刷新后保持上次选择）。
-     * 仅更新 rag_enabled 单列；true=开启自动检索（通用知识库 + 路由到智能体时其专属库）。
-     * 不校验库是否存在：库/智能体被删除后检索侧查不到库自动降级为不带资料。
-     *
-     * @param conversationId 会话 ID
-     * @param enabled        true=开启 RAG；false=关闭
-     */
+    /** 前端「📚 RAG」开关写回（仅 rag_enabled 单列）。不校验库是否存在：库被删则检索侧自动降级为不带资料。 */
     public void updateRagEnabled(String conversationId, Boolean enabled) {
         if (conversationId == null || conversationId.isBlank()) return;
         conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
@@ -185,11 +142,7 @@ public class ConversationService {
         log.debug("更新会话 RAG 开关：id={}，enabled={}", conversationId, Boolean.TRUE.equals(enabled));
     }
 
-    /**
-     * 删除会话及其全部消息（级联删除 chat_message）。
-     *
-     * @param conversationId 要删除的会话 ID
-     */
+    /** 删除会话及其全部消息。 */
     @Transactional
     public void deleteConversation(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -200,24 +153,14 @@ public class ConversationService {
         conversationMapper.deleteById(conversationId);
     }
 
-    /**
-     * 列出会话，按最近更新时间倒序。
-     *
-     * @return 会话列表
-     */
+    /** 列出会话，按最近更新时间倒序。 */
     public List<Conversation> listConversations() {
         QueryWrapper<Conversation> qw = new QueryWrapper<>();
         qw.orderByDesc("updated_at");
         return conversationMapper.selectList(qw);
     }
 
-    /**
-     * 会话内当前最大消息 ID（无消息返回 null）。用于在落库前记录水位，
-     * 事后只把附件元数据写到「本轮新增」的用户消息上，避免解析早期失败时误挂到上一条。
-     *
-     * @param conversationId 会话 ID
-     * @return 最大消息 ID；会话无消息时为 null
-     */
+    /** 会话内当前最大消息 ID（无消息返回 null）：落库前的「水位」。 */
     public Long maxMessageId(String conversationId) {
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId).orderByDesc("id").last("LIMIT 1");
@@ -226,15 +169,8 @@ public class ConversationService {
     }
 
     /**
-     * 把本轮附件元数据 JSON 写到「{@code id > afterId} 的最新一条用户消息」上。
-     * <p>
-     * 仅服务历史回看（缩略图 / 下载）：该列<b>不参与记忆读取</b>（DbChatMemory.get 只取 content），
-     * 因此对 LLM 上下文与 token 零影响。{@code afterId} 为落库前水位（见 {@link #maxMessageId}），
-     * 防止本轮在写用户消息前就失败时，错误地把附件挂到历史消息上。
-     *
-     * @param conversationId 会话 ID
-     * @param afterId        水位：只更新 id 大于该值的用户消息；null 表示不限（更新最新一条）
-     * @param attachmentsJson 附件元数据 JSON 数组；空则不处理
+     * 附件元数据写到「{@code id > afterId} 的最新一条用户消息」。仅历史回看用、不参与记忆读取；
+     * {@code afterId}（见 {@link #maxMessageId}）防止本轮失败时误挂到历史消息。
      */
     @Transactional
     public void attachToLatestUserMessage(String conversationId, Long afterId, String attachmentsJson) {
@@ -257,19 +193,7 @@ public class ConversationService {
         log.debug("附件元数据写入：会话={}，消息={}", conversationId, last.getId());
     }
 
-    /**
-     * 把本轮 RAG 引用来源 JSON 写到「{@code id > afterId} 的最新一条助手消息」上。
-     * <p>
-     * 与 {@link #attachToLatestUserMessage} 完全对称（后者挂 user 消息的附件、本方法挂 assistant 消息的引用），
-     * 落库时机都在本轮回复产出之后：助手消息由记忆 Advisor / 规划补写插入，因此用「水位」限定范围，
-     * 避免本轮在插入助手消息前就失败时，把引用错误地挂到上一条历史回复上。
-     * <p>
-     * 该列同样<b>不参与记忆读取</b>（DbChatMemory.get 只取 content），仅供前端渲染 [n] 角标与来源列表。
-     *
-     * @param conversationId 会话 ID
-     * @param afterId        水位：只更新 id 大于该值的助手消息；null 表示不限（更新最新一条）
-     * @param citationsJson  引用来源 JSON 数组；空则不处理
-     */
+    /** RAG 引用写到「{@code id > afterId} 的最新一条助手消息」，与附件元数据完全对称，仅供前端渲染 [n] 角标。 */
     @Transactional
     public void attachCitationsToLatestAssistantMessage(String conversationId, Long afterId, String citationsJson) {
         if (conversationId == null || conversationId.isBlank()
@@ -292,30 +216,20 @@ public class ConversationService {
     }
 
     /**
-     * 读取某会话的历史消息，按时间正序。
-     *
-     * @param conversationId 会话 ID
-     * @return 该会话的全部历史消息（从第一条到最后一条）
+     * 读取会话全部历史，按时间正序。<b>排序必须带 id tiebreaker</b>：{@code created_at} 是秒级 DATETIME，
+     * 同一轮 user/assistant 时间相同，只按它排序时顺序取决于执行计划，改走 filesort 就会错序。
      */
     public List<ChatMessage> getHistory(String conversationId) {
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
-        qw.eq("conversation_id", conversationId).orderByAsc("created_at");
+        qw.eq("conversation_id", conversationId).orderByAsc("created_at").orderByAsc("id");
         return chatMessageMapper.selectList(qw);
     }
 
     /**
-     * 读取某会话最近的 N 条历史消息（按时间正序返回）。
-     * <p>
-     * 内部先按 {@code created_at} 倒序取最近 N 条再反转成正序——供记忆窗口读取
-     * （DbChatMemory）使用，避免长会话每轮全量 selectList 后再在内存截断。
-     * <p>
-     * 注意：为让「倒序取最近 N 条」走索引，需要 {@code (conversation_id, created_at)} 复合索引；
-     * 新建库已由 schema.sql 创建，存量库请手动执行：
-     * {@code ALTER TABLE chat_message ADD INDEX idx_conv_created (conversation_id, created_at);}
+     * 读取最近 N 条历史（时间正序）：先按 {@code created_at, id} 倒序取 N 条再反转，供记忆窗口读取，
+     * 避免长会话每轮全量加载。走索引需 {@code (conversation_id, created_at)} 复合索引（schema.sql 已建）。
      *
-     * @param conversationId 会话 ID
-     * @param limit          最多取多少条；小于等于 0 时退化为全量查询（兼容原行为）
-     * @return 该会话最近的 N 条消息，按时间正序
+     * @param limit &lt;= 0 时退化为全量查询
      */
     public List<ChatMessage> getRecentHistory(String conversationId, int limit) {
         if (limit <= 0) {
@@ -323,7 +237,7 @@ public class ConversationService {
         }
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId)
-                .orderByDesc("created_at")
+                .orderByDesc("created_at").orderByDesc("id")
                 .last("LIMIT " + limit);   // limit 为受控 int 参数，无注入风险
         List<ChatMessage> list = chatMessageMapper.selectList(qw);
         java.util.Collections.reverse(list); // 倒序取回后恢复正序
@@ -331,23 +245,37 @@ public class ConversationService {
     }
 
     /**
-     * 查询指定会话的记录。
-     *
-     * @param conversationId 会话 ID
-     * @return 会话对象，不存在则返回 null
+     * 统计消息总条数（只走 count）。供 {@code MemoryMergeService} 把窗口起点换算成绝对索引：
+     * 摘要侧与注入侧必须基于同一段列表，否则会出现「既不摘要也不注入」的记忆空洞。
      */
+    public int countMessages(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return 0;
+        Long n = chatMessageMapper.selectCount(
+                new QueryWrapper<ChatMessage>().eq("conversation_id", conversationId));
+        return n == null ? 0 : n.intValue();
+    }
+
+    /**
+     * 取时间正序下的第 {@code [fromIndex, toIndex)} 条消息（只读「尚未摘要的那一段」）。
+     * <b>依赖契约「chat_message 不做物理删除」</b>——有删除则索引区间漂移、摘要水位失准。排序同 {@link #getHistory}。
+     */
+    public List<ChatMessage> getMessagesRange(String conversationId, int fromIndex, int toIndex) {
+        if (conversationId == null || conversationId.isBlank() || toIndex <= fromIndex || fromIndex < 0) {
+            return List.of();
+        }
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId)
+                .orderByAsc("created_at").orderByAsc("id")
+                .last("LIMIT " + fromIndex + ", " + (toIndex - fromIndex));   // 受控 int 参数，无注入风险
+        return chatMessageMapper.selectList(qw);
+    }
+
+    /** 查询会话记录，不存在返回 null。 */
     public Conversation getConversation(String conversationId) {
         return conversationMapper.selectById(conversationId);
     }
 
-    /**
-     * 若该会话尚不存在则补建一条记录（默认助手，无智能体绑定），并返回会话对象。
-     * 已存在则直接返回，避免调用方再查一次库。
-     * 用于确保每次 chat/stream 调用前会话已就绪，并复用本次查询结果。
-     *
-     * @param conversationId 会话 ID
-     * @return 会话对象；conversationId 为空时返回 null
-     */
+    /** 会话不存在则补建（默认助手）并返回，存在则直接返回，供 chat/stream 复用本次查询结果。 */
     @Transactional
     public Conversation ensureConversation(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return null;
@@ -365,12 +293,7 @@ public class ConversationService {
         return c;
     }
 
-    /**
-     * 批量落库消息（由 DbChatMemory 在 ChatMemory.add 时调用）。
-     * 同一批内的 created_at 依次递增（由调用方填充），保证顺序稳定。
-     *
-     * @param messages 待落库的消息列表（已含 conversationId / role / content）
-     */
+    /** 批量落库消息（DbChatMemory 在 ChatMemory.add 时调用）。 */
     @Transactional
     public void saveMessages(List<ChatMessage> messages) {
         if (messages == null || messages.isEmpty()) return;
@@ -381,28 +304,27 @@ public class ConversationService {
     }
 
     /**
-     * 清空指定会话的全部消息（保留会话本身），用于 ChatMemory.clear。
-     *
-     * @param conversationId 会话 ID
+     * 清空会话全部消息（保留会话本身），用于 ChatMemory.clear。
+     * <b>必须与摘要水位一起归零</b>：否则 summary 指向不存在的历史，且打破 {@link #getMessagesRange} 的索引契约。
      */
     @Transactional
     public void clearMessages(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
-        log.info("清空会话消息：id={}", conversationId);
+        log.info("清空会话消息并重置摘要水位：id={}", conversationId);
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
         chatMessageMapper.delete(qw);
+        // 摘要与水位同步归零
+        Conversation c = conversationMapper.selectById(conversationId);
+        if (c != null) {
+            c.setSummary(null);
+            c.setCoreFacts(null);
+            c.setSummarizedCount(0);
+            conversationMapper.updateById(c);
+        }
     }
 
-    /**
-     * 更新会话的更新时间；未手动命名的会话用首条用户消息作为会话标题。
-     * <p>
-     * 保持 select+update 两趟（而非单趟条件 UPDATE）：必须先读原标题才能判断「是否为新对话、
-     * 需要自动命名」，该判断无法用单条 SQL 原子表达。
-     *
-     * @param conversationId 会话 ID
-     * @param userText       当前用户输入，首次时截取前 20 字作标题
-     */
+    /** 更新时间戳；标题仍为「新对话」时用首条用户消息前 20 字自动命名（需先读原标题，故走 select+update）。 */
     public void touchConversation(String conversationId, String userText) {
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null) return;
@@ -418,14 +340,7 @@ public class ConversationService {
         }
     }
 
-    /**
-     * 落库一次「追问交互」：用户本轮输入 + 生成的追问文本（user + assistant 两条）。
-     * 由 ChatService 在确认进入追问分支、且非话题切换时调用，确保每轮只落库一次。
-     *
-     * @param conversationId 会话 ID
-     * @param userText       用户本轮输入
-     * @param assistantText  生成的追问文本（带 CLARIFY_PREFIX 前缀）
-     */
+    /** 落库一次追问交互（user + assistant 两条）。 */
     @Transactional
     public void saveClarifyExchange(String conversationId, String userText, String assistantText) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -439,19 +354,14 @@ public class ConversationService {
         a.setConversationId(conversationId);
         a.setRole("assistant");
         a.setContent(assistantText);
-        a.setCreatedAt(now.plusNanos(1000));   // 保证 user 早于 assistant 的顺序
+        // 与 user 共用同一时间：created_at 是秒级 DATETIME，纳秒偏移会被静默截断；
+        // user 早于 assistant 的顺序由自增主键 id 兜底（读取一律 ORDER BY created_at, id）。
+        a.setCreatedAt(now);
         chatMessageMapper.insert(u);
         chatMessageMapper.insert(a);
     }
 
-    /**
-     * 中途绑定智能体到会话（用于追问流程：路由命中某带 paramSchema 的 agent 并进入追问时，
-     * 把该 agent 记到会话上，使下一轮用户的追问回答能复用同一 agent 继续补全参数，而不被当作
-     * 全新问题重新路由导致 agent 丢失）。
-     *
-     * @param conversationId 会话 ID
-     * @param agentId        要绑定的智能体 ID（null 时忽略）
-     */
+    /** 追问流程临时绑定智能体（来源 CLARIFY），使下一轮回答能复用同一 agent 继续补参。 */
     @Transactional
     public void bindAgent(String conversationId, Long agentId) {
         if (conversationId == null || conversationId.isBlank() || agentId == null) return;
@@ -463,12 +373,7 @@ public class ConversationService {
         log.info("绑定智能体：会话={}，agentId={}，来源=CLARIFY", conversationId, agentId);
     }
 
-    /**
-     * 解绑会话上的智能体（参数齐全、给出正式回答后调用，使后续轮次恢复正常智能路由，
-     * 不被追问期间临时绑定的 agent 长期粘住）。显式绑定（用户主动选 agent）的不应调用此方法。
-     *
-     * @param conversationId 会话 ID
-     */
+    /** 解绑追问期临时绑定的智能体（给正式回答后调用）；显式绑定不应调用。 */
     @Transactional
     public void unbindAgent(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -483,15 +388,7 @@ public class ConversationService {
         log.info("解绑智能体：会话={}", conversationId);
     }
 
-    /**
-     * 写入会话的长期记忆：滚动摘要 + 用户核心信息 + 已覆盖条数（一次 UPDATE）。
-     * 当历史超出窗口时，ChatService 会批量调用此方法持久化。
-     *
-     * @param conversationId  会话 ID
-     * @param summary         滚动摘要文本
-     * @param coreFacts       用户核心信息（关键事实清单）；无则传 null
-     * @param summarizedCount 已被摘要覆盖的最旧消息条数（按时间正序索引）
-     */
+    /** 写入长期记忆：滚动摘要 + 核心信息 + 已覆盖条数（一次 UPDATE）。 */
     @Transactional
     public void updateMemory(String conversationId, String summary, String coreFacts, int summarizedCount) {
         log.info("更新长期记忆：会话={}，已覆盖条数={}，摘要长度={}，关键事实长度={}",
