@@ -42,8 +42,20 @@ public class PlannerService {
         this.promptProperties = promptProperties;
     }
 
-    /** 计划中的一步：调用哪个智能体（按 agentCode）+ 给该智能体的指令。 */
-    public record PlanStep(String agentCode, String instruction) {}
+    /**
+     * 计划中的一步：调用哪个智能体（按 agentCode）+ 给该智能体的指令 + 对前序步骤的依赖。
+     *
+     * @param agentCode   目标智能体编码
+     * @param instruction 给该智能体的指令（含必要上下文与用户原始诉求）
+     * @param dependsOn   依赖的前序步骤下标（0 基，指向 {@code steps} 数组里的更早位置）；空表=无依赖、
+     *                    可与同层其它无依赖步骤并行执行
+     */
+    public record PlanStep(String agentCode, String instruction, List<Integer> dependsOn) {
+        /** 无依赖步骤的便捷构造（向后兼容：未标注依赖即视为可立即执行）。 */
+        public PlanStep(String agentCode, String instruction) {
+            this(agentCode, instruction, List.of());
+        }
+    }
 
     /**
      * 动态规划：根据用户目标与可用智能体清单，让 LLM 产出「顺序执行」计划。
@@ -75,7 +87,7 @@ public class PlannerService {
         }
     }
 
-    /** 解析规划回复为步骤列表：识别 {@code steps} 数组，逐个取 agentCode + instruction（Hutool JSONUtil，规避 Jackson）。 */
+    /** 解析规划回复为步骤列表：识别 {@code steps} 数组，逐个取 agentCode + instruction + dependsOn（Hutool JSONUtil，规避 Jackson）。 */
     private List<PlanStep> parsePlan(String reply) {
         try {
             JSONObject obj = JSONUtil.parseObj(reply);
@@ -86,13 +98,32 @@ public class PlannerService {
                 if (!(o instanceof JSONObject js)) continue;
                 String code = js.getStr("agentCode");
                 if (code == null || code.isBlank()) continue;
-                out.add(new PlanStep(code.trim(), js.getStr("instruction")));
+                List<Integer> deps = parseDeps(js.getJSONArray("dependsOn"));
+                out.add(new PlanStep(code.trim(), js.getStr("instruction"), deps));
             }
             return out;
         } catch (Exception e) {
             log.warn("动态规划：JSON 解析失败，回退普通回答：{}", e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * 解析 {@code dependsOn} 数组为前序步骤下标列表。缺省 / 非数组 / 元素非法 → 空表（无依赖、可并行）。
+     * 只接受非负整数；下标越界或指向自身/后序步骤由执行层防御（这里不拦截，避免解析层承担执行语义）。
+     */
+    private static List<Integer> parseDeps(JSONArray deps) {
+        if (deps == null || deps.isEmpty()) return List.of();
+        List<Integer> out = new ArrayList<>();
+        for (Object d : deps) {
+            if (d instanceof Integer i && i >= 0) {
+                out.add(i);
+            } else if (d instanceof Number n) {
+                int i = n.intValue();
+                if (i >= 0) out.add(i);
+            }
+        }
+        return out;
     }
 
     /** 去掉可能残留的 ```json ... ``` 代码块围栏，只保留内部 JSON。 */

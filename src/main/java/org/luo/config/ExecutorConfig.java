@@ -58,6 +58,25 @@ public class ExecutorConfig {
     }
 
     /**
+     * 规划步骤并行执行专用线程池。动态规划器把「无依赖的步骤」同层并发调 LLM（阻塞 IO + 相互独立），
+     * 把 N 步的串行等待压成 1 轮。规划步骤数通常 2~4，核心 4 / 最大 8 / 队列 64 足够；队列满抛
+     * {@link java.util.concurrent.RejectedExecutionException}，由 PlannerRoundHandler 捕获后该步降级串行（详见其 runStep）。
+     */
+    @Bean("plannerStepExecutor")
+    public Executor plannerStepExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(4);
+        ex.setMaxPoolSize(8);
+        ex.setQueueCapacity(64);
+        ex.setKeepAliveSeconds(60);
+        ex.setThreadNamePrefix("planner-step-");
+        ex.setWaitForTasksToCompleteOnShutdown(true);
+        ex.setAwaitTerminationSeconds(10);
+        ex.initialize();
+        return ex;
+    }
+
+    /**
      * 前置链预取专用线程池（多轮查询改写）。一轮对话在「正式回答」前有三段独立模型往返：路由、参数抽取、
      * 检索问题改写；前两者有数据依赖，只有改写完全独立（只看用户原话与会话历史），故提交到本池与前置链
      * 并行，把它的耗时藏到路由/参数抽取背后。核心 4 / 最大 8 / 队列 256；队列满抛

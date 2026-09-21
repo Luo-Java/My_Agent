@@ -3,749 +3,118 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Spring AI 智能对话</title>
-    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-    <link rel="stylesheet" href="/css/style.css" />
+    <meta name="description" content="My_Agent —— 多智能体协作平台：规划、检索、数据分析与工具调用" />
+    <title>My_Agent · 多智能体协作平台</title>
+    <link rel="stylesheet" href="/css/landing.css" />
 </head>
 <body>
-<div id="app">
-    <aside class="sidebar">
-        <!-- 新建对话主按钮（侧边栏顶部） -->
-        <div class="sidebar-actions">
-            <button class="new-chat-btn" @click="goChat">＋ 新建对话</button>
+<!-- 背景层：粒子网络画布 + 网格 + 扫描线 -->
+<canvas id="net"></canvas>
+<div class="grid-overlay"></div>
+<div class="scanline"></div>
+
+<div class="shell">
+    <header class="nav rise d1">
+        <div class="brand">
+            <span class="brand-mark">
+                <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M13 2L4.5 13.5H11L10 22l8.5-11.5H12z" fill="#04101f" />
+                </svg>
+            </span>
+            <span>My_Agent</span>
+        </div>
+        <div class="nav-right">
+            <span class="dot"></span>
+            <span>服务就绪</span>
+        </div>
+    </header>
+
+    <main class="hero">
+        <span class="badge rise d2"><i></i>Spring Boot 4.0.7 · Spring AI 2.0.0</span>
+
+        <h1 class="rise d3">多智能体协作平台</h1>
+
+        <p class="sub rise d4">
+            <span id="typed"></span><span class="caret"></span>
+        </p>
+
+        <div class="cta-row rise d5">
+            <!-- chat.html 进入与刷新都落在空白欢迎页，不自动打开最近会话（见 app.js onMounted） -->
+            <a class="cta" href="/chat.html">
+                进入控制台
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 12h13M13 6l6 6-6 6" />
+                </svg>
+            </a>
+            <p class="hint">或按 <kbd>Enter</kbd> 直接进入</p>
         </div>
 
-        <!-- 智能体入口（点击后在右侧主区域展示列表，避免侧边栏拥挤） -->
-        <div class="sidebar-section agents-section">
-            <button class="agent-entry" @click="goAgents" :class="{ active: mainView === 'agents' }">
-                <span class="agent-entry-icon">🤖</span>
-                <span class="agent-entry-label">智能体</span>
-                <span class="agent-entry-count">{{ agents.length }}</span>
-                <span class="agent-entry-arrow">›</span>
-            </button>
-        </div>
+        <section class="cards">
+            <article class="card rise d5">
+                <div class="card-ico">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="9" y="2.5" width="6" height="5" rx="1.5" />
+                        <rect x="2.5" y="16.5" width="6" height="5" rx="1.5" />
+                        <rect x="15.5" y="16.5" width="6" height="5" rx="1.5" />
+                        <path d="M12 7.5v4M5.5 16.5v-2.5h13v2.5" />
+                    </svg>
+                </div>
+                <h3>智能规划</h3>
+                <p>任务拆成执行图逐步推进，缺参数先澄清再动手</p>
+            </article>
 
-        <!-- 知识库入口（RAG：会话开启 📚 RAG 开关后自动检索通用知识库 + 路由智能体的专属库） -->
-        <div class="sidebar-section kb-section">
-            <button class="agent-entry" @click="goKbs" :class="{ active: mainView === 'kbs' }">
-                <span class="agent-entry-icon">📚</span>
-                <span class="agent-entry-label">知识库</span>
-                <span class="agent-entry-count">{{ kbs.length }}</span>
-                <span class="agent-entry-arrow">›</span>
-            </button>
-        </div>
+            <article class="card rise d6">
+                <div class="card-ico">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M4.5 4.5h9l4 4v11h-13z" />
+                        <path d="M13.5 4.5v4h4" />
+                        <path d="M8 13h6M8 16.5h4" />
+                    </svg>
+                </div>
+                <h3>知识检索</h3>
+                <p>多路召回加精排，作答带引用来源可追溯</p>
+            </article>
 
-        <!-- 动态规划模式：入口改为聊天输入框左下角的「🧭 智能规划」开关（勾选=本轮及后续按规划模式执行） -->
+            <article class="card rise d7">
+                <div class="card-ico">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3.5 20.5h17" />
+                        <path d="M7 20.5v-6M12 20.5v-10M17 20.5v-4" />
+                    </svg>
+                </div>
+                <h3>数据分析</h3>
+                <p>自然语言转只读查询，结果直接出图</p>
+            </article>
 
-        <!-- 对话历史分区（下方，占满剩余高度） -->
-        <div class="sidebar-section conv-section">
-            <div class="sidebar-head">
-                <span>对话历史</span>
-            </div>
-            <ul class="conv-list">
-                <li v-for="c in conversations" :key="c.id"
-                    :class="{ active: c.id === currentId && mainView === 'chat' }"
-                    @click="selectConversation(c.id)">
-                    <template v-if="editingId === c.id">
-                        <input class="conv-edit" v-model="editingTitle"
-                               @click.stop
-                               @keydown.enter.prevent="commitEdit"
-                               @keydown.esc.prevent="editingId = null"
-                               @blur="commitEdit" />
-                    </template>
-                    <template v-else>
-                        <span class="conv-title" @dblclick.stop="startEdit(c)">{{ c.title || '新对话' }}</span>
-                        <span class="conv-agent" v-if="c.agentId && agentName(c.agentId)">{{ agentIcon(c.agentId) }}{{ agentName(c.agentId) }}</span>
-                        <span class="conv-planner" v-else-if="c.planner">🧭 规划</span>
-                        <button class="conv-edit-btn" title="重命名" @click.stop="startEdit(c)">✎</button>
-                        <button class="conv-del-btn" title="删除对话" @click.stop="deleteConversation(c.id)">🗑</button>
-                    </template>
-                </li>
-                <li v-if="conversations.length === 0" class="conv-empty">暂无会话，点击「＋ 新建对话」开始</li>
-            </ul>
-        </div>
-    </aside>
-
-    <main class="chat">
-        <!-- ===== 聊天视图 ===== -->
-        <template v-if="mainView === 'chat'">
-            <header>
-                <span class="dot"></span>
-                <span>Spring AI 智能对话</span>
-                <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
-                <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
-                <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
-                <!-- 访问密钥：服务端配置 app.api-key / APP_API_KEY 后，这里填入相同值即可正常调用；
-                     只存本浏览器 localStorage，不随页面源码分发。未启用服务端鉴权时留空即可。 -->
-                <button class="trace-btn key-btn" :class="{ 'key-btn-on': apiKeySet }" @click="editApiKey"
-                        :title="apiKeySet ? '已保存访问密钥（点击可修改或清除）' : '服务端启用 APP_API_KEY 后，在此填入相同密钥（仅存于本浏览器）'">
-                    🔑 {{ apiKeySet ? '已授权' : '访问密钥' }}
-                </button>
-                <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
-                <button v-if="currentId" class="trace-btn" @click="openTrace"
-                        title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
-            </header>
-            <div class="messages" ref="scroll">
-                <div class="empty" v-if="messages.length === 0">
-                    <div class="big">💬</div>
-                    <div>向 Spring AI 提问吧，支持多轮对话与历史记忆</div>
-                    <div v-if="currentAgentName" class="empty-sub">当前智能体：{{ currentAgentIcon }} {{ currentAgentName }}</div>
-                <div v-if="currentPlanner" class="empty-sub">规划模式下，描述你的目标，AI 会自动编排多个智能体协同完成</div>
+            <article class="card rise d8">
+                <div class="card-ico">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="4" y="10" width="16" height="9" rx="2" />
+                        <path d="M8 10V6M16 10V6M9.5 14.5h5" />
+                    </svg>
                 </div>
-                <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role === 'user' ? 'user' : 'ai'">
-                    <div class="avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
-                    <div class="bubble">
-                        <!-- 执行过程：本次运行期间的实时进度（任务规划 + 每步执行情况）。
-                             它不属于消息正文，后端也不写入会话记忆，刷新或重开会话后不会再出现。 -->
-                        <div class="steps-box" v-if="m.steps && m.steps.length">
-                            <div class="steps-head" @click="m.stepsOpen = !m.stepsOpen">
-                                <span class="steps-caret">{{ m.stepsOpen ? '▾' : '▸' }}</span>
-                                <span>执行过程 · {{ m.steps.length }} 条</span>
-                                <span class="steps-hint">不计入会话记忆</span>
-                            </div>
-                            <div class="steps-body" v-show="m.stepsOpen">
-                                <div class="steps-line" :class="{ 'steps-error': s.startsWith('❌') }"
-                                     v-for="(s, si) in m.steps" :key="si">{{ s }}</div>
-                            </div>
-                        </div>
-                        <!-- 用户消息：纯文本 + 可选附件（图片缩略图 / 文档下载 chip）；AI 消息：Markdown 渲染（绑定预存的 m.html）。
-                             附件对象字段：本会话新发的带 previewUrl(blob)，历史加载的带 url(服务端 /files/)——两者取其一渲染。
-                             纯附件无文字时 content 为空，靠 attachments 也能渲染出气泡。 -->
-                        <template v-if="m.role === 'user' ? (m.content || (m.attachments && m.attachments.length)) : m.content">
-                            <div v-if="m.role === 'user'" class="user-msg">
-                                <div v-if="m.attachments && m.attachments.length" class="msg-attachments">
-                                    <template v-for="(a, ai) in m.attachments" :key="ai">
-                                        <a v-if="a.type === 'image' && (a.url || a.previewUrl)"
-                                           :href="a.url || a.previewUrl" target="_blank" rel="noopener">
-                                            <img :src="a.url || a.previewUrl" :alt="a.filename" class="msg-attach-thumb" /></a>
-                                        <a v-else-if="a.url" :href="a.url" target="_blank" rel="noopener"
-                                           class="msg-attach-file" :title="a.filename">📄 {{ a.filename }}</a>
-                                        <span v-else class="msg-attach-file">📄 {{ a.filename }}</span>
-                                    </template>
-                                </div>
-                                <span v-if="m.content">{{ m.content }}</span>
-                            </div>
-                            <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
-                            <!-- RAG 引用来源（溯源）：回答正文里的 [n] 角标对应这里的第 n 条。
-                                 数据来自当轮 SSE citations 事件或历史接口的 citations 字段；
-                                 与「执行过程」同理只作展示，不进正文、不进会话记忆。 -->
-                            <div v-if="m.role !== 'user' && m.citations && m.citations.length" class="msg-citations">
-                                <div class="cites-head" @click="m.citesOpen = !m.citesOpen">
-                                    <span class="cites-caret">{{ m.citesOpen ? '▾' : '▸' }}</span>
-                                    <span>引用来源 · {{ m.citations.length }}</span>
-                                    <span class="cites-hint">来自知识库检索</span>
-                                </div>
-                                <div class="cites-body" v-show="m.citesOpen">
-                                    <div class="cite-line" v-for="c in m.citations" :key="c.index">
-                                        <span class="cite-no">[{{ c.index }}]</span>
-                                        <span class="cite-src">
-                                            {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
-                                        </span>
-                                        <span class="cite-score" :title="'相关度 ' + c.score">{{ fmtScore(c.score) }}</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </template>
-                        <span v-else-if="loading && i === messages.length - 1" class="typing">
-                            <span></span><span></span><span></span>
-                        </span>
-                    </div>
-                </div>
-            </div>
-            <div class="input-bar">
-                <!-- 附件预览：图片显示缩略图，文档显示文件 chip；发送时由后端 /api/chat/attachment/process
-                     转成文本（当轮注入 LLM）+ 原文件落盘（供历史回看）。解析文本不进会话记忆，刷新后不重复消耗 token；
-                     落盘文件的历史可见性由消息元数据支撑（历史接口返回 /files/ 链接）。 -->
-                <div v-if="attachments.length" class="input-attachments">
-                    <div v-for="(a, i) in attachments" :key="i" :class="a.isImage ? 'img-thumb' : 'file-thumb'">
-                        <img v-if="a.isImage && a.previewUrl" :src="a.previewUrl" :alt="a.filename || '图片'" />
-                        <div v-else class="file-thumb-body">📄<span class="file-thumb-name">{{ a.filename }}</span></div>
-                        <button class="img-thumb-del" @click="removeAttachment(i)" title="删除附件">×</button>
-                    </div>
-                </div>
-                <div class="input-row">
-                    <textarea v-model="input" @keydown.enter.exact.prevent="send"
-                              placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-                    <button :disabled="loading || !input.trim()" @click="send">发送</button>
-                </div>
-                <!-- 输入框左下角模式开关：勾选「智能规划」= 由动态规划器运行时编排多个智能体协同完成目标，
-                     取消 = 普通对话（智能路由 / 追问）。选择会写回会话，刷新后保持上次选择。
-                     绑定智能体的会话不支持规划（planner 与 agentId 互斥），置灰并提示。 -->
-                <div class="input-foot">
-                    <!-- 📎 附件按钮：点击触发文件选择（多选，支持图片与常见文档）；发送前统一调
-                         /api/chat/attachment/process 把图片识别为 caption、文档解析为文本，随 attachments 注入本轮对话（不进会话记忆）。 -->
-                    <button type="button" class="attach-btn" @click="triggerFilePicker"
-                            title="添加附件：支持图片与 txt/md/csv/json/pdf/docx/xlsx 等文档；最多 5 个，单个 ≤15MB">
-                        📎 附件
-                    </button>
-                    <input ref="fileInput" type="file" :accept="ACCEPT" multiple style="display:none"
-                           @change="onFilePicked" />
-                    <label class="planner-toggle" :class="{ on: planMode && !currentAgentId, disabled: !!currentAgentId }">
-                        <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId" @change="onPlannerChange"
-                               title="勾选后按规划模式执行：AI 自动编排多个智能体协同完成你的目标" />
-                        <span class="toggle-switch"></span>
-                        <span class="toggle-text">🧭 智能规划</span>
-                    </label>
-                    <!-- 📚 RAG 开关（会话级）：开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，
-                         命中内容注入上下文作回答依据；关闭=不使用 RAG（仅靠模型知识）。写回会话，刷新后保持。 -->
-                    <label class="rag-toggle" :class="{ on: ragEnabled }" title="开启后自动检索资料库（通用知识库 + 当前智能体专属库），命中内容会作为回答依据；关闭则仅靠模型自身知识">
-                        <input type="checkbox" v-model="ragEnabled" @change="onRagEnabledChange" />
-                        <span class="toggle-switch"></span>
-                        <span class="toggle-text">📚 RAG</span>
-                    </label>
-                    <span v-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
-                    <span v-else-if="!ragEnabled" class="input-hint">未开启 RAG，本轮不使用知识库</span>
-                </div>
-            </div>
-        </template>
-
-        <!-- ===== 智能体管理视图 ===== -->
-        <div v-else-if="mainView === 'agents'" class="agent-manage">
-            <div class="agent-manage-head">
-                <div class="agent-manage-title-wrap">
-                    <div class="agent-manage-title">🤖 智能体管理</div>
-                    <div class="agent-manage-sub">共 {{ agents.length }} 个智能体 · agent_code 用于多智能体协作时路由</div>
-                </div>
-                <button class="new-chat-btn agent-manage-new" @click="openCreateAgent">＋ 新建智能体</button>
-            </div>
-            <div class="agent-grid">
-                <div v-for="a in agents" :key="a.id" class="agent-card" @click="viewAgent(a)">
-                    <div class="agent-card-icon" :style="{ background: (a.avatarColor || '#3b82f6') + '1f', color: a.avatarColor || '#3b82f6' }">
-                        {{ a.icon || '🤖' }}
-                    </div>
-                    <div class="agent-card-body">
-                        <div class="agent-card-name">{{ a.name }}</div>
-                        <div class="agent-card-code" v-if="a.agentCode">code: {{ a.agentCode }}</div>
-                        <div class="agent-card-desc">{{ a.description || '暂无描述' }}</div>
-                    </div>
-                    <div class="agent-card-actions" @click.stop>
-                        <button class="card-btn" title="用 TA 对话" @click="startAgentChat(a)">💬</button>
-                        <button class="card-btn" title="编辑" @click="openEditAgent(a)">✎</button>
-                        <button class="card-btn card-btn-del" title="删除" @click="deleteAgent(a.id)">🗑</button>
-                    </div>
-                </div>
-                <div v-if="agents.length === 0" class="agent-grid-empty">
-                    还没有智能体，点右上角「＋ 新建智能体」创建
-                </div>
-            </div>
-        </div>
-
-        <!-- ===== 知识库管理视图（RAG） ===== -->
-        <div v-else-if="mainView === 'kbs'" class="agent-manage kb-manage">
-            <!-- 库列表态 -->
-            <template v-if="!kbDetail.open">
-                <div class="agent-manage-head">
-                    <div class="agent-manage-title-wrap">
-                        <div class="agent-manage-title">📚 知识库管理</div>
-                        <div class="agent-manage-sub">RAG 检索增强：对话时开启输入框「📚 RAG」开关后自动检索「通用知识库 + 路由到智能体时的专属库」；这里管理各库的文件与分片</div>
-                    </div>
-                    <button class="new-chat-btn agent-manage-new" :disabled="availableAgents.length === 0"
-                            :title="availableAgents.length === 0 ? '所有智能体都已有专属知识库' : '为智能体创建专属知识库'"
-                            @click="openCreateKb">＋ 新建知识库</button>
-                </div>
-                <div v-if="availableAgents.length === 0" class="kb-hint field-hint">
-                    当前所有智能体都已拥有专属知识库（每个智能体至多一个）。想添加知识请直接点击对应知识库卡片进入管理。
-                </div>
-                <div class="agent-grid">
-                    <div v-for="kb in kbs" :key="kb.id" class="agent-card kb-card" @click="openKbDetail(kb)">
-                        <div class="agent-card-icon" :style="kbIconStyle(kb)">
-                            {{ kb.agentId ? (agentIcon(kb.agentId) || '🤖') : '🌐' }}
-                        </div>
-                        <div class="agent-card-body">
-                            <div class="agent-card-name">{{ kb.name }}</div>
-                            <div class="agent-card-code">
-                                {{ kb.agentId ? '专属库 · ' + (agentName(kb.agentId) || 'agent#' + kb.agentId) : '全局库 · 通用资料（会话可选）' }}
-                            </div>
-                            <div class="agent-card-desc">{{ kb.description || '暂无说明' }}</div>
-                            <div class="kb-meta">{{ kb.docCount || 0 }} 个知识块 · {{ fmtTime(kb.updatedAt) }} 更新</div>
-                        </div>
-                        <div class="agent-card-actions" @click.stop>
-                            <button class="card-btn" title="管理知识" @click="openKbDetail(kb)">📖</button>
-                            <button class="card-btn" title="重命名 / 改说明" @click="openRenameKb(kb)">✎</button>
-                            <button class="card-btn card-btn-del" v-if="kb.agentId" title="删除知识库" @click="deleteKb(kb.id)">🗑</button>
-                        </div>
-                    </div>
-                    <div v-if="kbs.length === 0" class="agent-grid-empty">知识库加载中…</div>
-                </div>
-            </template>
-
-            <!-- 库详情态：添加知识 + 知识块列表 -->
-            <template v-else>
-                <div class="agent-manage-head">
-                    <div class="kb-detail-head-left">
-                        <button class="btn-ghost kb-back" @click="kbDetail.open = false">‹ 返回</button>
-                        <div class="kb-detail-title">{{ kbDetail.kb.name }}</div>
-                        <button class="card-btn kb-detail-set" title="知识库设置：默认分片策略与相邻块重叠字数（新上传文件按此切块）"
-                                @click="openRenameKb(kbDetail.kb)">⚙</button>
-                        <span class="agent-card-code">{{ kbDetail.kb.agentId ? '专属库' : '全局库 · 会话可选' }}</span>
-                    </div>
-                    <div class="agent-manage-sub">共 {{ kbDetail.total }} 个知识块 · 对话时会自动语义检索最相关的若干块，作为参考资料注入提示词</div>
-                </div>
-                <!-- 向量副本（Chroma）状态条：确认知识块是否同步进了向量库；未同步可一键回填 -->
-                <div class="kb-chroma-bar">
-                    <span class="kb-chroma-dot" :class="chroma.connected ? 'on' : 'off'"></span>
-                    <span class="field-hint">
-                        向量副本：
-                        <template v-if="chroma.connected">
-                            <b>Chroma 已连接</b> · {{ chroma.collection }}
-                            共 {{ chroma.documentCount >= 0 ? chroma.documentCount : '未知' }} 条向量
-                        </template>
-                        <template v-else>
-                            <b>Chroma 未连接</b>（{{ chroma.lastError || '服务不可用' }}）· 检索已降级为 MySQL 余弦
-                        </template>
-                    </span>
-                    <button class="btn-ghost btn-sm" :disabled="chroma.syncing"
-                            title="把本库 MySQL 存量知识块幂等回填到 Chroma（按块 id 覆盖，可重复执行）"
-                            @click="syncChroma">{{ chroma.syncing ? '同步中…' : '🔄 同步本库' }}</button>
-                    <span v-if="chroma.msg" class="field-hint">{{ chroma.msg }}</span>
-                </div>
-                <div class="kb-detail-body">
-                    <!-- 左：库内文件列表 + 上传 -->
-                    <div class="kb-add-panel">
-                        <div class="kb-panel-title">库内文件（{{ kbDetail.fileList.length }}）</div>
-                        <div v-if="kbDetail.fileList.length === 0" class="kb-empty-tip">
-                            还没有文件，上传 txt / md / pdf / docx / xlsx 后自动解析入库
-                        </div>
-                        <div v-for="f in kbDetail.fileList" :key="f.id" class="kb-file-row">
-                            <span class="kb-file-ico">{{ typeIcon(f.fileType) }}</span>
-                            <div class="kb-file-info">
-                                <div class="kb-file-name" :title="f.fileName">{{ f.fileName }}</div>
-                                <div class="kb-file-meta">{{ fmtSize(f.sizeBytes) }} · {{ f.chunkCount || 0 }} 块 · {{ strategyLabel(f.chunkStrategy) }} · 重叠 {{ overlapLabel(f.chunkOverlap) }} · {{ fmtTime(f.updatedAt) }} 更新</div>
-                            </div>
-                            <button class="card-btn kb-file-rechunk" title="更换分片策略，重新切块入库（无需重传）"
-                                    @click="openRechunk(f)">🔄</button>
-                            <button class="card-btn card-btn-del kb-file-del" title="删除文件（连同其知识块）"
-                                    @click="deleteKbFile(f)">🗑</button>
-                        </div>
-
-                        <!-- 重新分片确认条（选择新策略 / 重叠后整文件重切） -->
-                        <div v-if="kbDetail.rechunk" class="kb-rechunk-bar">
-                            <span class="field-hint">重新分片「{{ kbDetail.rechunk.file.fileName }}」：</span>
-                            <select class="kb-strategy-select" v-model="kbDetail.rechunk.strategy"
-                                    :disabled="kbDetail.rechunk.busy">
-                                <option v-for="s in kbDetail.strategies" :key="s.key" :value="s.key">{{ s.label }}</option>
-                            </select>
-                            <select class="kb-strategy-select kb-overlap-select" v-model="kbDetail.rechunk.overlap"
-                                    title="相邻块间保留多少重复字符，避免边界内容被切断影响检索" :disabled="kbDetail.rechunk.busy">
-                                <option v-for="o in overlapOptions" :key="o" :value="o">{{ overlapText(o) }}</option>
-                            </select>
-                            <button class="btn-primary btn-sm" :disabled="kbDetail.rechunk.busy"
-                                    @click="doRechunk">{{ kbDetail.rechunk.busy ? '重分中…' : '确定重分' }}</button>
-                            <button class="btn-ghost btn-sm" :disabled="kbDetail.rechunk.busy"
-                                    @click="kbDetail.rechunk = null">取消</button>
-                        </div>
-
-                        <div class="kb-upload-divider">＋ 上传新文件</div>
-                        <div class="kb-upload-strategy">
-                            <span class="field-hint">按知识库默认分片：<b>{{ strategyLabel(kbDetail.uploadStrategy) }}</b> · 相邻重叠 <b>{{ overlapText(kbDetail.uploadOverlap) }}</b></span>
-                            <button class="btn-ghost btn-sm" title="调整该库的默认分片策略与重叠字数"
-                                    @click="openRenameKb(kbDetail.kb)">⚙ 修改设置</button>
-                        </div>
-                        <div class="field-hint" style="margin-bottom: 8px;">上传后自动切块并向量化入库；个别文件想用不同策略，可在文件行点 🔄 重新分片</div>
-                        <div class="kb-upload-zone" :class="{ drag: kbDetail.drag && !kbDetail.uploading }"
-                             @click="pickFiles" @dragover.prevent="kbDetail.drag = true"
-                             @dragleave="kbDetail.drag = false" @drop.prevent="onDropFiles">
-                            <input type="file" ref="kbFileInput" multiple hidden
-                                   accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx"
-                                   @change="onFilesChosen" />
-                            <div class="kb-upload-icon">📄</div>
-                            <div class="kb-upload-main">{{ kbDetail.uploading ? '解析并向量化中，请稍候…' : '点击选择文件，或将文件拖拽到此处' }}</div>
-                            <div class="kb-upload-exts">支持 txt / md / csv / pdf / docx / xlsx · 单个文件 ≤ 15MB · 同名文件将覆盖替换</div>
-                        </div>
-                        <!-- 待上传文件队列 -->
-                        <div v-if="kbDetail.files.length" class="kb-files">
-                            <div v-for="(f, i) in kbDetail.files" :key="i" class="kb-file-item">
-                                <span class="kb-file-name" :title="f.name">📎 {{ f.name }}</span>
-                                <span class="kb-file-size">{{ fmtSize(f.size) }}</span>
-                                <button class="card-btn card-btn-del kb-file-del" title="移除该文件" @click="removeFile(i)">✕</button>
-                            </div>
-                        </div>
-                        <div class="kb-add-foot">
-                            <span class="field-hint">解析后自动分块（单块约 600 字）并向量化入库</span>
-                            <button class="btn-primary" :disabled="kbDetail.uploading || kbDetail.files.length === 0"
-                                    @click="uploadFiles">{{ kbDetail.uploading ? '导入中…' : '上传导入' }}</button>
-                        </div>
-                        <!-- 上传结果汇总 -->
-                        <div v-if="kbDetail.msg" class="kb-msg" :class="kbDetail.msgOk ? 'ok' : 'err'">{{ kbDetail.msg }}</div>
-                    </div>
-                    <!-- 右：已有知识块列表 -->
-                    <div class="kb-chunk-list">
-                        <div class="kb-panel-title">已有知识块（{{ kbDetail.total }}）</div>
-                        <div v-if="kbDetail.chunks.length === 0" class="agent-grid-empty">还没有知识块，在左侧上传文件导入</div>
-                        <div v-for="c in kbDetail.chunks" :key="c.id" class="kb-chunk-item">
-                            <div class="kb-chunk-head">
-                                <span class="agent-card-code" v-if="c.source">{{ c.source }}</span>
-                                <span class="field-hint">{{ fmtTime(c.createdAt) }}</span>
-                                <button class="card-btn card-btn-del kb-chunk-del" title="删除该知识块" @click="deleteChunk(c.id)">🗑</button>
-                            </div>
-                            <div class="kb-chunk-content">{{ c.content }}</div>
-                        </div>
-                        <div v-if="kbDetail.total > kbDetail.chunks.length" class="kb-more">
-                            <button class="btn-ghost" @click="loadMoreChunks">加载更多（还剩 {{ kbDetail.total - kbDetail.chunks.length }} 个）</button>
-                        </div>
-                    </div>
-                </div>
-            </template>
-        </div>
+                <h3>工具生态</h3>
+                <p>本地工具与 MCP 远端工具，同一个注册表装配</p>
+            </article>
+        </section>
     </main>
 
-    <!-- 智能体创建 / 编辑弹窗 -->
-    <div class="modal-mask" v-if="agentModal.open" @click.self="closeAgentModal">
-        <div class="modal">
-            <div class="modal-head">
-                <span>{{ agentModal.id ? '编辑智能体' : '创建智能体' }}</span>
-                <button class="modal-close" @click="closeAgentModal">✕</button>
-            </div>
-            <div class="modal-body">
-                <label>名称 <span class="req">*</span></label>
-                <input v-model="agentModal.name" placeholder="例如：翻译官 / Python 老师" @blur="autoFillCode" />
-
-                <label>图标（可选）</label>
-                <div class="icon-row">
-                    <span v-for="ic in iconPresets" :key="ic" class="icon-opt"
-                          :class="{ selected: agentModal.icon === ic }"
-                          @click="agentModal.icon = ic">{{ ic }}</span>
-                    <input class="icon-custom" v-model="agentModal.icon" placeholder="自定义" maxlength="4" />
-                </div>
-
-                <label>智能体编码（agent_code，协作路由用）<span class="req">*</span></label>
-                <input v-model="agentModal.agentCode"
-                       :disabled="!!agentModal.id"
-                       :placeholder="agentModal.id ? '创建后不可修改' : '留空自动生成（如 python-teacher）'" />
-                <div v-if="agentModal.id" class="field-hint">编码创建后不可修改，如需变更请新建智能体</div>
-
-                <label>描述 <span class="req">*</span></label>
-                <input v-model="agentModal.description" placeholder="一句话说明这个智能体是做什么的（必填）" />
-
-                <div class="label-row">
-                    <label>系统提示词（人设）<span class="req">*</span></label>
-                    <button class="gen-btn" type="button"
-                            :disabled="agentModal.genLoading || !agentModal.name.trim()"
-                            @click="genPrompt">
-                        {{ agentModal.genLoading ? '生成中…' : '✨ AI 生成' }}
-                    </button>
-                </div>
-                <textarea v-model="agentModal.systemPrompt" rows="9"
-                          placeholder="例如：你是一位资深 Python 工程师，回答时优先给出可运行代码示例，并解释关键思路。&#10;&#10;也可以先填名称和描述，点「✨ AI 生成」让 AI 帮你写人设。"></textarea>
-
-                <!-- 参数补全编辑区：声明执行该智能体所需参数，对话中缺失会自动追问 -->
-                <div class="param-section">
-                    <div class="label-row">
-                        <label>参数补全（可选）</label>
-                        <button class="gen-btn" type="button" @click="addParam">＋ 添加参数</button>
-                    </div>
-                    <div class="field-hint">声明执行该智能体所需的参数；对话中若缺失会自动追问补全（最多 3 次）。无需参数可留空。</div>
-
-                    <div v-if="agentModal.paramList.length === 0" class="param-empty">暂无参数，点「＋ 添加参数」声明第一个。</div>
-
-                    <div v-for="(p, idx) in agentModal.paramList" :key="idx" class="param-row">
-                        <div class="param-head">
-                            <span class="param-idx">参数 {{ idx + 1 }}</span>
-                            <label class="param-req"><input type="checkbox" v-model="p.required" /> 必填</label>
-                            <button class="param-del" type="button" @click="removeParam(idx)" title="删除该参数">✕ 删除</button>
-                        </div>
-                        <div class="param-grid">
-                            <input v-model="p.key" class="param-key" placeholder="参数键(英文)" />
-                            <input v-model="p.label" class="param-label" placeholder="显示名" />
-                            <input v-model="p.hint" class="param-hint" placeholder="追问提示语" />
-                            <input v-model="p.optionsText" class="param-options" placeholder="可选项，顿号/逗号分隔" />
-                        </div>
-                    </div>
-
-                    <div class="field-hint">示例（翻译官）：目标语言 targetLang（必填，可选项：英语、日语、韩语）；语气 tone（可选，可选项：正式、口语）</div>
-                </div>
-
-                <!-- 工具装配：控制该智能体可调用哪些工具。默认「全部工具」与历史行为一致；
-                     翻译/闲聊等纯文本智能体选「不使用工具」，避免被 SQL、天气等无关工具干扰人设。 -->
-                <div class="param-section">
-                    <div class="label-row">
-                        <label>工具装配</label>
-                    </div>
-                    <div class="field-hint">控制该智能体可调用的工具范围。纯聊天 / 翻译类建议选「不使用工具」，避免被无关工具干扰人设。</div>
-
-                    <div class="tool-mode-row">
-                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'all' }">
-                            <input type="radio" value="all" v-model="agentModal.toolMode" />
-                            <span class="tmc-icon">🌐</span>
-                            <span class="tmc-text"><b>全部工具</b><small>默认，不限制</small></span>
-                        </label>
-                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'none' }">
-                            <input type="radio" value="none" v-model="agentModal.toolMode" />
-                            <span class="tmc-icon">💬</span>
-                            <span class="tmc-text"><b>不使用工具</b><small>纯聊天推荐</small></span>
-                        </label>
-                        <label class="tool-mode-card" :class="{ active: agentModal.toolMode === 'custom' }">
-                            <input type="radio" value="custom" v-model="agentModal.toolMode" />
-                            <span class="tmc-icon">🎯</span>
-                            <span class="tmc-text"><b>指定工具</b><small>按需勾选</small></span>
-                        </label>
-                    </div>
-
-                    <div v-if="agentModal.toolMode === 'custom'" class="tool-picker">
-                        <template v-if="availableTools.length">
-                            <div class="tool-picker-head">
-                                <span class="tph-count">已选 <b>{{ agentModal.toolNames.length }}</b> / {{ availableTools.length }} 个工具</span>
-                                <div class="tph-actions">
-                                    <button type="button" class="tph-btn" @click="toolSelectAll">全选</button>
-                                    <button type="button" class="tph-btn" @click="toolClearAll">清空</button>
-                                </div>
-                            </div>
-                            <div class="tool-search">
-                                <span class="ts-icon">🔍</span>
-                                <input v-model="agentModal.toolSearch" placeholder="搜索工具名或描述…"
-                                       @keydown.esc="agentModal.toolSearch = ''" />
-                                <button v-if="agentModal.toolSearch" type="button" class="ts-clear"
-                                        @click="agentModal.toolSearch = ''" title="清除搜索">✕</button>
-                            </div>
-                            <div class="tool-scroll">
-                                <div v-if="toolGroups.length === 0" class="tool-no-result">
-                                    没有匹配「{{ agentModal.toolSearch }}」的工具
-                                </div>
-                                <div v-for="g in toolGroups" :key="g.group" class="tool-group">
-                                    <div class="tool-group-name">{{ toolGroupLabel(g.group) }}<em>{{ g.tools.length }}</em></div>
-                                    <div class="tool-grid">
-                                        <label v-for="t in g.tools" :key="t.name" class="tool-card"
-                                               :class="{ active: agentModal.toolNames.includes(t.name) }">
-                                            <input type="checkbox" :value="t.name" v-model="agentModal.toolNames" />
-                                            <span class="tool-check"></span>
-                                            <span class="tool-card-body">
-                                                <span class="tool-card-name">{{ t.name }}</span>
-                                                <span class="tool-card-desc" :title="t.description">{{ t.description }}</span>
-                                            </span>
-                                        </label>
-                                    </div>
-                                </div>
-                            </div>
-                        </template>
-                        <div v-else class="param-empty">暂无可选工具（后端未注册任何工具）。</div>
-                    </div>
-                </div>
-
-                <div class="row">
-                    <div class="col">
-                        <label>模型（可选）</label>
-                        <input v-model="agentModal.model" placeholder="留空则使用默认模型" />
-                    </div>
-                    <div class="col">
-                        <label>温度（可选 0~2）</label>
-                        <input v-model.number="agentModal.temperature" type="number" step="0.1" min="0" max="2" placeholder="如 0.7" />
-                    </div>
-                </div>
-
-                <label>主题色（可选）</label>
-                <div class="color-row">
-                    <input v-model="agentModal.avatarColor" placeholder="#3b82f6" />
-                    <input type="color" v-model="agentModal.avatarColor" />
-                </div>
-            </div>
-            <div class="modal-foot">
-                <button class="btn-ghost" @click="closeAgentModal">取消</button>
-                <button class="btn-primary"
-                        :disabled="agentModal.saving || !agentModal.name.trim() || !agentModal.agentCode.trim() || !agentModal.description.trim() || !agentModal.systemPrompt.trim()"
-                        @click="saveAgent">
-                    {{ agentModal.saving ? '保存中…' : '保存' }}
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- 智能体查看弹窗（只读详情） -->
-    <div class="modal-mask" v-if="agentView.open" @click.self="agentView.open = false">
-        <div class="modal modal-view">
-            <div class="modal-head">
-                <span>{{ agentView.agent.icon || '🤖' }} {{ agentView.agent ? agentView.agent.name : '' }}</span>
-                <button class="modal-close" @click="agentView.open = false">✕</button>
-            </div>
-            <div class="modal-body">
-                <label>智能体编码</label>
-                <div class="view-text view-code">{{ agentView.agent.agentCode || '（无）' }}</div>
-
-                <label>描述</label>
-                <div class="view-text">{{ agentView.agent.description || '—' }}</div>
-
-                <label>系统提示词</label>
-                <pre class="view-prompt">{{ agentView.agent.systemPrompt }}</pre>
-
-                <label>工具装配</label>
-                <div class="view-text">
-                    <template v-if="parseTools(agentView.agent.toolsJson).mode === 'all'">全部工具（不限制）</template>
-                    <template v-else-if="parseTools(agentView.agent.toolsJson).mode === 'none'">不使用任何工具</template>
-                    <template v-else>{{ parseTools(agentView.agent.toolsJson).names.join('、') }}</template>
-                </div>
-
-                <label>参数补全</label>
-                <div v-if="parseParamSchema(agentView.agent.paramSchema).length" class="view-params">
-                    <div v-for="(p, i) in parseParamSchema(agentView.agent.paramSchema)" :key="i" class="view-param-item">
-                        <b>{{ p.label || p.key }}</b>
-                        <span v-if="p.required" class="req-tag">必填</span>
-                        <span v-else class="opt-tag">可选</span>
-                        <span v-if="p.hint" class="param-hint-text">（{{ p.hint }}）</span>
-                        <span v-if="p.optionsText" class="param-opts-text">可选项：{{ p.optionsText }}</span>
-                    </div>
-                </div>
-                <div class="view-text" v-else>无</div>
-
-                <div class="row">
-                    <div class="col">
-                        <label>模型</label>
-                        <div class="view-text">{{ agentView.agent.model || '默认模型' }}</div>
-                    </div>
-                    <div class="col">
-                        <label>温度</label>
-                        <div class="view-text">{{ agentView.agent.temperature ?? '默认' }}</div>
-                    </div>
-                </div>
-
-                <label>主题色</label>
-                <div class="color-view">
-                    <span class="agent-dot" :style="{ background: agentView.agent.avatarColor || '#3b82f6' }"></span>
-                    <span>{{ agentView.agent.avatarColor || '默认' }}</span>
-                </div>
-            </div>
-            <div class="modal-foot">
-                <button class="btn-danger-ghost" @click="deleteAgent(agentView.agent.id)">删除</button>
-                <span class="foot-spacer"></span>
-                <button class="btn-ghost" @click="openEditAgent(agentView.agent)">编辑</button>
-                <button class="btn-primary" @click="startAgentChat(agentView.agent)">用 TA 对话</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- 知识库创建 / 重命名弹窗 -->
-    <div class="modal-mask" v-if="kbModal.open" @click.self="kbModal.open = false">
-        <div class="modal">
-            <div class="modal-head">
-                <span>{{ kbModal.mode === 'rename' ? '知识库设置' : '为智能体创建专属知识库' }}</span>
-                <button class="modal-close" @click="kbModal.open = false">✕</button>
-            </div>
-            <div class="modal-body">
-                <template v-if="kbModal.mode === 'create'">
-                    <label>归属智能体 <span class="req">*</span></label>
-                    <select v-model.number="kbModal.agentId" @change="autoKbName">
-                        <option v-for="a in availableAgents" :key="a.id" :value="a.id">
-                            {{ a.icon || '🤖' }} {{ a.name }}（暂无专属库）
-                        </option>
-                    </select>
-                    <div class="field-hint">该库只在此智能体处理对话时检索；全局通用资料请直接添加到「通用知识库」</div>
-                </template>
-                <template v-else>
-                    <label>归属</label>
-                    <div class="view-text">{{ kbModal.agentId ? '专属库 · ' + (agentName(kbModal.agentId) || 'agent#' + kbModal.agentId) : '全局库（会话可选）' }}</div>
-                </template>
-
-                <label>知识库名称 <span class="req">*</span></label>
-                <input v-model="kbModal.name" placeholder="如：产品知识库 / 校历与制度" />
-
-                <label>说明（可选）</label>
-                <input v-model="kbModal.description" placeholder="这个库主要放什么资料" />
-
-                <label>默认分片策略</label>
-                <select class="kb-strategy-select kb-settings-select" v-model="kbModal.chunkStrategy"
-                        title="上传文件时按哪种规则切块：固定长度 / 按段落 / 递归字符 / Markdown 标题">
-                    <option v-for="s in kbDetail.strategies" :key="s.key" :value="s.key" :title="s.desc">{{ s.label }} — {{ s.desc }}</option>
-                </select>
-
-                <label>相邻块重叠字数</label>
-                <select class="kb-strategy-select kb-settings-select kb-overlap-select" v-model.number="kbModal.chunkOverlap"
-                        title="相邻知识块间保留多少重复字符：语义跨过切分边界也能完整命中（向量检索更精准）">
-                    <option v-for="o in overlapOptions" :key="o" :value="o">{{ overlapText(o) }}</option>
-                </select>
-                <div class="field-hint">上传新文件、手动添加知识默认按此配置分块入库；已入库文件仍可在文件行用 🔄 单独重切。</div>
-            </div>
-            <div class="modal-foot">
-                <button class="btn-ghost" @click="kbModal.open = false">取消</button>
-                <button class="btn-primary" :disabled="kbModal.saving || !kbModal.name.trim()"
-                        @click="saveKb">
-                    {{ kbModal.saving ? '保存中…' : (kbModal.mode === 'rename' ? '保存' : '创建') }}
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ===== 链路追踪弹窗（可观测，只读） =====
-         数据来自后端 agent_trace 表：每轮对话在回复产出后异步落库，记录路由来源 / 规划步骤 /
-         RAG 命中与引用 / 工具调用与参数摘要 / token 用量 / 耗时 / 成功失败。
-         用途：回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「花了多少 token」。 -->
-    <div class="modal-mask" v-if="traceModal.open" @click.self="traceModal.open = false">
-        <div class="modal modal-trace">
-            <div class="modal-head">
-                <span>🔍 链路追踪</span>
-                <button class="modal-close" @click="traceModal.open = false">✕</button>
-            </div>
-            <div class="modal-body">
-                <div class="trace-toolbar">
-                    <span class="field-hint">仅显示当前会话的最近 50 轮；追踪在本轮回复产出后异步落库，刚发出的那一轮可能稍有延迟。</span>
-                    <button class="btn-ghost btn-sm" @click="openTrace" :disabled="traceModal.loading">
-                        {{ traceModal.loading ? '加载中…' : '刷新' }}
-                    </button>
-                </div>
-                <div v-if="traceModal.error" class="trace-empty">{{ traceModal.error }}</div>
-                <div v-else class="trace-list">
-                    <div class="trace-item" v-for="(t, ti) in traceModal.items" :key="t.traceId">
-                        <div class="trace-row" @click="toggleTrace(ti)">
-                            <span class="trace-caret">{{ traceModal.expanded[ti] ? '▾' : '▸' }}</span>
-                            <span class="trace-time">{{ fmtTime(t.createdAt) }}</span>
-                            <span class="trace-tag" :class="t.status === 'error' ? 'tag-err' : 'tag-ok'">
-                                {{ t.status === 'error' ? '失败' : '成功' }}
-                            </span>
-                            <span class="trace-tag tag-mode">{{ modeLabel(t.mode) }}</span>
-                            <span class="trace-tag tag-route">{{ routeLabel(t.routeSource) }}</span>
-                            <span v-if="t.agentCode" class="trace-agent">{{ t.agentCode }}</span>
-                            <span class="trace-metrics">
-                                <span :title="'RAG 命中块数'">📚 {{ t.kbHitCount }}</span>
-                                <span :title="'工具调用次数'">🔧 {{ (t.toolCalls && t.toolCalls.length) || 0 }}</span>
-                                <span :title="'token 合计（输入+输出）'">🎫 {{ t.totalTokens }}</span>
-                                <span :title="'本轮总耗时'">⏱ {{ fmtElapsed(t.elapsedMs) }}</span>
-                            </span>
-                        </div>
-                        <div class="trace-detail" v-show="traceModal.expanded[ti]">
-                            <div class="trace-q" v-if="t.userMessage">用户：{{ t.userMessage }}</div>
-                            <div class="trace-q trace-rq" v-if="t.retrievalQuery">🔍 检索改写：{{ t.retrievalQuery }}</div>
-                            <div class="trace-kv" v-if="t.errorMessage"><b>错误</b>{{ t.errorMessage }}</div>
-                            <div class="trace-kv">
-                                <b>token</b>输入 {{ t.promptTokens }} · 输出 {{ t.completionTokens }} · 合计 {{ t.totalTokens }}
-                            </div>
-                            <div class="trace-block" v-if="t.planJson && t.planJson !== '[]'">
-                                <div class="trace-block-title">规划步骤</div>
-                                <pre>{{ t.planJson }}</pre>
-                            </div>
-                            <div class="trace-block" v-if="t.toolCalls && t.toolCalls.length">
-                                <div class="trace-block-title">工具调用</div>
-                                <div class="trace-tool" v-for="(tc, ci) in t.toolCalls" :key="ci">
-                                    <span class="cite-no">🔧</span>
-                                    <span class="trace-tool-name">{{ tc.name }}</span>
-                                    <span class="trace-tool-text" v-if="tc.args">入参：{{ tc.args }}</span>
-                                    <span class="trace-tool-text" v-if="tc.result">返回：{{ tc.result }}</span>
-                                </div>
-                            </div>
-                            <div class="trace-block" v-if="t.citations && t.citations.length">
-                                <div class="trace-block-title">引用来源</div>
-                                <div class="cite-line" v-for="c in t.citations" :key="c.index">
-                                    <span class="cite-no">[{{ c.index }}]</span>
-                                    <span class="cite-src">
-                                        {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
-                                    </span>
-                                    <span class="cite-score">{{ fmtScore(c.score) }}</span>
-                                </div>
-                            </div>
-                            <div class="trace-block" v-if="!t.planJson && (!t.toolCalls || !t.toolCalls.length)
-                                    && (!t.citations || !t.citations.length) && !t.retrievalQuery">
-                                <div class="trace-block-title">无规划 / 无工具调用 / 无 RAG 命中</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-foot">
-                <span class="field-hint">traceId 可在服务端日志中检索，用于定位单轮全链路日志。</span>
-                <button class="btn-primary" @click="traceModal.open = false">关闭</button>
-            </div>
-        </div>
-    </div>
+    <footer class="foot rise d8">
+        <span>多智能体协作 · 双层记忆 · 向量加速检索 · 流式输出</span>
+        <span class="foot-stack">
+            <span>Spring AI</span>
+            <span>Chroma</span>
+            <span>MyBatis-Plus</span>
+            <span>MCP</span>
+        </span>
+    </footer>
 </div>
 
-<script src="/js/app.js"></script>
+<script src="/js/landing.js"></script>
 </body>
 </html>

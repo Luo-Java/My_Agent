@@ -122,3 +122,115 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     INDEX idx_trace_conv (conversation_id, created_at),
     INDEX idx_trace_created (created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '智能体链路追踪表：一轮对话的路由/RAG/工具/token/耗时留痕';
+
+-- 裸 LLM 调用成本流水表：与 agent_trace 互补，记全量成本。
+-- agent_trace 只记「正式回答 + 工具循环」的 token；路由判定/参数抽取/查询改写/视觉识别/记忆合并这些
+-- 裸 ChatModel.call()（不经 Advisor）的 token 在这里按用途（purpose）各记一条，成本看板据此做全量聚合。
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
+    conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
+    prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
+    completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
+    total_tokens      INT          NOT NULL DEFAULT 0      COMMENT '本次调用 token 合计',
+    created_at        DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_usage_purpose (purpose, created_at),
+    INDEX idx_usage_conv (conversation_id, created_at),
+    INDEX idx_usage_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';
+
+-- 规划任务表：一轮规划 = 一条 task + N 条 task_step，落库支撑断点续跑。
+-- 状态机：RUNNING → DONE/FAILED/CANCELLED；单会话单 RUNNING（开新规划任务前自动结旧）。
+CREATE TABLE IF NOT EXISTS task (
+    id              VARCHAR(64)  NOT NULL                COMMENT '任务ID（业务层生成UUID）',
+    conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id',
+    user_goal       TEXT         DEFAULT NULL            COMMENT '用户原始目标（触发规划的那句原话）',
+    status          VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT '任务状态：RUNNING/DONE/FAILED/CANCELLED',
+    total_steps     INT          NOT NULL DEFAULT 0      COMMENT '步骤总数（快照，避免反复数）',
+    done_steps      INT          NOT NULL DEFAULT 0      COMMENT '已完成步骤数（冗余，供列表快速展示进度）',
+    result          LONGTEXT     DEFAULT NULL            COMMENT '最终汇总结果（汇总步产出/最后一个成功步骤产出）',
+    created_at      DATETIME                             COMMENT '创建时间',
+    updated_at      DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    INDEX idx_task_conv (conversation_id, status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务表：一轮多智能体规划任务的落库与断点续跑';
+
+-- 规划任务步骤表：任务的一步 = 一个智能体 + 指令 + 依赖前驱。
+-- 状态机：PENDING → RUNNING → DONE/SKIPPED/FAILED；FAILED 续跑时重试一次，累计失败 >= 2 判确定性失败（不再重试）。
+CREATE TABLE IF NOT EXISTS task_step (
+    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    task_id        VARCHAR(64)  NOT NULL                COMMENT '所属任务ID，关联 task.id',
+    step_index     INT          NOT NULL                COMMENT '步骤下标（0基，对应规划 steps 数组位置，即重映射后的 specs 连续下标）',
+    agent_code     VARCHAR(64)  NOT NULL                COMMENT '本步执行的智能体编码',
+    instruction    TEXT         DEFAULT NULL            COMMENT '给该智能体的指令',
+    depends_on     VARCHAR(500) DEFAULT '[]'            COMMENT '依赖的前序步骤下标（JSON数组，如 [0,1]；空表=无依赖）',
+    status         VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT '步骤状态：PENDING/RUNNING/DONE/SKIPPED/FAILED',
+    retry_count    INT          NOT NULL DEFAULT 0      COMMENT '重试次数（0=未重试；续跑对 FAILED 重试一次，累计>=2 判确定性失败）',
+    output         LONGTEXT     DEFAULT NULL            COMMENT '本步产出文本（成功时写入；失败/空为 NULL）',
+    error          VARCHAR(1000) DEFAULT NULL           COMMENT '失败原因（FAILED 时）',
+    citations_json TEXT         DEFAULT NULL            COMMENT '本步 RAG 引用（与 chat_message.citations_json 同构）',
+    started_at     DATETIME                             COMMENT '开始执行时间',
+    finished_at    DATETIME                             COMMENT '完成时间',
+    PRIMARY KEY (id),
+    INDEX idx_step_task (task_id, step_index)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务步骤表：任务每一步的产出与状态落库（断点续跑的最小粒度）';
+
+
+-- 新增「规划任务」与「规划任务步骤」表（跨轮任务状态持久化）：schema.sql 已含建表语句，这里同样保留一份，
+-- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
+-- 一轮规划 = 一条 task + N 条 task_step；单会话单 RUNNING，开新规划任务前自动结旧；显式续跑只跑剩余步骤。
+CREATE TABLE IF NOT EXISTS task (
+    id              VARCHAR(64)  NOT NULL                COMMENT '任务ID（业务层生成UUID）',
+    conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id',
+    user_goal       TEXT         DEFAULT NULL            COMMENT '用户原始目标（触发规划的那句原话）',
+    status          VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT '任务状态：RUNNING/DONE/FAILED/CANCELLED',
+    total_steps     INT          NOT NULL DEFAULT 0      COMMENT '步骤总数（快照，避免反复数）',
+    done_steps      INT          NOT NULL DEFAULT 0      COMMENT '已完成步骤数（冗余，供列表快速展示进度）',
+    result          LONGTEXT     DEFAULT NULL            COMMENT '最终汇总结果（汇总步产出/最后一个成功步骤产出）',
+    created_at      DATETIME                             COMMENT '创建时间',
+    updated_at      DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    INDEX idx_task_conv (conversation_id, status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务表：一轮多智能体规划任务的落库与断点续跑';
+
+CREATE TABLE IF NOT EXISTS task_step (
+    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    task_id        VARCHAR(64)  NOT NULL                COMMENT '所属任务ID，关联 task.id',
+    step_index     INT          NOT NULL                COMMENT '步骤下标（0基，对应规划 steps 数组位置，即重映射后的 specs 连续下标）',
+    agent_code     VARCHAR(64)  NOT NULL                COMMENT '本步执行的智能体编码',
+    instruction    TEXT         DEFAULT NULL            COMMENT '给该智能体的指令',
+    depends_on     VARCHAR(500) DEFAULT '[]'            COMMENT '依赖的前序步骤下标（JSON数组，如 [0,1]；空表=无依赖）',
+    status         VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT '步骤状态：PENDING/RUNNING/DONE/SKIPPED/FAILED',
+    retry_count    INT          NOT NULL DEFAULT 0      COMMENT '重试次数（0=未重试；续跑对 FAILED 重试一次，累计>=2 判确定性失败）',
+    output         LONGTEXT     DEFAULT NULL            COMMENT '本步产出文本（成功时写入；失败/空为 NULL）',
+    error          VARCHAR(1000) DEFAULT NULL           COMMENT '失败原因（FAILED 时）',
+    citations_json TEXT         DEFAULT NULL            COMMENT '本步 RAG 引用（与 chat_message.citations_json 同构）',
+    started_at     DATETIME                             COMMENT '开始执行时间',
+    finished_at    DATETIME                             COMMENT '完成时间',
+    PRIMARY KEY (id),
+    INDEX idx_step_task (task_id, step_index)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务步骤表：任务每一步的产出与状态落库（断点续跑的最小粒度）';
+
+
+-- 新增「裸 LLM 调用成本流水」表（全量成本口径）：schema.sql 已含建表语句，这里同样保留一份，
+-- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
+-- 与 agent_trace 互补：agent_trace 只记「正式回答+工具循环」token；本表记路由/参数抽取/查询改写/视觉/记忆合并等
+-- 裸 ChatModel.call() 的 token，成本看板据此做全量聚合与按用途（purpose）拆解。
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
+    conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
+    prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
+    completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
+    total_tokens      INT          NOT NULL DEFAULT 0      COMMENT '本次调用 token 合计',
+    created_at        DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_usage_purpose (purpose, created_at),
+    INDEX idx_usage_conv (conversation_id, created_at),
+    INDEX idx_usage_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';

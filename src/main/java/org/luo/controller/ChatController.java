@@ -4,14 +4,19 @@ import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import org.luo.dto.ChatAttachment;
 import org.luo.dto.ChatRequest;
+import org.luo.dto.ResumeTaskRequest;
 import org.luo.dto.StreamEvent;
+import org.luo.entity.Task;
 import org.luo.service.ChatService;
+import org.luo.service.TaskService;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.Disposable;
@@ -28,7 +33,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 对话接口（与会话管理业务分离，后者见 ConversationController）。
  * <p>
- * POST /api/chat/send   - 同步返回完整回复；POST /api/chat/stream - SSE 流式返回。
+ * POST /api/chat/send   - 同步返回完整回复；POST /api/chat/stream - SSE 流式返回；
+ * POST /api/chat/task/resume - SSE 流式续跑未完成任务；GET /api/chat/task/running - 查询当前会话的未完成任务。
  * <p>
  * <b>传输层兜底</b>（与业务无关，纯防连接被静默挂死）：有限超时（{@code app.sse.timeout-seconds}，默认 300s，
  * 不用 {@code 0L} 永不超时——上游卡死会让连接与异步线程永久泄漏）；心跳（{@code app.sse.heartbeat-seconds}，
@@ -40,6 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ChatController {
 
     private final ChatService chatService;
+    private final TaskService taskService;
 
     /** SSE 连接最长存活时间（秒）。必须有限，默认 300s，足够覆盖最长的规划 + 多轮工具调用。 */
     private final long sseTimeoutSeconds;
@@ -56,11 +63,12 @@ public class ChatController {
      */
     private final ScheduledExecutorService heartbeatScheduler;
 
-    public ChatController(ChatService chatService,
+    public ChatController(ChatService chatService, TaskService taskService,
                           @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
                           @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds,
                           @Qualifier("sseHeartbeatScheduler") ScheduledExecutorService heartbeatScheduler) {
         this.chatService = chatService;
+        this.taskService = taskService;
         this.sseTimeoutSeconds = sseTimeoutSeconds;
         this.heartbeatSeconds = heartbeatSeconds;
         this.heartbeatScheduler = heartbeatScheduler;
@@ -145,6 +153,67 @@ public class ChatController {
         emitter.onTimeout(cleanup);
         emitter.onError(e -> cleanup.run());
         return emitter;
+    }
+
+    /**
+     * 显式续跑未完成任务（SSE 流式）：按会话定位唯一 RUNNING 任务，回填已完成步骤、只跑剩余步骤。
+     * 事件类型与 stream 一致（progress 播报 / token 正文 / citations 引用 / error 错误）。
+     */
+    @PostMapping(value = "/task/resume", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter resume(@RequestBody ResumeTaskRequest request) {
+        SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
+        String conversationId = resolveConversationId(request.conversationId());
+        Flux<StreamEvent> flux = chatService.resume(conversationId);
+
+        AtomicBoolean finished = new AtomicBoolean(false);
+        Disposable subscription = flux.doOnNext(event -> {
+                    try {
+                        emitter.send(Map.of(event.type(), event.text() == null ? "" : event.text()));
+                    } catch (IOException e) {
+                        emitter.completeWithError(e);
+                    }
+                })
+                .doOnComplete(() -> {
+                    finished.set(true);
+                    emitter.complete();
+                })
+                .doOnError(e -> {
+                    finished.set(true);
+                    emitter.completeWithError(e);
+                })
+                .subscribe();
+
+        // 心跳逻辑与 stream 一致（见 stream 方法内注释）：续跑剩余步骤期间无字节流出，易被反向代理判空闲切断。
+        ScheduledFuture<?> heartbeat = heartbeatSeconds > 0
+                ? heartbeatScheduler.scheduleWithFixedDelay(() -> {
+                    if (finished.get()) {
+                        return;
+                    }
+                    try {
+                        emitter.send(Map.of(StreamEvent.TYPE_PING, "1"));
+                    } catch (Exception e) {
+                        finished.set(true);
+                    }
+                }, heartbeatSeconds, heartbeatSeconds, TimeUnit.SECONDS)
+                : null;
+
+        Runnable cleanup = () -> {
+            finished.set(true);
+            subscription.dispose();
+            if (heartbeat != null) {
+                heartbeat.cancel(false);
+            }
+        };
+        emitter.onCompletion(cleanup);
+        emitter.onTimeout(cleanup);
+        emitter.onError(e -> cleanup.run());
+        return emitter;
+    }
+
+    /** 查询当前会话的未完成任务（前端「继续执行」提示条用）；无 RUNNING 任务返回 null。 */
+    @GetMapping("/task/running")
+    public Task running(@RequestParam String conversationId) {
+        return taskService.findRunning(resolveConversationId(conversationId));
     }
 
     /**

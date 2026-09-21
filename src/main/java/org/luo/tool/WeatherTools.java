@@ -22,6 +22,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * 提供两个 @Tool 方法：单日查询与日期范围查询。内部完成「城市→经纬度」地理编码、
  * 调用预报接口、把 WMO weather_code 映射为中文并整理为易读文本三件事，
  * 即「日期解析 → 查询 → 结果处理」中的后两步。城市地理编码结果带缓存。
+ * <p>
+ * 日期参数（date/startDate/endDate）缺省时回填今天：模型在多轮追问（如「上海呢」）里不会稳定继承上一轮日期，
+ * 与其让模型反复追问日期，不如工具自己兜底「缺省=今天」，city 保持必填。
  */
 @Slf4j
 @Service
@@ -35,28 +38,31 @@ public class WeatherTools implements ToolProvider {
     /** 城市 → 经纬度缓存（线程安全）。 */
     private final Map<String, double[]> geoCache = new ConcurrentHashMap<>();
 
-    @Tool(description = "查询某个城市在指定单日的天气。city 为城市名（如 北京、上海、杭州），date 为 YYYY-MM-DD 格式的具体日期。" +
-            "返回该日天气摘要（天气状况、最高/最低气温）。必须先由 resolveDate 得到具体日期后再调用。")
+    @Tool(description = "查询某个城市在指定单日的天气。city 为城市名（如 北京、上海、杭州），date 为 YYYY-MM-DD 格式的具体日期，" +
+            "缺省时默认今天，无需追问。返回该日天气摘要（天气状况、最高/最低气温）。")
     public String queryWeatherByDate(
             @ToolParam(description = "城市名称，如 北京、上海、广州") String city,
-            @ToolParam(description = "具体日期，格式 YYYY-MM-DD，例如 2026-08-23") String date) {
+            @ToolParam(description = "具体日期，格式 YYYY-MM-DD，例如 2026-08-23；缺省时默认今天", required = false) String date) {
         return doQuery(city, date, date);
     }
 
-    @Tool(description = "查询某个城市在指定日期范围内的天气（含起止两天）。city 为城市名，startDate/endDate 为 YYYY-MM-DD 格式。" +
-            "返回区间内每日天气摘要。必须先由 resolveDate 得到具体日期范围后再调用。")
+    @Tool(description = "查询某个城市在指定日期范围内的天气（含起止两天）。city 为城市名，startDate/endDate 为 YYYY-MM-DD 格式，" +
+            "任一缺省时默认今天。返回区间内每日天气摘要。")
     public String queryWeatherByRange(
             @ToolParam(description = "城市名称，如 北京、上海、广州") String city,
-            @ToolParam(description = "起始日期，格式 YYYY-MM-DD") String startDate,
-            @ToolParam(description = "结束日期，格式 YYYY-MM-DD") String endDate) {
+            @ToolParam(description = "起始日期，格式 YYYY-MM-DD；缺省时默认今天", required = false) String startDate,
+            @ToolParam(description = "结束日期，格式 YYYY-MM-DD；缺省时默认今天", required = false) String endDate) {
         return doQuery(city, startDate, endDate);
     }
 
     private String doQuery(String city, String startDate, String endDate) {
-        if (city == null || city.isBlank() || startDate == null || startDate.isBlank()
-                || endDate == null || endDate.isBlank()) {
-            return "缺少必要参数（city/startDate/endDate），无法查询天气。";
+        // city 必填；日期缺省（null/空串）回填今天，避免模型因日期缺失反过来追问用户
+        if (city == null || city.isBlank()) {
+            return "缺少城市参数（city），无法查询天气。";
         }
+        String today = LocalDate.now().format(FMT);
+        if (startDate == null || startDate.isBlank()) startDate = today;
+        if (endDate == null || endDate.isBlank()) endDate = today;
         try {
             LocalDate s = LocalDate.parse(startDate, FMT);
             LocalDate e = LocalDate.parse(endDate, FMT);

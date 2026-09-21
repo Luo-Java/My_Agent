@@ -217,3 +217,49 @@
 - **配置注释与事实对齐**：`spring.sql.init` 默认整段注释 = 不自动建表（DDL 人工执行）；库 `agent` 需手动建
   （URL 无 `createDatabaseIfNotExist`）；`agent.vision.model` 默认 `qwen3.5-ocr`（`VisionProperties.DEFAULT_MODEL`）。
 
+## 八、MCP 接入（2026-09-17，官方 starter 路线）
+
+**选型**：走官方 `org.springframework.ai:spring-ai-starter-mcp-client`（版本由 `spring-ai-bom` 统一管，pom 里
+不写版本号），不采用自研极简客户端。本地仓库原先没有 MCP 构件，**首次构建需联网拉取一次**
+（`ONLINE=1 bash .workbuddy/memory/run_mvn.sh`），之后照旧离线 `-o` 构建。
+传递依赖：`spring-ai-mcp` / `spring-ai-mcp-annotations` / `spring-ai-autoconfigure-mcp-client-{common,httpclient}`
+/ `io.modelcontextprotocol.sdk:mcp:2.0.0`（+ `mcp-core`、`mcp-json-jackson3`）。
+
+**接线**：`org.luo.tool.McpToolSource implements ToolCallbackSource`，注入 `ObjectProvider<ToolCallbackProvider>`
+（starter 为每个 MCP server 装配一个 `Sync/AsyncMcpToolCallbackProvider`），逐个 try/catch 后合并，分组名固定 `MCP`。
+- 该接口的返回值在 **`ToolRegistry` 构造期**被消费 ⇒ **必须吞异常**，否则一个 server 挂掉等于应用起不来。
+- 不要另开注册路径：绕过 `ToolRegistry` 会出现「前端工具装配看不到 / `tools_json` 白名单选不中 /
+  `LenientToolCallbackResolver` 兜底不认识」三处静默失效。
+
+**配置**（`spring.ai.mcp.client.*`；下表默认值取自 2.0.0 的 `spring-configuration-metadata.json`）：
+
+| 键 | 默认 | 本项目取值 |
+|---|---|---|
+| `enabled` | true | true |
+| `name` / `version` | `spring-ai-mcp-client` / `1.0.0` | `my-agent` / `1.0.0` |
+| `type` | `sync` | `sync`（与全同步工具链一致） |
+| `request-timeout` | `20s` | `15s`（工具卡住不拖垮整轮） |
+| `toolcallback.enabled` | true | true（**关掉则 `McpToolSource` 收不到任何工具**） |
+| `initialized` | true | 未改 = 启动时同步 initialize |
+| `stdio.connections` / `streamable-http.connections` / `sse.connections` | 空 | **刻意留空** |
+| `stdio.servers-configuration` | — | 未用（Claude Desktop 风格 JSON 文件） |
+
+`stdio.connections.<名>` 的字段为 `command` / `args`(List) / `env`(Map)。
+**主 yaml 刻意不声明任何 server** ⇒ 默认即「不接入」，启动行为与未引入 MCP 时一致（零连接、零等待）；
+真正的 server 配置只写 `application-local.yaml`（已 gitignore）。
+
+**坑**：
+- **Windows**：`npx` / `npm` / `node` 都是 `.cmd` 批处理，`ProcessBuilder` 不能直接执行 ⇒ 必须
+  `command: cmd.exe` + `args: ["/c", "npx", ...]`，否则表现为「启动即退出、连不上」。
+- 启动时会同步做一次 `tools/list`，server 不健康会拖慢启动；工具名以 server 返回为准
+  （`DefaultMcpToolNamePrefixGenerator` 仅在跨连接重名时才加前缀），别凭猜 —— 看 `GET /api/agent/tools`
+  的 `MCP` 分组。
+- **安全**：stdio 配置等价于「在本机拉起任意进程」。server 配置只能来自配置文件，**绝不能让接口 / 前端在
+  运行时新增**；MCP 返回的文本按不可信外部数据对待（同 RAG 文档，只进工具结果位、不进 system 指令位）；
+  `tools_json` 为 NULL / 空 = 挂全量 ⇒ 接入 MCP 后「全量装配」的智能体会**自动获得 MCP 工具**，
+  接入前先想清楚要不要改成显式白名单。
+
+**未验证 / 验收**：应用未启动（按项目约定不由 AI 启动），故「无 server 时零副作用」目前只有静态证据
+（两个自动配置类带 `@ConditionalOnProperty` / `@ConditionalOnMissingBean` 守卫）。验收方式：启动日志出现
+`MCP 工具加载：N 个`，且 `GET /api/agent/tools` 能列出 `MCP` 分组的工具；再建个测试智能体写
+`tools_json: ["<工具名>"]` 试调。

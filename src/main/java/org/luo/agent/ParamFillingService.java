@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.properties.PromptProperties;
 import org.luo.entity.Agent;
 import org.luo.entity.ChatMessage;
+import org.luo.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
@@ -47,12 +48,15 @@ public class ParamFillingService {
     private final ChatModel chatModel;
     private final ConversationService conversationService;
     private final PromptProperties promptProperties;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响参数抽取）。 */
+    private final LlmUsageService llmUsageService;
 
     public ParamFillingService(ChatModel chatModel, ConversationService conversationService,
-                               PromptProperties promptProperties) {
+                               PromptProperties promptProperties, LlmUsageService llmUsageService) {
         this.chatModel = chatModel;
         this.conversationService = conversationService;
         this.promptProperties = promptProperties;
+        this.llmUsageService = llmUsageService;
     }
 
     /**
@@ -82,7 +86,7 @@ public class ParamFillingService {
         int asked = countClarifyStreak(history);          // 已连续追问次数
         // 参数抽取范围 = 最后一次正式回答之后的用户请求到末尾（原始请求 + ≤MAX_CLARIFY 轮问答），天然有界
         List<ChatMessage> scoped = clarifyScopedHistory(history);
-        Map<String, String> params = extractParams(message, scoped, schema);
+        Map<String, String> params = extractParams(conversationId, message, scoped, schema);
         List<ParamDef> missing = missingRequired(schema, params);
         Map<String, String> paramLabels = schema.stream()
                 .collect(Collectors.toMap(ParamDef::key, ParamDef::label, (a, b) -> a));
@@ -149,7 +153,8 @@ public class ParamFillingService {
      * 用裸 ChatModel 从「当前任务切片 + 本轮输入」抽取参数（纯文本行式 "key: 取值"）。
      * 只在用户明确表达时填值、禁止臆测，失败回退空 Map。
      */
-    private Map<String, String> extractParams(String message, List<ChatMessage> history, List<ParamDef> schema) {
+    private Map<String, String> extractParams(String conversationId, String message, List<ChatMessage> history,
+                                              List<ParamDef> schema) {
         String schemaText = schema.stream().map(p ->
                         "- " + p.key + "（" + (p.required ? "必填" : "可选") + "）：" + p.label
                                 + (p.hint != null && !p.hint.isBlank() ? "；提示：" + p.hint : "")
@@ -164,6 +169,7 @@ public class ParamFillingService {
                             Map.of("schemaText", schemaText))),
                     new UserMessage("对话历史：\n" + (histText.isBlank() ? "（无）" : histText)
                             + "\n\n本次用户输入：\n" + message))));
+            llmUsageService.recordAsync("CLARIFY", conversationId, null, r);
             var generation = r.getResult();
             var assistantMessage = generation != null ? generation.getOutput() : null;
             String reply = assistantMessage != null ? assistantMessage.getText() : null;

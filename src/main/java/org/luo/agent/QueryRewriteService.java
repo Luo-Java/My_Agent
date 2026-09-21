@@ -5,6 +5,7 @@ import org.luo.properties.PromptProperties;
 import org.luo.properties.RagProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.service.ConversationService;
+import org.luo.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
@@ -51,15 +52,19 @@ public class QueryRewriteService {
     private final ConversationService conversationService;
     private final PromptProperties promptProperties;
     private final RagProperties ragProperties;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响改写）。 */
+    private final LlmUsageService llmUsageService;
 
     public QueryRewriteService(ChatModel chatModel,
                               ConversationService conversationService,
                               PromptProperties promptProperties,
-                              RagProperties ragProperties) {
+                              RagProperties ragProperties,
+                              LlmUsageService llmUsageService) {
         this.chatModel = chatModel;
         this.conversationService = conversationService;
         this.promptProperties = promptProperties;
         this.ragProperties = ragProperties;
+        this.llmUsageService = llmUsageService;
         log.info("QueryRewriteService 初始化：查询改写开关={}，参与改写的历史条数={}",
                 ragProperties.queryRewriteOn(), ragProperties.queryRewriteHistorySize());
     }
@@ -77,7 +82,7 @@ public class QueryRewriteService {
                 // 首轮（或历史里没有任何可读文本）：没有指代可消解，直接原话，省一次模型调用
                 return message;
             }
-            String rephrased = call(historyText, message);
+            String rephrased = call(conversationId, historyText, message);
             String cleaned = sanitize(rephrased, message);
             if (!cleaned.equals(message)) {
                 log.debug("查询改写：会话={}，「{}」→「{}」", conversationId, message, cleaned);
@@ -108,12 +113,13 @@ public class QueryRewriteService {
     }
 
     /** 一次改写调用（裸 ChatModel：无 advisor、无工具、不写记忆）。 */
-    private String call(String historyText, String message) {
+    private String call(String conversationId, String historyText, String message) {
         ChatResponse response = chatModel.call(new Prompt(List.of(
                 new SystemMessage(promptProperties.queryRewriteSystem()),
                 new UserMessage("对话历史：\n" + historyText
                         + "\n\n用户最新一条消息：\n" + message
                         + "\n\n请只输出改写后的问题："))));
+        llmUsageService.recordAsync("REWRITE", conversationId, null, response);
         var generation = response.getResult();
         var assistantMessage = generation != null ? generation.getOutput() : null;
         return assistantMessage != null ? assistantMessage.getText() : null;

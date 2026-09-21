@@ -53,6 +53,15 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
         </dependency>
+        <!-- MCP 客户端（官方 starter）：
+             - 支持 stdio / Streamable-HTTP 两种 transport，工具以 ToolCallbackProvider 形式暴露
+             - 本项目的 McpToolSource 再把它收进 ToolRegistry（动态工具接缝 ToolCallbackSource）
+             注：本地离线仓库原本不含该构件及 io.modelcontextprotocol.sdk 传递依赖，
+             首次构建需联网拉取一次；之后仍可离线 -o 构建。 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-client</artifactId>
+        </dependency>
         <!-- Spring AI 模板引擎（ST/StringTemplate）：提示词模板化渲染，StTemplateRenderer 依赖。
              注：用模块本体而非 starter（starter 未在离线仓库）。
              注意：本模块 pom 错误地声明了 antlr4-runtime，而 ST4 4.3.4 实际运行时依赖的是

@@ -7,7 +7,9 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * 单轮对话的可观测上下文（一次对话 = 一个 RoundTrace）。
@@ -64,6 +66,25 @@ public class RoundTrace {
     private final List<ToolCall> toolCalls = new ArrayList<>();
     private final List<KbCitation> citations = new ArrayList<>();
 
+    /**
+     * 执行过程进度回调（可选）。流式接口由 {@code ChatService} 注入，把各环节（路由 / 检索 / 工具调用）
+     * 的进展实时推到前端（{@code StreamEvent.progress}）；同步接口为默认空实现。与「纯旁路、不影响对话」
+     * 一脉相承：回调只做展示、抛异常由调用方兜住，缺数据可接受。
+     */
+    private Consumer<String> progress = text -> {};
+
+    /** 工具名 → 中文动作的映射，用于把 Advisor 采集到的工具名翻译成可读的进度文案（未知工具名原样回显）。 */
+    private static final Map<String, String> TOOL_LABELS = Map.of(
+            "query", "查询数据库",
+            "describe_table", "查看表结构",
+            "sample_rows", "查看样例数据",
+            "validate_sql", "校验 SQL",
+            "chart_echarts", "生成图表",
+            "chart_histogram", "生成分布图",
+            "queryWeatherByDate", "查询天气",
+            "queryWeatherByRange", "查询天气",
+            "resolveDate", "解析日期");
+
     private int promptTokens;
     private int completionTokens;
     private int totalTokens;
@@ -104,8 +125,9 @@ public class RoundTrace {
     /**
      * 记录本轮 RAG 引用（<b>覆盖</b>语义）。用覆盖而非追加：规划模式每步各自从 [1] 编号，
      * 跨步追加会出现重复序号、与正文角标对不上；最终回答由最后一步产出，故只保留那份编号。
+     * 同步：DAG 并行的同层步骤可能并发回写，clear+addAll 非原子，需加锁。
      */
-    public void citations(List<KbCitation> hits) {
+    public synchronized void citations(List<KbCitation> hits) {
         this.citations.clear();
         if (hits != null) {
             this.citations.addAll(hits);
@@ -115,16 +137,43 @@ public class RoundTrace {
     /**
      * 同步工具调用明细（<b>只增不减</b>语义）。Advisor 每轮模型调用都经过，传入的是「此刻完整历史里
      * 已执行的工具」（随循环单调增长）；故只在更长时替换，避免后一次调用（如最后一轮无工具）把已有记录清空。
+     * 同时把<b>新增</b>的工具调用经 {@link #progress} 播报出去（仅运行期展示，不进记忆、不进落库）。
+     * 同步：DAG 并行的同层步骤并发经此回写，「比较大小 + 替换」与进度播报有竞态，需加锁保证只增不减。
      */
-    public void syncToolCalls(List<ToolCall> calls) {
-        if (calls != null && calls.size() > toolCalls.size()) {
-            toolCalls.clear();
-            toolCalls.addAll(calls);
+    public synchronized void syncToolCalls(List<ToolCall> calls) {
+        if (calls == null || calls.size() <= toolCalls.size()) {
+            return;
+        }
+        // 只播报本次新增的部分（历史已有的不重复提醒）
+        List<ToolCall> fresh = calls.subList(toolCalls.size(), calls.size());
+        for (ToolCall tc : fresh) {
+            progress.accept("🔧 调用工具：" + labelOf(tc.name()));
+        }
+        toolCalls.clear();
+        toolCalls.addAll(calls);
+    }
+
+    /** 注入执行过程进度回调（流式接口传入，同步接口保持默认空实现）。 */
+    public void onProgress(Consumer<String> callback) {
+        if (callback != null) {
+            this.progress = callback;
         }
     }
 
-    /** 累加一次模型调用的 token 用量（工具循环内会有多次，累加得到本轮总量）。 */
-    public void addUsage(Integer prompt, Integer completion, Integer total) {
+    /** 各环节直接播报一条执行过程（路由 / 检索 / 改写等前置链与工具循环共用同一通道）。 */
+    public void reportProgress(String text) {
+        if (text != null && !text.isBlank()) {
+            this.progress.accept(text);
+        }
+    }
+
+    /** 工具名 → 中文动作文案（未知工具名原样回显，避免「tool」这类兜底名显示空泛）。 */
+    private static String labelOf(String name) {
+        return name == null ? "未知工具" : TOOL_LABELS.getOrDefault(name, name);
+    }
+
+    /** 累加一次模型调用的 token 用量（工具循环内会有多次，累加得到本轮总量）。同步：DAG 并行下多线程累加需原子。 */
+    public synchronized void addUsage(Integer prompt, Integer completion, Integer total) {
         if (prompt != null) promptTokens += prompt;
         if (completion != null) completionTokens += completion;
         if (total != null) {

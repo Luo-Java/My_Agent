@@ -3,6 +3,7 @@ package org.luo.agent;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.properties.PromptProperties;
 import org.luo.entity.Agent;
+import org.luo.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
@@ -34,28 +35,37 @@ public class AgentRouter {
     private final AgentService agentService;
     private final ChatModel chatModel;
     private final PromptProperties promptProperties;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响路由）。 */
+    private final LlmUsageService llmUsageService;
 
-    public AgentRouter(AgentService agentService, ChatModel chatModel, PromptProperties promptProperties) {
+    public AgentRouter(AgentService agentService, ChatModel chatModel, PromptProperties promptProperties,
+                       LlmUsageService llmUsageService) {
         this.agentService = agentService;
         this.chatModel = chatModel;
         this.promptProperties = promptProperties;
+        this.llmUsageService = llmUsageService;
     }
 
     /** 不带追问上下文的普通路由；未命中或失败返回 null。 */
     public Agent route(String message) {
-        return route(message, null, null).agent();
+        return route(message, null, null, null).agent();
     }
 
     /** 携带「待回答的追问」上下文做路由决策。 */
     public RouteDecision route(String message, String pendingQuestion) {
-        return route(message, pendingQuestion, null);
+        return route(message, pendingQuestion, null, null);
+    }
+
+    /** 携带「待回答的追问」与「最近对话上下文」做路由决策（旧签名，会话 ID 缺省为空）。 */
+    public RouteDecision route(String message, String pendingQuestion, String recentContext) {
+        return route(message, pendingQuestion, recentContext, null);
     }
 
     /**
      * 携带「待回答的追问」与「最近对话上下文」做路由：后者用于识别「承接上一轮的短追问」
-     * （如上一轮查天气、本轮只说「北京呢？」），避免被误判为普通对话。
+     * （如上一轮查天气、本轮只说「北京呢？」），避免被误判为普通对话。conversationId 用于成本采集（可空）。
      */
-    public RouteDecision route(String message, String pendingQuestion, String recentContext) {
+    public RouteDecision route(String message, String pendingQuestion, String recentContext, String conversationId) {
         List<Agent> agents = agentService.listAgents();
         if (agents == null || agents.isEmpty()) {
             log.debug("智能路由：暂无智能体，跳过路由");
@@ -85,6 +95,7 @@ public class AgentRouter {
             ChatResponse response = chatModel.call(new Prompt(List.of(
                     new SystemMessage(system),
                     new UserMessage("用户消息：\n" + message))));
+            llmUsageService.recordAsync("ROUTE", conversationId, null, response);
             var generation = response.getResult();
             var assistantMessage = generation != null ? generation.getOutput() : null;
             String reply = assistantMessage != null ? assistantMessage.getText() : null;

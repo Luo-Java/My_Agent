@@ -3,6 +3,7 @@ package org.luo.infrastructure.vision;
 import cn.hutool.core.exceptions.ExceptionUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.properties.VisionProperties;
+import org.luo.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -30,7 +31,7 @@ import org.luo.controller.ChatController;
  * <p>
  * 采用 <b>Spring AI 原生多模态</b>：注入裸 {@link ChatModel} 直接 {@code call(Prompt)}，图片由
  * {@code UserMessage.builder().media(Media)} 承载，per-request {@link OpenAiChatOptions} 覆盖为视觉模型
- * （{@code agent.vision.model}，默认 qwen3.5-ocr）。
+ * （{@code agent.vision.model}，默认 {@link VisionProperties#DEFAULT_MODEL}）。
  * <p>
  * <b>为什么注入裸 ChatModel</b>（与 AgentRouter / MemoryMergeService / ParamFillingService / PromptService
  * 同一模式）：绕开 advisor 与记忆机制（视觉识别是同步、单轮、无状态的独立调用，不应污染会话记忆）；
@@ -54,13 +55,17 @@ public class VisionService {
     private final VisionProperties props;
     private final ChatModel chatModel;
     private final Executor visionExecutor;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响识别）。 */
+    private final LlmUsageService llmUsageService;
 
     public VisionService(VisionProperties props,
                          ChatModel chatModel,
-                         @Qualifier("visionExecutor") Executor visionExecutor) {
+                         @Qualifier("visionExecutor") Executor visionExecutor,
+                         LlmUsageService llmUsageService) {
         this.props = props;
         this.chatModel = chatModel;
         this.visionExecutor = visionExecutor;
+        this.llmUsageService = llmUsageService;
         log.info("VisionService 初始化：model={}（Spring AI 原生多模态，裸 ChatModel 直调，多图并发）", props.model());
     }
 
@@ -144,6 +149,7 @@ public class VisionService {
                     .build());
 
             ChatResponse response = chatModel.call(prompt);
+            llmUsageService.recordAsync("VISION", null, null, response);
             String caption = (response == null || response.getResult() == null
                     || response.getResult().getOutput() == null)
                     ? null : response.getResult().getOutput().getText();

@@ -10,7 +10,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * （不在此处），视觉识别模型是 {@code agent.vision.model}（未配置时默认 {@link #DEFAULT_MODEL}）。
  * 这样既能吃图理解，又不污染主对话模型的稳定性。
  *
- * @param model          视觉模型名（dashscope OpenAI 兼容接口支持：qwen3.5-ocr / qwen-vl-plus 等）
+ * @param model          视觉模型名（dashscope OpenAI 兼容接口支持：qwen-vl-plus / qwen-image-2.0-pro 等）
  * @param prompt         注入视觉模型的固定指令（客观描述 / 保留原题与选项 / 表格结构化输出）
  * @param maxImageBytes  单张图片字节上限；超出返回「图片过大」占位文本，避免大图击穿超时
  * @param timeoutSeconds 单次识别的编排层超时（秒）——Spring AI 无 per-request 超时，由 VisionService 用
@@ -20,7 +20,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record VisionProperties(String model, String prompt, long maxImageBytes, int timeoutSeconds) {
 
     /** 未配置视觉模型时的默认值（构造器兜底与 yaml 注释都以本常量为准，勿只改一处）。 */
-    public static final String DEFAULT_MODEL = "qwen3.5-ocr";
+    public static final String DEFAULT_MODEL = "qwen-image-2.0-pro-2026-06-22";
 
     public VisionProperties {
         if (model == null || model.isBlank()) model = DEFAULT_MODEL;

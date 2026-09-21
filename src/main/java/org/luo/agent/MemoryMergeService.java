@@ -6,6 +6,7 @@ import org.luo.properties.PromptProperties;
 import org.luo.entity.ChatMessage;
 import org.luo.entity.Conversation;
 import org.luo.memory.DbChatMemory;
+import org.luo.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
@@ -47,6 +48,8 @@ public class MemoryMergeService {
     private final Executor memoryMergeExecutor;
     /** 记忆窗口配置：与 {@code DbChatMemory} 共用同一份——两处参数不一致会让「被摘要区间」与窗口错位。 */
     private final MemoryProperties memoryProperties;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响合并）。 */
+    private final LlmUsageService llmUsageService;
 
     /** 合并中的会话：同一会话互斥，避免连发消息时并发触发多次合并相互覆盖（跳过的那次下一轮会重查）。 */
     private final Set<String> merging = ConcurrentHashMap.newKeySet();
@@ -54,12 +57,14 @@ public class MemoryMergeService {
     public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
                               @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor,
                               PromptProperties promptProperties,
-                              MemoryProperties memoryProperties) {
+                              MemoryProperties memoryProperties,
+                              LlmUsageService llmUsageService) {
         this.conversationService = conversationService;
         this.chatModel = chatModel;
         this.memoryMergeExecutor = memoryMergeExecutor;
         this.memoryMergeSystem = promptProperties.memoryMergeSystem();
         this.memoryProperties = memoryProperties;
+        this.llmUsageService = llmUsageService;
     }
 
     /**
@@ -123,7 +128,7 @@ public class MemoryMergeService {
             // 只取「尚未摘要的那一段」（按全量索引区间开窗），长会话下不再整段历史读进内存
             List<ChatMessage> delta = conversationService.getMessagesRange(
                     conversationId, alreadySummarized, windowStart);
-            SummaryResult sr = summarize(conv.getSummary(), conv.getCoreFacts(), delta);
+            SummaryResult sr = summarize(conversationId, conv.getSummary(), conv.getCoreFacts(), delta);
             conversationService.updateMemory(conversationId, sr.summary, sr.coreFacts, windowStart);
             log.info("记忆合并完成：合并 {} 条，已覆盖条数={}", delta.size(), windowStart);
         } catch (Exception e) {
@@ -135,7 +140,8 @@ public class MemoryMergeService {
      * 把「新增溢出的历史」与「已有摘要/关键事实」合并，一次 LLM 调用同时产出新摘要与新核心信息；
      * LLM 失败时两者均回退原值。
      */
-    private SummaryResult summarize(String existingSummary, String existingCoreFacts, List<ChatMessage> newMessages) {
+    private SummaryResult summarize(String conversationId, String existingSummary, String existingCoreFacts,
+                                    List<ChatMessage> newMessages) {
         try {
             StringBuilder sb = new StringBuilder();
             sb.append("【已有摘要】\n").append(existingSummary == null || existingSummary.isBlank() ? "（无）" : existingSummary).append("\n\n");
@@ -148,6 +154,7 @@ public class MemoryMergeService {
             ChatResponse response = chatModel.call(new Prompt(List.of(
                     new SystemMessage(memoryMergeSystem),
                     new UserMessage(sb.toString()))));
+            llmUsageService.recordAsync("MEMORY_MERGE", conversationId, null, response);
             var generation = response.getResult();
             var assistantMessage = generation != null ? generation.getOutput() : null;
             String reply = assistantMessage != null ? assistantMessage.getText() : null;

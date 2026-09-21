@@ -9,24 +9,28 @@
 - **自定义智能体**：页面创建任意角色（翻译、天气、教育数据分析、代码助手…），配置人设提示词、模型、温度与可用工具；提示词自动汇总到 `agent_code.md`。
 - **智能路由**：未绑定智能体的会话由 LLM 三态路由（命中智能体 / 普通对话 / 正在回答追问），并携带最近上下文识别「北京呢？」这类承接上一轮的短追问。
 - **参数追问补全**：智能体用 `paramSchema`（JSON 数组）声明参数；缺失必填项时自动追问（上限 3 轮），参数齐全才正式回答。跟进任务会继承上一轮已明确的参数（如「今天」→ 日期=今天）。追问状态**无显式存储**，每轮从历史重放推导，天然跨重启一致。
-- **动态规划（Planner）**：会话级 🧭 开关开启后，由 LLM 运行时把用户目标拆成多智能体步骤并顺序执行；执行过程实时展示、不写入记忆。规划模式与绑定智能体互斥。
+- **动态规划（Planner）**：会话级 🧭 开关开启后，由 LLM 运行时把用户目标拆成多智能体步骤并**按依赖并行**执行；执行过程实时展示、不写入记忆。规划模式与绑定智能体互斥。**任务状态持久化**：每轮规划落库 `task`/`task_step`，服务重启/中断后可点「继续执行」显式续跑剩余步骤（不重新规划）。
 - **双层记忆**：短期窗口（`chat_message` 原文，受 token 预算与条数下限约束）+ 长期滚动摘要（`conversation.summary` / `core_facts`）；超窗历史异步压缩合并，**先推回复、后处理记忆**。
 - **流式输出**：SSE 推送 `token`（正文，进记忆）、`progress`（执行过程，不进记忆）、`citations`（引用来源）、`ping`（心跳）、`error` 等事件，前端逐字渲染。
 - **链路追踪**：每轮对话的路由来源、规划步骤、改写后检索问句、RAG 命中、工具调用（参数/结果/token/耗时）异步落库 `agent_trace`；页面 🔍 追踪弹窗可查看本会话最近 50 轮。
+- **成本看板**：全量成本口径——除「回答本身」（`agent_trace`）外，路由判定/参数抽取/查询改写/视觉识别/记忆合并这些裸 `ChatModel` 调用也各自记入 `llm_usage`（按用途 `purpose` 拆解）；页面 💰 成本弹窗按天趋势 + 按用途聚合展示（近 7/30/90 天）。
 
 ### 知识库与多模态
 
 - **知识库 RAG（会话级纯开关 + 自动多库）**：会话开启「📚 RAG」后，每轮自动检索「通用知识库（`agent_id` 为空）＋路由/绑定智能体的专属库」，多库一次合并检索并注入编号上下文；关闭即完全不检索。三段式检索：**粗排召回 → 精排（DashScope text-rerank）→ 编号注入**，精排不可用时降级「向量分截断」。检索前会用最近若干轮历史做**多轮查询改写**（指代消解），首轮/未开 RAG 自动跳过。
 - **以「文件」为管理单元**：上传 → 解析 → 分片 → 向量化入库并登记（`kb_file`）；支持 4 种分片策略（fixed / paragraph / recursive / markdown）与重叠字数、**重新分片**（不重传换策略）、**同名重传=替换**。
 - **向量存储双写**：MySQL 留档（源，向量以 JSON 文本存 `kb_chunk`）+ Chroma 加速副本。检索优先 Chroma（余弦 TopK），不可用/无命中自动降级 MySQL 余弦（有界扫描，防 OOM）；`POST /api/kb/chroma/sync` 幂等回填副本。Chroma 写入统一延后到**事务提交之后**，避免 MySQL 回滚后副本失配。
-- **多模态图片理解**：输入框 🖼 支持多选图片（≤5 张 / 单张 ≤10MB），由视觉模型（默认 `qwen3.5-ocr`，可配）识别成中文 caption 拼入本轮上下文；走 Spring AI 原生多模态（裸 `ChatModel` + `UserMessage.media`，per-request 覆盖模型、多图并发识别）。**原始二进制不进会话存储**——caption 仅当轮可见。
+- **多模态图片理解**：输入框 🖼 支持多选图片（≤5 张 / 单张 ≤10MB），由视觉模型（默认 `qwen-image-2.0-pro-2026-06-22`，可配）识别成中文 caption 拼入本轮上下文；走 Spring AI 原生多模态（裸 `ChatModel` + `UserMessage.media`，per-request 覆盖模型、多图并发识别）。**原始二进制不进会话存储**——caption 仅当轮可见。
 - **文档解析**：附件与知识库支持 txt / md / markdown / csv / json / xml / yml / properties / log / sql 文本，以及 pdf（PDFBox）、docx / xlsx（POI）。
 
 ### 工具调用
 
 - **全局能力池**：天气查询、日期解析、SQL 安全查询、表结构查看、样例数据、SQL 预检、ECharts 图表、文本直方图。
+- **有界工具循环**：Spring AI 默认的「模型调工具」循环是无上限的，模型反复调同一个工具会死循环拖垮 token。已用自定义 Advisor 装上双刹车——**轮数上限**（默认 10 轮，覆盖「查表→查数→画图」合理长链）+ **连续重复检测**（默认连续 3 次同名同参即停），超限走**软刹车**（追加「基于已有信息作答」指令，不抛错中断），配置见 `application.yaml` 的 `agent.tool-call.*`。
 - **按智能体装配**：`agent.tools_json` 控制白名单 —— `NULL`/空 = 挂全量、`[]` = 不挂、`["名"]` = 白名单（按 `@Tool` 名匹配，未指定 name 时即方法名）。未知名忽略、非法 JSON 回退全量。
 - **安全护栏**：SQL 工具仅允许只读 `SELECT`/`WITH`，白名单表名（student/class/teacher/subject/course/score）、拒绝多语句与可执行注释、结果行数上限。
+- **MCP 远端工具**：官方 `spring-ai-starter-mcp-client` 接入的 MCP server 工具经 `McpToolSource` 收进**同一个能力池**（前端分组显示为 `MCP`），与本地工具一样按 `tools_json` 装配。默认**不声明任何 server**，即「不接入」——启动行为与未引入 MCP 时一致。
+  接一个 server：在 `application-local.yaml` 写 `spring.ai.mcp.client.stdio.connections.<名>`，`command` 用可执行文件绝对路径、`args` 首项为 server 入口、其后为允许读写的沙箱根目录（**不要用 `npx`**，Windows 上是批处理包装、且依赖 PATH 与网络）。工具名以 server 返回为准，看 `GET /api/agent/tools` 的 `MCP` 分组。
 
 ## 技术栈
 
@@ -35,6 +39,7 @@
 | JDK | 17 |
 | Spring Boot | 4.0.7 |
 | Spring AI | 2.0.0（`spring-ai-starter-model-openai`，兼容 OpenAI 协议） |
+| MCP | `spring-ai-starter-mcp-client` 2.0.0（官方 MCP 客户端，stdio / Streamable-HTTP / SSE；默认不接 server） |
 | MyBatis-Plus | 3.5.16（`mybatis-plus-spring-boot4-starter`） |
 | MySQL | 8.x（`mysql-connector-j`） |
 | Chroma | 0.5.23（向量加速副本，`spring-ai-chroma-store` 2.0.0；与 MySQL 双写，缺失自动降级） |
@@ -42,7 +47,7 @@
 | PDFBox / POI | 2.0.30 / 4.1.2（pdf、docx、xlsx 文本抽取） |
 | 前端 | 内置静态页面（`static/index.html` + Vue 3 + 原生 CSS） |
 
-> 主对话模型默认 `kimi-k2.7-code`，向量化默认 `qwen3.7-text-embedding`，视觉默认 `qwen3.5-ocr`，精排固定 `gte-rerank-v2`；均可在 `application.yaml` 调整。
+> 主对话模型默认 `qwen3.7-flash-2026-07-15`，向量化默认 `qwen3.7-text-embedding`，视觉默认 `qwen-image-2.0-pro-2026-06-22`，精排固定 `gte-rerank-v2`；均可在 `application.yaml` 调整。
 
 ## 快速开始
 
@@ -95,8 +100,12 @@ spring:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1   # 可换 DeepSeek / Ollama 等兼容服务
       timeout: 60s
       max-retries: 1
-      chat:      {model: kimi-k2.7-code}
+      chat:      {model: qwen3.7-flash-2026-07-15}
       embedding: {model: qwen3.7-text-embedding}
+    mcp:                            # MCP 客户端：这里不声明 server（=不接入）；server 配置放 application-local.yaml
+                                    # 例：stdio.connections.<名>.command: <node.exe 绝对路径>
+                                    #     stdio.connections.<名>.args: [<server 入口 js>, <沙箱根目录>]
+      client: {enabled: true, name: my-agent, version: 1.0.0, type: sync, request-timeout: 15s}
 agent:
   memory: {recent-tokens: 4000, min-keep-messages: 2, max-message-chars: 4000}
   rag:    {rerank-enabled: true, recall-k: 20, top-k: 3, rerank-min-score: 0.20,
@@ -151,7 +160,8 @@ org.luo
 │   └── handler/     # RoundHandler + AgentRoundHandler / PlannerRoundHandler / RoundResult
 ├── chat/            # ChatComposer(请求装配：人设/记忆/材料/工具/RAG)
 ├── advisor/         # ToolUsageLoggingAdvisor / RoundTraceAdvisor
-├── tool/            # ToolRegistry(能力池) / WeatherTools / DateResolver
+├── tool/            # ToolRegistry(能力池) / ToolProvider(注解式工具) / ToolCallbackSource(动态工具接缝)
+│                    # / McpToolSource(MCP 远端工具) / WeatherTools / DateResolver
 │                    # / SqlQueryTool / SqlSafety / SqlSchemaTool / ChartTool
 ├── memory/          # DbChatMemory(Spring AI ChatMemory 的 DB 实现)
 ├── trace/           # RoundTrace(一轮收集器) / TraceService(异步落库)
@@ -202,6 +212,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 并发预取 | 前置链（路由/参数抽取/查询改写）由专用线程池并行，显著缩短首字节时延；预取只加速、不承担正确性，异常/超时一律回退用户原话 |
 | 纯旁路追踪 | `agent_trace` 删掉后对话照常运行；写入在回复产出后异步、失败只记日志 |
 | SSE 兜底 | 有限超时（默认 300s）+ 独立心跳调度器（默认 15s，专用线程池，不与打字机抢 Reactor 线程） |
+| 工具注册 | 两类来源统一进 `ToolRegistry`：注解式（`ToolProvider` + `@Tool` 反射）与动态式（`ToolCallbackSource`，如 MCP 远端工具、运行时才知道有哪些）；同名时注解式优先并告警 |
 
 ## API 一览
 
@@ -226,6 +237,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | DELETE | `/api/chat/conversation/{id}` | 删除会话及全部消息 |
 | GET | `/api/chat/conversations` | 会话列表（按最近更新倒序） |
 | GET | `/api/chat/history?conversationId=` | 读取会话历史消息 |
+| POST | `/api/chat/task/resume` | SSE 流式续跑未完成任务（显式按钮触发）：回填已完成步骤、只跑剩余步骤 |
+| GET | `/api/chat/task/running?conversationId=` | 查询当前会话的 RUNNING 任务（无则 null，供「继续执行」提示条） |
 
 ### 智能体
 
@@ -267,6 +280,12 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | GET | `/api/trace?conversationId=` | 某会话最近若干轮追踪 |
 | GET | `/api/trace/{traceId}` | 单轮追踪详情 |
 
+### 成本看板
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/cost/summary?days=` | 近 N 天（默认 30、上限 90）全量成本聚合：回答本身 + 裸调用按用途拆解 |
+
 ## 数据库表
 
 | 表 | 关键列 | 说明 |
@@ -278,13 +297,17 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | `kb_chunk` | id, kb_id, content, source, embedding, created_at | 知识块；`embedding` 为向量 JSON 文本（MySQL 源） |
 | `kb_file` | id, kb_id, file_name, file_type, chunk_strategy, chunk_overlap, size_bytes, chunk_count, raw_text | 以文件为管理单元；`raw_text` 支持不重传重新分片 |
 | `agent_trace` | trace_id, conversation_id, mode, route_source, agent_code, user_message, retrieval_query, plan_json, tool_calls, kb_hit_count, citations_json, prompt_tokens, completion_tokens, total_tokens, elapsed_ms, status | 纯旁路可观测表，删掉不影响对话 |
+| `llm_usage` | trace_id, conversation_id, purpose, model, prompt_tokens, completion_tokens, total_tokens, created_at | 裸 LLM 调用成本流水（全量成本口径）：路由/参数抽取/查询改写/视觉/记忆合并各记一条，按用途拆解 |
+| `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING |
+| `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败 |
 
 ## 前端界面
 
-- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪。
+- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪、💰 成本。
 - **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）。
 - **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
 - **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。
+- **成本看板弹窗**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。
 
 ## 开发备注
 

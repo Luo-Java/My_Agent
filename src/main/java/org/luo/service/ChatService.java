@@ -141,6 +141,58 @@ public class ChatService {
                 .delayElements(Duration.ofMillis(TYPING_FRAME_MS));
     }
 
+    /**
+     * 显式续跑未完成任务（流式）：按会话定位唯一 RUNNING 任务，回填已完成步骤、只跑剩余步骤。
+     * 事件类型与 {@link #stream} 一致（progress 播报、token 正文、citations 引用、error 错误）。
+     */
+    public Flux<StreamEvent> resume(String conversationId) {
+        return Flux.<StreamEvent>create(sink -> {
+                    try {
+                        doResume(conversationId, sink);
+                    } catch (Exception e) {
+                        log.error("续跑任务失败：会话={}，错误={}", conversationId, e.getMessage(), e);
+                        sink.next(StreamEvent.error("续跑失败：" + e.getMessage()));
+                    } finally {
+                        sink.complete();
+                    }
+                }, FluxSink.OverflowStrategy.BUFFER)
+                .subscribeOn(Schedulers.boundedElastic())
+                .delayElements(Duration.ofMillis(TYPING_FRAME_MS));
+    }
+
+    /** 续跑执行体（跑在弹性线程上），结果经 sink 推送。 */
+    private void doResume(String conversationId, FluxSink<StreamEvent> sink) {
+        log.info("续跑任务：会话={}", conversationId);
+        Conversation conv = conversationService.ensureConversation(conversationId);
+        Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
+        RoundTrace trace = startTrace(conversationId, "");
+        trace.mode(MODE_PLANNER);
+        trace.onProgress(progress);
+        RoundResult out;
+        try {
+            out = plannerRoundHandler.resumeTask(conv, conversationId, progress, trace);
+            if (out == null || out.isFallback()) {
+                sink.next(StreamEvent.error("没有未完成的任务，无需续跑"));
+                traceService.saveAsync(trace);
+                return;
+            }
+            trace.citations(out.citations());
+            // 续跑是「任务」的专属操作，不改变会话形态；回复推送后补写引用与收尾
+            emitChunks(sink, out.reply());
+            String citationsJson = KbCitation.toJson(out.citations());
+            if (!citationsJson.isEmpty()) {
+                sink.next(StreamEvent.citations(citationsJson));
+            }
+            persistCitations(conversationId, null, out.citations());
+            afterReply(conversationId, "");
+        } catch (RuntimeException | Error e) {
+            trace.markError(e.getMessage());
+            traceService.saveAsync(trace);
+            throw e;
+        }
+        traceService.saveAsync(trace);
+    }
+
     /** 流式执行体（跑在弹性线程上，可阻塞调用 LLM），结果经 sink 推送。 */
     private void doStream(String conversationId, String message, String material, String attachmentsJson,
                           FluxSink<StreamEvent> sink, Boolean planner) {
@@ -152,6 +204,8 @@ public class ChatService {
                 ? conversationService.maxMessageId(conversationId) : null;
         Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
         RoundTrace trace = startTrace(conversationId, message);
+        // 执行过程经 Advisor / 各前置环节回调进 trace 播报：流式才挂（同步接口无通道，见 NO_PROGRESS）
+        trace.onProgress(progress);
         RoundResult out;
         try {
             // 追问整段推、正式回答切片模拟打字机；progress 只展示不进记忆

@@ -1,4 +1,12 @@
-const { createApp, ref, reactive, computed, onMounted, nextTick } = Vue;
+// Vue 由 /js/lib/vue.global.prod.js 提供（已本地化，不再依赖 CDN）。
+// 缺了它，下面这行解构会抛 ReferenceError，整个文件静默失效、页面停在原始模板。
+// 显式拦一下，把原因写进控制台，并保留 chat.html 里 #boot-tip 的提示文案。
+if (typeof Vue === 'undefined') {
+    console.error('[启动失败] Vue 未加载：请确认 /js/lib/vue.global.prod.js 可访问（HTTP 200）。');
+    throw new Error('Vue 未加载，前端无法启动');
+}
+
+const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick } = Vue;
 
 // ==================== 接口访问密钥（X-Api-Key） ====================
 /** 密钥在浏览器本地的存储键。只存本机、不进页面源码（服务端配置 APP_API_KEY 后才需要填）。 */
@@ -68,6 +76,56 @@ function renderMd(text) {
     return html;
 }
 
+/** ECharts 深色主题：页面已改为深色科技风，ECharts 默认浅色主题的深色文字在暗底上看不清。
+ *  只改「文字 / 轴线 / 分隔线 / 提示框」这类框架级配色，不动模型给的系列色，
+ *  保证图表配色仍由数据决定，而坐标、图例、tooltip 与页面同色系。
+ *  注册一次即可（重复注册会告警），故用 flag 守卫。 */
+const ECHARTS_THEME = 'agent-dark';
+let echartsThemeReady = false;
+function ensureEchartsTheme() {
+    if (echartsThemeReady || typeof echarts === 'undefined') return;
+    const axisLineColor = 'rgba(110, 160, 255, .28)';
+    const splitLineColor = 'rgba(110, 160, 255, .10)';
+    const axis = {
+        axisLine: { lineStyle: { color: axisLineColor } },
+        axisTick: { lineStyle: { color: axisLineColor } },
+        axisLabel: { color: '#93a6c8' },
+        splitLine: { lineStyle: { color: splitLineColor } },
+        splitArea: { show: false },
+        nameTextStyle: { color: '#93a6c8' }
+    };
+    echarts.registerTheme(ECHARTS_THEME, {
+        color: ['#3b82f6', '#22d3ee', '#a78bfa', '#34d399', '#fbbf24', '#f87171'],
+        backgroundColor: 'transparent',
+        textStyle: { color: '#cfe0ff' },
+        title: {
+            textStyle: { color: '#e8eefc' },
+            subtextStyle: { color: '#93a6c8' }
+        },
+        legend: { textStyle: { color: '#93a6c8' } },
+        tooltip: {
+            backgroundColor: 'rgba(8, 14, 26, .95)',
+            borderColor: 'rgba(110, 160, 255, .32)',
+            borderWidth: 1,
+            textStyle: { color: '#e8eefc' },
+            axisPointer: {
+                lineStyle: { color: 'rgba(110, 160, 255, .45)' },
+                crossStyle: { color: 'rgba(110, 160, 255, .45)' },
+                label: { color: '#e8eefc', backgroundColor: '#1b2a4a' }
+            }
+        },
+        categoryAxis: axis,
+        valueAxis: axis,
+        timeAxis: axis,
+        logAxis: axis,
+        dataZoom: {
+            textStyle: { color: '#93a6c8' },
+            handleStyle: { color: '#3b82f6' }
+        }
+    });
+    echartsThemeReady = true;
+}
+
 /** 渲染所有 .echarts-box 容器（ECharts 图表）。防抖 300ms：流式高频重建 DOM 时避免反复 init。
  *  流结束时需手动调用一次强制渲染。 */
 let chartRenderTimer = null;
@@ -88,7 +146,8 @@ function renderChartsNow() {
             try { opt = JSON.parse(el.dataset.option); } catch (e) { return; }
             if (!opt) return;
             try {
-                const chart = echarts.init(el);
+                ensureEchartsTheme();
+                const chart = echarts.init(el, ECHARTS_THEME);
                 chart.setOption(opt);
                 el.dataset.inited = '1';
             } catch (e) { /* 单个图表失败不影响其余消息 */ }
@@ -114,7 +173,156 @@ function toMsg(role, content, attachments, citations) {
     };
 }
 
-createApp({
+// ── 自绘下拉组件（替代原生 select）───────────────────────────────────────────
+// 原生 select 展开的弹层是操作系统绘制的独立窗口（Windows 上不受页面渲染树管辖）：
+// 容器底色 / 边框 / 圆角 / 阴影 / 开合动画全由系统决定，CSS 碰不到；唯一能影响的 option
+// 配色还会让 Chromium 走「先建原生弹层、再套自定义色」的路径，点开闪一帧。改为页内自绘。
+// 弹层 Teleport 到 body 并用 fixed 定位：绕开祖先滚动容器的 overflow 裁剪
+// （.modal-body / 知识库面板都是 overflow:auto），也避开 .modal-mask 的 backdrop-filter
+// 建立包含块带来的干扰（fixed 相对遮罩定位，而遮罩本身 inset:0 全屏）。
+const UiSelect = {
+    name: 'UiSelect',
+    props: {
+        modelValue: { default: null },
+        options: { type: Array, default: () => [] },
+        placeholder: { type: String, default: '请选择' },
+        title: { type: String, default: '' },
+        size: { type: String, default: '' },
+        disabled: { type: Boolean, default: false }
+    },
+    emits: ['update:modelValue', 'change'],
+    setup(props, { emit }) {
+        const open = ref(false);
+        const activeIndex = ref(-1);
+        const trigger = ref(null);
+        const pop = ref(null);
+        const pos = ref({});
+
+        // value 保持原类型（数字 / 字符串），故一律用全等比较；空串是「全部来源」的合法取值
+        const currentIndex = computed(() => props.options.findIndex(o => o.value === props.modelValue));
+        const currentLabel = computed(() => {
+            const o = props.options[currentIndex.value];
+            return o ? o.label : '';
+        });
+
+        // 弹层定位：贴着 trigger，下方空间不足就向上弹；高度按可用空间收敛
+        function measure() {
+            const el = trigger.value;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            const gap = 6;
+            const below = window.innerHeight - r.bottom - gap - 8;
+            const above = r.top - gap - 8;
+            const up = below < 160 && above > below;
+            const maxHeight = Math.max(120, Math.min(260, up ? above : below));
+            pos.value = up
+                ? { left: r.left + 'px', width: r.width + 'px', bottom: (window.innerHeight - r.top + gap) + 'px', maxHeight: maxHeight + 'px' }
+                : { left: r.left + 'px', width: r.width + 'px', top: (r.bottom + gap) + 'px', maxHeight: maxHeight + 'px' };
+        }
+
+        function scrollActive() {
+            const p = pop.value;
+            if (!p) return;
+            const el = p.children[activeIndex.value];
+            if (!el) return;
+            const top = el.offsetTop;
+            const bottom = top + el.offsetHeight;
+            if (top < p.scrollTop) p.scrollTop = top;
+            else if (bottom > p.scrollTop + p.clientHeight) p.scrollTop = bottom - p.clientHeight;
+        }
+
+        function openPop() {
+            if (props.disabled || !props.options.length) return;
+            open.value = true;
+            activeIndex.value = currentIndex.value >= 0 ? currentIndex.value : 0;
+            nextTick(() => { measure(); scrollActive(); });
+        }
+
+        function close() { open.value = false; }
+
+        function toggle() { open.value ? close() : openPop(); }
+
+        function pick(o) {
+            if (o.disabled) return;
+            if (o.value !== props.modelValue) {
+                emit('update:modelValue', o.value);
+                emit('change', o.value);
+            }
+            close();
+        }
+
+        function onKeydown(e) {
+            if (props.disabled) return;
+            const k = e.key;
+            if (!open.value) {
+                if (k === 'Enter' || k === ' ' || k === 'ArrowDown' || k === 'ArrowUp') {
+                    e.preventDefault();
+                    openPop();
+                }
+                return;
+            }
+            if (k === 'Escape') { e.preventDefault(); close(); return; }
+            if (k === 'Tab') { close(); return; }
+            if (k === 'Enter' || k === ' ') {
+                e.preventDefault();
+                const o = props.options[activeIndex.value];
+                if (o) pick(o);
+                return;
+            }
+            if (k === 'ArrowDown' || k === 'ArrowUp') {
+                e.preventDefault();
+                const n = props.options.length;
+                if (!n) return;
+                let i = activeIndex.value + (k === 'ArrowDown' ? 1 : -1);
+                if (i < 0) i = n - 1;
+                if (i >= n) i = 0;
+                activeIndex.value = i;
+                nextTick(scrollActive);
+            }
+        }
+
+        // 点击组件与外点关闭：弹层 Teleport 到了 body，所以 trigger 和 pop 都要判
+        function onDocDown(e) {
+            const t = e.target;
+            if ((trigger.value && trigger.value.contains(t)) || (pop.value && pop.value.contains(t))) return;
+            close();
+        }
+        function onReposition() { if (open.value) measure(); }
+
+        onMounted(() => {
+            document.addEventListener('mousedown', onDocDown, true);
+            window.addEventListener('resize', onReposition);
+            window.addEventListener('scroll', onReposition, true);
+        });
+        onUnmounted(() => {
+            document.removeEventListener('mousedown', onDocDown, true);
+            window.removeEventListener('resize', onReposition);
+            window.removeEventListener('scroll', onReposition, true);
+        });
+
+        return { open, activeIndex, trigger, pop, pos, currentIndex, currentLabel, toggle, pick, onKeydown };
+    },
+    template: `
+        <div class="ui-select" :class="{ 'is-open': open, 'is-disabled': disabled, 'is-sm': size === 'sm' }">
+            <button type="button" class="ui-select-trigger" ref="trigger" :title="title" :disabled="disabled"
+                    @click="toggle" @keydown="onKeydown">
+                <span class="ui-select-label" :class="{ 'is-placeholder': !currentLabel }">{{ currentLabel || placeholder }}</span>
+                <span class="ui-select-caret" aria-hidden="true"></span>
+            </button>
+            <Teleport to="body">
+                <div v-if="open" class="ui-select-pop" ref="pop" :style="pos">
+                    <div v-for="(o, i) in options" :key="o.value" class="ui-select-opt"
+                         :class="{ 'is-active': i === activeIndex, 'is-selected': i === currentIndex, 'is-disabled': o.disabled }"
+                         @click="pick(o)" @mousemove="activeIndex = i">
+                        <span class="ui-select-opt-text">{{ o.label }}</span>
+                        <span v-if="i === currentIndex" class="ui-select-tick" aria-hidden="true"></span>
+                    </div>
+                </div>
+            </Teleport>
+        </div>`
+};
+
+const app = createApp({
     setup() {
         const conversations = ref([]);
         const agents = ref([]);
@@ -135,9 +343,13 @@ createApp({
         // 只存布尔值，密钥本身不进 Vue 状态（避免出现在调试面板/组件实例里），读取统一走 getApiKey()。
         const apiKeySet = ref(!!getApiKey());
 
-        // 输入框「📚 RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
+        // 输入框「RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
         const ragEnabled = ref(false);
+
+        // 当前会话的未完成任务（RUNNING）：有则显示顶部「继续执行」提示条（断点续跑入口）。
+        // 切换会话 / 发送完成 / 续跑完成后刷新；无 RUNNING 任务为 null。
+        const runningTask = ref(null);
 
         // ===== 对话附件（图片 / 文档任意文件）=====
         // 待发送附件列表，每项 {file, previewUrl, isImage, type, content, filename}。
@@ -207,10 +419,46 @@ createApp({
         // 向量副本（Chroma）状态条：connected=是否连上；documentCount=collection 内向量条数（-1=未知）
         const chroma = ref({ connected: false, baseUrl: '', collection: '', documentCount: -1,
             lastError: '', syncing: false, msg: '' });
+        // 知识块筛选（纯前端，只作用于已加载的分页数据）：q=内容关键字，source=来源文件
+        const chunkFilter = reactive({ q: '', source: '' });
 
         // 尚无专属知识库的智能体（新建知识库下拉只列这些，一个智能体至多一个库）
         const availableAgents = computed(() =>
             agents.value.filter(a => !kbs.value.some(k => k.agentId === a.id)));
+
+        // 知识库一览统计（列表态顶部统计条）：块数为各库 docCount 求和
+        const kbTotalChunks = computed(() => kbs.value.reduce((s, k) => s + (Number(k.docCount) || 0), 0));
+        const kbScopedCount = computed(() => kbs.value.filter(k => k.agentId).length);
+        const kbGlobalCount = computed(() => kbs.value.length - kbScopedCount.value);
+
+        // 知识块来源候选（仅已加载分页内去重），供「全部来源」下拉
+        const chunkSources = computed(() => {
+            const set = new Set();
+            kbDetail.chunks.forEach(c => { if (c.source) set.add(c.source); });
+            return [...set];
+        });
+
+        // ── 自绘下拉的选项源：把已有数据映射成 {value,label}，value 保持原类型 ──
+        const strategyChoices = computed(() =>
+            (kbDetail.strategies || []).map(s => ({ value: s.key, label: s.label })));
+        const overlapChoices = computed(() =>
+            overlapOptions.map(o => ({ value: o, label: overlapText(o) })));
+        const agentChoices = computed(() =>
+            availableAgents.value.map(a => ({ value: a.id, label: (a.icon || '🤖') + ' ' + a.name + '（暂无专属库）' })));
+        const sourceChoices = computed(() => [
+            { value: '', label: '全部来源' },
+            ...chunkSources.value.map(s => ({ value: s, label: s }))
+        ]);
+
+        // 过滤后的知识块：关键字按内容匹配、来源按文件精确匹配；两者皆空时直出原数组
+        const shownChunks = computed(() => {
+            const q = chunkFilter.q.trim().toLowerCase();
+            const src = chunkFilter.source;
+            if (!q && !src) return kbDetail.chunks;
+            return kbDetail.chunks.filter(c =>
+                (!src || c.source === src) &&
+                (!q || String(c.content || '').toLowerCase().includes(q)));
+        });
 
         // 预设智能体图标（emoji）
         const iconPresets = ['🤖', '🎓', '🌐', '💻', '🎨', '📝', '🧮', '🔬', '🗣', '💼'];
@@ -286,15 +534,17 @@ createApp({
             return !!(conv && conv.planner);
         });
 
-        // 当前会话是否开启 RAG（顶部 📚 徽标 / 输入框开关回显依据）
+        // 当前会话是否开启 RAG（顶部徽标 / 输入框开关回显依据）
         const currentRagOn = computed(() => {
             const conv = conversations.value.find(c => c.id === currentId.value);
             return !!(conv && conv.ragEnabled);
         });
 
-        // 📚 RAG 开关变更 → 即时写回会话（纯开关，不选库），刷新后保持上次选择。
+        // RAG 开关变更 → 即时写回会话（纯开关，不选库），刷新后保持上次选择。
         // 开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，由后端 KbService 决定目标库。
         async function onRagEnabledChange() {
+            // 尚未建会话：同样只留在前端状态，由 send() 建会话后补写回（否则本轮检索不会生效）。
+            // 刻意不在此处建会话 —— 避免「碰一下开关就多出一个没说过话的空会话」。
             if (!currentId.value) return;
             try {
                 const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/rag', {
@@ -311,10 +561,12 @@ createApp({
             }
         }
 
-        // 🧭 智能规划开关变更 → 即时写回会话（与 RAG 开关对称，拨动即持久化），刷新后保持上次选择。
+        // 智能规划开关变更 → 即时写回会话（与 RAG 开关对称，拨动即持久化），刷新后保持上次选择。
         // planner 与 agentId 互斥：绑定智能体的会话开关已置灰，后端另有防御校验拒绝越权开启。
         async function onPlannerChange() {
-            if (!currentId.value) { planMode.value = false; return; }
+            // 尚未建会话（首页进入 / 刷新后的空白页）：保留本次选择，等首次发送建会话时由 send() 补写回。
+            // 不能强制复位为 false —— 那会让开关在空白页上「拨一下立刻弹回」，看起来像点不动。
+            if (!currentId.value) return;
             try {
                 const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/planner', {
                     method: 'PUT',
@@ -322,7 +574,7 @@ createApp({
                     body: JSON.stringify({ enabled: planMode.value })
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                // 同步侧边栏会话对象：顶部 🧭 徽标与会话列表「🧭 规划」标记即时更新
+                // 同步侧边栏会话对象：顶部徽标与会话列表「规划」标记即时更新
                 const conv = conversations.value.find(c => c.id === currentId.value);
                 if (conv) conv.planner = planMode.value;
             } catch (e) {
@@ -351,20 +603,25 @@ createApp({
         }
 
         // ===== 会话 =====
+        // 只把列表填进侧边栏，不自动打开任何会话：进入 / 刷新 chat.html 一律落在空白欢迎页，
+        // 只有在侧边栏点击某条历史时才打开它。currentId 保持 null，
+        // 用户直接提问时由 send() 兜底新建会话，不会产生空会话记录。
         async function loadConversations() {
             try {
                 const resp = await apiFetch('/api/chat/conversations');
                 if (!resp.ok) return;
-                const list = await resp.json();
-                conversations.value = list;
-                if (list.length > 0) {
-                    if (!currentId.value || !list.some(c => c.id === currentId.value)) {
-                        await selectConversation(list[0].id);
-                    }
-                } else {
-                    await newConversation();
-                }
+                conversations.value = await resp.json();
             } catch (e) { /* 忽略：后端未启动或数据库未就绪 */ }
+        }
+
+        // 查询当前会话的未完成任务（RUNNING）：有则显示「继续执行」提示条。无会话或无任务时置 null。
+        async function loadRunningTask() {
+            if (!currentId.value) { runningTask.value = null; return; }
+            try {
+                const resp = await apiFetch('/api/chat/task/running?conversationId=' + encodeURIComponent(currentId.value));
+                if (!resp.ok) { runningTask.value = null; return; }
+                runningTask.value = await resp.json();
+            } catch (e) { runningTask.value = null; }
         }
 
         // 开启新对话（默认助手，不绑定智能体）
@@ -382,6 +639,7 @@ createApp({
                 input.value = '';
                 planMode.value = false; // 新建普通会话：规划开关默认关闭
                 ragEnabled.value = false;   // 新建会话默认关闭 RAG；需要时在输入框自行开启
+                runningTask.value = null;   // 新会话无未完成任务
                 mainView.value = 'chat';
                 scrollToBottom();
             } catch (e) {
@@ -408,6 +666,7 @@ createApp({
                 input.value = '';
                 planMode.value = false; // 智能体会话不支持规划（planner 与 agentId 互斥），开关强制关闭
                 ragEnabled.value = false;   // 新会话默认关闭 RAG；需要时在输入框自行开启
+                runningTask.value = null;   // 新会话无未完成任务
                 agentView.open = false; // 从查看弹窗发起对话后关闭弹窗
                 mainView.value = 'chat'; // 切回聊天视图
                 scrollToBottom();
@@ -425,6 +684,7 @@ createApp({
             planMode.value = !!(conv && conv.planner);
             // RAG 开关跟随会话：上次的开关状态回显（false=关闭）
             ragEnabled.value = !!(conv && conv.ragEnabled);
+            loadRunningTask(); // 查询该会话是否有未完成任务（有则显示「继续执行」提示条）
             try {
                 const resp = await apiFetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
                 if (resp.ok) {
@@ -492,6 +752,52 @@ createApp({
                 const resp = await apiFetch('/api/agent');
                 if (resp.ok) agents.value = await resp.json();
             } catch (e) { /* 忽略 */ }
+        }
+
+        // ===== 智能体管理：搜索 / 统计 / 卡片展示辅助 =====
+        const agentQuery = ref('');
+
+        /** 按关键字过滤（名称 / 编码 / 描述），纯前端过滤，不请求后端。 */
+        const shownAgents = computed(() => {
+            const q = agentQuery.value.trim().toLowerCase();
+            if (!q) return agents.value;
+            return agents.value.filter(a =>
+                ((a.name || '') + ' ' + (a.agentCode || '') + ' ' + (a.description || '')).toLowerCase().includes(q));
+        });
+
+        /** 一览统计：总数 / 已配参数补全 / 已限定工具 / 已挂专属知识库。 */
+        const agentStats = computed(() => {
+            const list = agents.value;
+            return {
+                total: list.length,
+                withParams: list.filter(a => parseParamSchema(a.paramSchema).length > 0).length,
+                withTools: list.filter(a => parseTools(a.toolsJson).mode !== 'all').length,
+                withKb: list.filter(a => agentHasKb(a)).length
+            };
+        });
+
+        /** 卡片图标配色：优先智能体主题色，缺省主色（与知识库专属库图标同一口径）。 */
+        function agentIconStyle(a) {
+            const c = (a && a.avatarColor) || '#3b82f6';
+            return { background: c + '1f', color: c };
+        }
+
+        /** 参数补全项数量（0 = 未配置） */
+        function agentParamCount(a) {
+            return parseParamSchema(a && a.paramSchema).length;
+        }
+
+        /** 工具装配摘要；返回空串表示「不限制（挂全部工具）」，卡片上不占标签位。 */
+        function agentToolLabel(a) {
+            const t = parseTools(a && a.toolsJson);
+            if (t.mode === 'none') return '🧰 不用工具';
+            if (t.mode === 'custom') return '🧰 工具 ' + t.names.length + ' 个';
+            return '';
+        }
+
+        /** 是否已绑定专属知识库（知识库列表在 onMounted 已加载） */
+        function agentHasKb(a) {
+            return !!(a && kbs.value.some(k => k.agentId === a.id));
         }
 
         /** 拉取可用工具清单（工具集在应用启动时固定，拉一次即可）。失败静默，不影响智能体管理主流程。 */
@@ -774,6 +1080,16 @@ createApp({
             return { background: c + '1f', color: c };
         }
 
+        // 知识块来源 -> 左侧色条：同一来源文件同色，长列表里便于一眼分辨块的归属
+        const KB_SOURCE_COLORS = ['#639922', '#378add', '#ba7517', '#d4537e', '#1d9e75', '#6b7f9e'];
+        function chunkBarStyle(c) {
+            const s = c && c.source;
+            if (!s) return {};
+            let h = 0;
+            for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+            return { borderLeftColor: KB_SOURCE_COLORS[h % KB_SOURCE_COLORS.length] };
+        }
+
         // 后端 LocalDateTime 字符串（如 2026-09-02T13:32:25）转可读格式
         function fmtTime(s) {
             if (!s) return '';
@@ -803,6 +1119,13 @@ createApp({
         function strategyLabel(key) {
             const hit = (kbDetail.strategies || []).find(s => s.key === key);
             return hit ? hit.label : (key || 'recursive');
+        }
+
+        // 分片策略：key → 说明文案。显示在弹窗下拉的下方，而不是塞进 option 文本 ——
+        // 原生 select 的 option 不换行，长说明挤在一起只会被硬裁。
+        function strategyDesc(key) {
+            const hit = (kbDetail.strategies || []).find(s => s.key === key);
+            return hit ? hit.desc : '';
         }
 
         // 重叠候选值（0 = 不重叠；受后端 maxOverlap=200 约束，列表内均合法）
@@ -946,6 +1269,8 @@ createApp({
             kbDetail.uploading = false;
             kbDetail.msg = '';
             kbDetail.rechunk = null;
+            chunkFilter.q = '';        // 每次进库重置筛选，避免带着上一个库的条件看新库
+            chunkFilter.source = '';
             kbDetail.open = true;
             await loadChunkStrategies();
             syncKbDefaults();      // 上传按该库默认分片策略 / 重叠执行（知识库设置）
@@ -1196,6 +1521,25 @@ createApp({
         // 回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「调了哪些工具、花了多少 token、耗时多久」。
         // items：追踪列表（按时间倒序）；expanded：按索引记录哪几条展开了明细。
         const traceModal = reactive({ open: false, loading: false, items: [], expanded: {}, error: '' });
+        /** 追踪列表的聚合统计（看板视角）：轮次 / token 合计 / 平均耗时 / 工具调用数 / 错误轮。纯客户端聚合，不改后端。 */
+        const traceStats = computed(() => {
+            const list = traceModal.items || [];
+            const count = list.length;
+            let totalTokens = 0, toolCalls = 0, errorCount = 0, elapsedSum = 0;
+            for (const t of list) {
+                totalTokens += t.totalTokens || 0;
+                toolCalls += (t.toolCalls && t.toolCalls.length) || 0;
+                if (t.status === 'error') errorCount++;
+                elapsedSum += t.elapsedMs || 0;
+            }
+            return {
+                count,
+                totalTokens,
+                toolCalls,
+                errorCount,
+                avgElapsed: count ? fmtElapsed(Math.round(elapsedSum / count)) : '-',
+            };
+        });
         /** 顶栏「访问密钥」：写入/清除本浏览器的 X-Api-Key。
          *  用原生 prompt（无需新增样式）；密钥明文存 localStorage，仅本机可见。 */
         function editApiKey() {
@@ -1260,14 +1604,122 @@ createApp({
             return Math.round(Math.max(0, Math.min(1, n)) * 100) + '%';
         }
 
+        // ===== 成本看板（全量成本口径） =====
+        // 与「追踪」弹窗（会话级、只算回答成本）不同：这里跨会话聚合 agent_trace（回答本身）与
+        // llm_usage（路由/参数抽取/查询改写/视觉/记忆合并等裸调用），做按天趋势 + 按用途拆解。
+        const costModal = reactive({ open: false, loading: false, days: 30, data: null, error: '' });
+        /** 两个图表实例引用（关闭弹窗时 dispose，避免复用残留）。 */
+        let costTrendChart = null, costPurposeChart = null;
+
+        /** token 数 → 可读文本（千分位 + 万/百万缩略）。 */
+        function fmtTokens(n) {
+            if (n == null) return '0';
+            const v = Number(n);
+            if (!isFinite(v)) return '-';
+            if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M';
+            if (v >= 10000) return (v / 10000).toFixed(1) + 'w';
+            return v.toLocaleString('en-US');
+        }
+
+        async function loadCost() {
+            costModal.loading = true;
+            costModal.error = '';
+            try {
+                const resp = await apiFetch('/api/cost/summary?days=' + costModal.days);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                costModal.data = data;
+                renderCostCharts();
+            } catch (e) {
+                costModal.error = '加载失败：' + e.message;
+            } finally {
+                costModal.loading = false;
+            }
+        }
+
+        async function openCost() {
+            costModal.open = true;
+            // 上次关闭若未 dispose（如遮罩点击关闭），图表实例仍指向已销毁 DOM，先清理再加载
+            disposeCostCharts();
+            await loadCost();
+        }
+
+        /** 关闭成本看板并释放图表实例（v-if 移除 DOM 后实例必须 dispose，否则指向游离节点、内存泄漏）。 */
+        function closeCost() {
+            disposeCostCharts();
+            costModal.open = false;
+        }
+
+        function disposeCostCharts() {
+            if (costTrendChart) { costTrendChart.dispose(); costTrendChart = null; }
+            if (costPurposeChart) { costPurposeChart.dispose(); costPurposeChart = null; }
+        }
+
+        /** 渲染成本看板两个图表（按天趋势堆叠柱 + 按用途饼图）。复用 agent-dark 主题。 */
+        function renderCostCharts() {
+            if (typeof echarts === 'undefined' || !costModal.data) return;
+            nextTick(() => {
+                const trendEl = document.getElementById('cost-trend-el');
+                const purposeEl = document.getElementById('cost-purpose-el');
+                if (trendEl) {
+                    if (!costTrendChart) { ensureEchartsTheme(); costTrendChart = echarts.init(trendEl, ECHARTS_THEME); }
+                    costTrendChart.setOption(buildTrendOption(costModal.data), true);
+                }
+                if (purposeEl) {
+                    if (!costPurposeChart) { ensureEchartsTheme(); costPurposeChart = echarts.init(purposeEl, ECHARTS_THEME); }
+                    costPurposeChart.setOption(buildPurposeOption(costModal.data), true);
+                }
+            });
+        }
+
+        function buildTrendOption(data) {
+            const days = (data.daily || []).map(d => d.day);
+            const answer = (data.daily || []).map(d => d.answerTokens || 0);
+            const aux = (data.daily || []).map(d => d.auxTokens || 0);
+            return {
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['回答本身', '辅助调用'] },
+                grid: { left: 48, right: 16, top: 32, bottom: 28 },
+                xAxis: { type: 'category', data: days, axisLabel: { rotate: days.length > 14 ? 45 : 0 } },
+                yAxis: { type: 'value', name: 'token' },
+                series: [
+                    { name: '回答本身', type: 'bar', stack: 'total', data: answer, itemStyle: { color: '#3b82f6' }, barMaxWidth: 28 },
+                    { name: '辅助调用', type: 'bar', stack: 'total', data: aux, itemStyle: { color: '#a78bfa' }, barMaxWidth: 28 }
+                ]
+            };
+        }
+
+        function buildPurposeOption(data) {
+            const items = (data.byPurpose || []).map(p => ({
+                name: p.label || p.purpose, value: p.totalTokens || 0
+            }));
+            return {
+                tooltip: { trigger: 'item', formatter: '{b}: {c} token（{d}%）' },
+                legend: { orient: 'vertical', right: 8, top: 'middle' },
+                series: [{
+                    type: 'pie', radius: ['40%', '70%'], center: ['40%', '50%'],
+                    itemStyle: { borderColor: 'rgba(8,14,26,1)', borderWidth: 2 },
+                    label: { show: false }, labelLine: { show: false },
+                    data: items
+                }]
+            };
+        }
+
         // ===== 发送消息（流式） =====
         async function send() {
             const text = input.value.trim();
             // 允许「只有图片没有文字」的场景（如「这张图是什么」）；两者都空才拒绝
             if (loading.value) return;
             if (!text && attachments.value.length === 0) return;
+            // 空白页（首页进入 / 刷新）时用户可能已经拨好规划 / RAG 开关，此刻还没有会话可写回。
+            // newConversation() 会把两个开关复位为默认关闭，所以先暂存本次选择，建会话后再补写：
+            // 否则用户拨动的选择被静默丢弃，且 RAG 不写回会话时本轮根本不会走检索。
+            const pendingPlanner = planMode.value;
+            const pendingRag = ragEnabled.value;
             if (!currentId.value) await newConversation();
             const convId = currentId.value;
+            if (pendingPlanner && !planMode.value) { planMode.value = true; await onPlannerChange(); }
+            if (pendingRag && !ragEnabled.value) { ragEnabled.value = true; await onRagEnabledChange(); }
 
             // 1) 把本轮所有附件一次性发给 /api/chat/attachment/process：
             //    图片→视觉模型识别、文档→解析为文本，后端按入参顺序返回 {type, filename, content}。
@@ -1388,10 +1840,12 @@ createApp({
                         }
                         const m = messages.value[lastIndex];
                         if (error) {
-                            // 错误事件：红色提示展示在「执行过程」区，绝不混进正文（正文会进会话记忆）
+                            // 错误事件：既在「执行过程」区留痕（红字），也在气泡里醒目展示（errText 直接可见，
+                            // 不再藏在折叠的步骤里）；绝不混进正文（正文会进会话记忆）。
                             if (!m.steps) m.steps = [];
                             m.steps.push('❌ ' + error);
                             m.stepsOpen = true;
+                            m.errText = error;
                         } else if (progress) {
                             // 执行过程：只收集到 steps 单独展示，绝不混进正文
                             if (!m.steps) m.steps = [];
@@ -1430,10 +1884,9 @@ createApp({
                 loadConversations();
             } catch (e) {
                 const m = messages.value[lastIndex];
-                const msg = '⚠️ 请求失败：' + e.message +
-                    '\n请确认后端已配置有效的 API Key / 服务地址，且 MySQL 已启动、服务已运行。';
-                m.content = msg;
-                m.html = escapeHtml(msg).replace(/\n/g, '<br>');
+                const msg = '请求失败：' + e.message +
+                    '（请确认后端已配置有效的 API Key / 服务地址，且 MySQL 已启动、服务已运行）';
+                m.errText = msg;
             } finally {
                 loading.value = false;
                 scrollToBottom();
@@ -1442,10 +1895,114 @@ createApp({
                     if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
                 }
                 attachments.value = [];
+                // 发送完成后刷新未完成任务状态（规划任务执行中断会留下 RUNNING，正常跑完会 DONE）
+                loadRunningTask();
+            }
+        }
+
+        // ===== 续跑未完成任务（显式按钮触发）=====
+        // 走 POST /api/chat/task/resume（SSE），消费 progress/token/citations/error 事件，与 send 一致。
+        // 续跑不重新规划、不新建会话：回填已完成步骤、只跑剩余步骤，最终结果推为一条 assistant 消息。
+        async function resumeTask() {
+            if (loading.value || !currentId.value) return;
+            const convId = currentId.value;
+            // 推一条空的 assistant 消息承接续跑输出（无用户气泡；续跑是对既有任务的延续）
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true });
+            const lastIndex = messages.value.length - 1;
+            loading.value = true;
+            scrollToBottom();
+
+            try {
+                const resp = await apiFetch('/api/chat/task/resume', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: convId })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+
+                const flushEvents = () => {
+                    let evIdx;
+                    while ((evIdx = buf.indexOf('\n\n')) >= 0) {
+                        const block = buf.slice(0, evIdx);
+                        buf = buf.slice(evIdx + 2);
+                        let data = '';
+                        block.split('\n').forEach(line => {
+                            if (line.startsWith('data:')) data += line.slice(5).replace(/^ /, '');
+                        });
+                        if (!data) continue;
+                        let progress = '';
+                        let error = '';
+                        let citations = '';
+                        try {
+                            const parsed = JSON.parse(data);
+                            if (parsed && typeof parsed.error === 'string') {
+                                error = parsed.error;
+                                data = '';
+                            } else if (parsed && typeof parsed.progress === 'string') {
+                                progress = parsed.progress;
+                                data = '';
+                            } else if (parsed && typeof parsed.citations === 'string') {
+                                citations = parsed.citations;
+                                data = '';
+                            } else {
+                                data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
+                            }
+                        } catch (e) { /* 兼容旧格式 */ }
+                        const m = messages.value[lastIndex];
+                        if (error) {
+                            if (!m.steps) m.steps = [];
+                            m.steps.push('❌ ' + error);
+                            m.stepsOpen = true;
+                            m.errText = error;
+                        } else if (progress) {
+                            if (!m.steps) m.steps = [];
+                            m.steps.push(progress);
+                        } else if (citations) {
+                            try {
+                                const list = JSON.parse(citations);
+                                if (Array.isArray(list) && list.length) {
+                                    m.citations = list;
+                                    m.citesOpen = true;
+                                }
+                            } catch (e) { /* 引用解析失败不影响正文 */ }
+                        } else if (data) {
+                            if (!m.content && m.steps && m.steps.length) m.stepsOpen = false;
+                            m.content += data;
+                            m.html = renderMd(m.content);
+                            m.version++;
+                            renderCharts();
+                        }
+                    }
+                };
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    flushEvents();
+                    scrollToBottom();
+                }
+                buf += decoder.decode();
+                flushEvents();
+                renderChartsNow();
+                loadConversations();
+            } catch (e) {
+                const m = messages.value[lastIndex];
+                m.errText = '续跑失败：' + e.message;
+            } finally {
+                loading.value = false;
+                // 续跑完成后刷新未完成任务状态：任务已 DONE/FAILED 则提示条消失
+                await loadRunningTask();
+                scrollToBottom();
             }
         }
 
         onMounted(() => {
+            // 不自动打开最近会话：进入与刷新都落在空白欢迎页（点侧边栏历史才打开）。
             loadConversations();
             loadAgents();
             loadTools(); // 可用工具清单（智能体弹窗「工具装配」用）
@@ -1454,6 +2011,7 @@ createApp({
 
         return {
             conversations, agents, messages, input, loading, currentId, planMode, ragEnabled,
+            runningTask, resumeTask,
             onRagEnabledChange, onPlannerChange,
             // 多模态附件
             attachments, fileInput, triggerFilePicker, onFilePicked, removeAttachment, ACCEPT,
@@ -1465,20 +2023,33 @@ createApp({
             startEdit, commitEdit, deleteConversation,
             goChat, goAgents, goKbs,
             openCreateAgent, openEditAgent, closeAgentModal, saveAgent, deleteAgent,
+            // 智能体管理页：搜索过滤 / 一览统计 / 卡片展示辅助
+            agentQuery, shownAgents, agentStats, agentIconStyle, agentParamCount, agentToolLabel, agentHasKb,
             viewAgent, genPrompt, autoFillCode,
             addParam, removeParam, parseParamSchema,
             availableTools, toolGroups, parseTools, toolGroupLabel, toolSelectAll, toolClearAll,
             agentName, agentIcon, renderMd, scroll,
             loadKbs, kbIconStyle, fmtTime, fmtSize, typeIcon, openCreateKb, openRenameKb, autoKbName,
+            kbTotalChunks, kbScopedCount, kbGlobalCount,
+            chunkFilter, chunkSources, shownChunks, chunkBarStyle,
+            strategyChoices, overlapChoices, agentChoices, sourceChoices,
             saveKb, deleteKb, openKbDetail, loadMoreChunks, deleteChunk,
             loadFiles, deleteKbFile,
-            strategyLabel, overlapOptions, overlapText, overlapLabel,
+            strategyLabel, strategyDesc, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
             pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
             // 顶栏「访问密钥」：状态 + 修改入口（所有 /api 请求经 apiFetch 自动带上该密钥）
             apiKeySet, editApiKey,
             // 链路追踪（可观测）：traceModal + 展示辅助函数
-            traceModal, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore
+            traceModal, traceStats, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore,
+            // 成本看板（全量成本口径）：costModal + 加载/关闭 + token 格式化
+            costModal, openCost, closeCost, loadCost, fmtTokens
         };
     }
-}).mount('#app');
+});
+
+app.component('ui-select', UiSelect);
+app.mount('#app');
+
+// 挂载成功 → 摘掉 chat.html 里那条静态启动提示（它只在 JS 未就绪时可见）
+document.getElementById('boot-tip')?.remove();

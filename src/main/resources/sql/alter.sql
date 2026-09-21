@@ -75,8 +75,23 @@ CREATE TABLE IF NOT EXISTS agent_trace (
 -- 单独留痕是为了让「RAG 没命中」可归因：究竟是改写跑偏了，还是知识库里确实没有。
 ALTER TABLE agent_trace ADD COLUMN retrieval_query VARCHAR(1000) DEFAULT NULL COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）' AFTER user_message;
 
--- ============ 以下为「无需执行」的说明项（第二批修复，2026-09-14）============
--- chat_message.created_at 维持 DATETIME（秒级），列定义**不做任何变更**，存量库无需执行语句。
--- 原因：同一轮落库的 user/assistant 两条消息写入的是同一个秒值（原代码的 plusNanos 纳秒偏移会被该列静默截断），
--- 因此先后顺序不能依赖时间精度，改由自增主键 id 兜底——所有读取路径已统一为 ORDER BY created_at, id
--- （getHistory / getRecentHistory / getMessagesRange）。schema.sql 中该列的注释已同步修正。
+
+-- 新增「裸 LLM 调用成本流水」表（全量成本口径）：schema.sql 已含建表语句，这里同样保留一份，
+-- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
+-- 与 agent_trace 互补：agent_trace 只记「正式回答+工具循环」token；本表记路由/参数抽取/查询改写/视觉/记忆合并等
+-- 裸 ChatModel.call() 的 token，成本看板据此做全量聚合与按用途（purpose）拆解。
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
+    conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
+    prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
+    completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
+    total_tokens      INT          NOT NULL DEFAULT 0      COMMENT '本次调用 token 合计',
+    created_at        DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_usage_purpose (purpose, created_at),
+    INDEX idx_usage_conv (conversation_id, created_at),
+    INDEX idx_usage_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';

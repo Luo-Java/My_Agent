@@ -175,7 +175,13 @@ public class ChatComposer {
         if (trace != null && !query.equals(message)) {
             trace.retrievalQuery(query);
         }
-        return kbSearchService.buildKbContext(true, agent, query);
+        KbSearchService.KbContext kb = kbSearchService.buildKbContext(true, agent, query);
+        // 检索命中播报：命中数对用户可见（0 命中与无 RAG 的「完全静默」要能区分开，便于判断是否该换个问法）
+        if (trace != null) {
+            int hit = kb.citations().size();
+            trace.reportProgress(hit > 0 ? ("📚 知识库检索命中 " + hit + " 条") : "📚 知识库检索未命中");
+        }
+        return kb;
     }
 
     /**

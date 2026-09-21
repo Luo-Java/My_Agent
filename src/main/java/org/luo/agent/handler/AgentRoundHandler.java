@@ -77,7 +77,7 @@ public class AgentRoundHandler implements RoundHandler {
         if (!explicitBinding && conv.getAgentId() != null && AgentBindSource.CLARIFY.equals(conv.getAgentBindSource())) {
             String pendingQuestion = paramFillingService.lastClarifyQuestion(conversationId);
             AgentRouter.RouteDecision rd = agentRouter.route(message, pendingQuestion,
-                    composer.buildHistoryContextText(conversationId, RECENT_TURNS, null));
+                    composer.buildHistoryContextText(conversationId, RECENT_TURNS, null), conversationId);
             boolean keepBound = rd.continuation()
                     || (rd.agent() != null && rd.agent().getId().equals(agent.getId()));
             if (!keepBound) {
@@ -132,7 +132,7 @@ public class AgentRoundHandler implements RoundHandler {
             // 传入最近若干轮上下文：让路由识别「承接上一轮的短追问」（如上一轮查天气、用户只说「北京呢？」）。
             // 否则失去上下文会被误判为普通对话，导致带工具的智能体无法被路由、进而「无法回答」。
             return agentRouter.route(message, null,
-                    composer.buildHistoryContextText(conv.getId(), RECENT_TURNS, null)).agent();
+                    composer.buildHistoryContextText(conv.getId(), RECENT_TURNS, null), conv.getId()).agent();
         }
         return null;
     }
