@@ -114,9 +114,21 @@ chroma:
   retry-interval-seconds: 60   # 连接失败后的重试冷却，先起应用后起 Chroma 可自愈
   upsert-batch-size: 10        # 单批写入条数，受 embedding 模型单次批量上限约束(留一倍余量)
 
-# 接口访问控制：留空=不校验；非空则 /api/** 需带 X-Api-Key 头一致才放行
+# 接口访问控制：API Key 与登录鉴权是两个独立闸门，都要过
+#   api-key —— 服务级密钥（脚本/机器调用），留空=不校验
+#   jwt     —— 用户登录态，/api/** 除 /api/auth/login 外都要带 Authorization: Bearer <token>
 app:
   api-key: ${APP_API_KEY:}
+  jwt:
+    enabled: true            # 强制登录；置 false 则 /api/** 不再校验 token（回到引入用户系统前的行为）
+    # 签名密钥不进仓库：用环境变量 JWT_SECRET 注入（如 openssl rand -hex 32）。
+    # 留空或不足 32 字节时启动生成随机密钥并打 WARN —— 仅够本地开发，重启后所有已签发 token 失效。
+    secret: ${JWT_SECRET:457a37ff516ef1cd2100ea1573063358ab578395b7515b252c14eaa71bbd0d74}
+    expire-minutes: 720      # token 有效期（分钟）
+    issuer: my-agent
+    bootstrap-admin: true    # 启动时若 sys_user 表为空则创建初始管理员（否则首次无法登录）
+    bootstrap-username: admin
+    bootstrap-password: ${JWT_BOOTSTRAP_PASSWORD:admin123}   # 仅初始口令，登录后应立即修改
   sse:
     timeout-seconds: 300     # 单条 SSE 连接最长存活(0=永不超时，会泄漏)
     heartbeat-seconds: 15    # 心跳间隔，防反向代理 60s 空闲断连(0=关闭)

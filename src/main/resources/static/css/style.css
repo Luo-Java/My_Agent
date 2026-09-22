@@ -2861,3 +2861,43 @@ button {
    且没有事件监听，表现为「一进页面就是追踪弹窗、点 ✕ 和遮罩都没反应」。
    挂载完成后 Vue 会自动摘掉 v-cloak 属性，由 chat.html 的 #boot-tip 承担失败提示。 */
 [v-cloak] { display: none !important; }
+
+/* ══ 顶栏登录用户区（登录态见 js/auth.js）══
+   跟在「成本」按钮右侧：.trace-btn 自带 margin-left:auto（把自己推开靠右），
+   这里抵消自身那份额外间距、并让用户名/管理入口/退出靠成一组。 */
+.auth-box {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 8px;
+    flex: none;
+}
+
+/* 用户名：过长截断，不挤占顶栏标题 */
+.auth-user {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-soft);
+}
+
+/* 与 .trace-btn 同款胶囊外观：管理入口是 <a>、退出是 <button>，这里统一成一种视觉 */
+.auth-entry {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.auth-entry:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }

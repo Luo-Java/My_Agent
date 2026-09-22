@@ -2,11 +2,18 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spring AI 智能对话</title>
     <!-- 前端依赖一律本地化（原先走 cdn.jsdelivr.net）。CDN 不可达时 Vue 会加载失败，
          导致整个页面停在原始模板：4 个弹窗的 v-if 全不生效、叠加显示且点不动。
          版本：Vue 3.5.43 / marked 18.0.13 / ECharts 5.6.0（见各文件头部注释）。 -->
+    <!-- 登录态与接口鉴权：必须最先、就地加载（不能加 defer）—— requireLogin 会先锁住页面，
+         确认登录态后才放行渲染；未登录/已失效就直接弹整页登录框，不必白等 Vue/marked/ECharts
+         下载完（见 js/auth.js）。 -->
+    <script src="/js/auth.js"></script>
+    <script>Auth.requireLogin();</script>
     <script src="/js/lib/vue.global.prod.js"></script>
     <script src="/js/lib/marked.umd.min.js"></script>
     <script src="/js/lib/echarts.min.js"></script>
@@ -103,6 +110,14 @@
                 <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话 -->
                 <button class="trace-btn cost-btn" @click="openCost"
                         title="查看全量成本看板：按天趋势与按用途拆解（回答 + 路由/参数抽取/查询改写/视觉/记忆合并）">💰 成本</button>
+                <!-- 登录用户区：登录态由 auth.js 维护；「用户管理」仅 ADMIN 可见（服务端另有 @RequireRole 兜底） -->
+                <span class="auth-box">
+                    <span class="auth-user" :title="authName ? '当前登录：' + authName : ''">{{ authName }}</span>
+                    <a v-if="authIsAdmin" class="auth-entry" href="/user.html"
+                       title="用户与角色管理">用户管理</a>
+                    <button class="auth-entry" @click="authLogout"
+                            title="退出登录（清除本浏览器的登录态）">退出</button>
+                </span>
             </header>
             <!-- 未完成任务提示条：当前会话存在 RUNNING 任务时显示（断点续跑入口）。
                  点「继续执行」走 POST /api/chat/task/resume，回填已完成步骤、只跑剩余步骤。 -->

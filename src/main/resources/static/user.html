@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>用户管理 · My_Agent</title>
+    <!-- 登录态与接口鉴权：最先、就地加载（不能加 defer）—— requireLogin 先锁住页面，
+         确认登录态后才放行渲染；未登录/已失效直接弹整页登录框（见 js/auth.js） -->
+    <script src="/js/auth.js"></script>
+    <script>Auth.requireLogin();</script>
+    <script src="/js/lib/vue.global.prod.js"></script>
+    <link rel="stylesheet" href="/css/user.css" />
+</head>
+<body>
+<div id="boot-tip" style="position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:24px;background:#05080f;color:#93a6c8;text-align:center;font:14px/1.8 -apple-system,'Segoe UI','Microsoft YaHei UI',sans-serif;">
+    <div>用户管理加载中…<br />
+        <span style="font-size:13px;">若长时间停在此处，请确认 /js/lib/vue.global.prod.js 可访问（HTTP 200）。</span>
+    </div>
+</div>
+
+<div id="app" v-cloak>
+    <!-- 顶栏 -->
+    <header class="um-topbar">
+        <div class="um-topbar-left">
+            <a class="um-link" href="/chat.html" title="返回 AI 控制台" data-auth-required>← 返回控制台</a>
+            <span class="um-title">用户管理</span>
+        </div>
+        <div class="um-topbar-right">
+            <a class="um-link" href="/edu.html" title="前往教务系统" data-auth-required>教务系统 →</a>
+            <span class="auth-box">
+                <span class="auth-user" :title="authName ? '当前登录：' + authName : ''">{{ authName }}</span>
+                <button class="um-btn" @click="authLogout" title="退出登录（清除本浏览器的登录态）">退出</button>
+            </span>
+        </div>
+    </header>
+
+    <div class="um-layout">
+        <!-- 左侧视图切换 -->
+        <nav class="um-tabs">
+            <button class="um-tab" :class="{ 'is-active': tab === 'user' }" @click="switchTab('user')">用户管理</button>
+            <button class="um-tab" :class="{ 'is-active': tab === 'role' }" @click="switchTab('role')">角色管理</button>
+        </nav>
+
+        <main class="um-main">
+            <!-- ==================== 用户 ==================== -->
+            <section v-show="tab === 'user'" class="um-panel">
+                <div class="um-panel-head">
+                    <span class="um-panel-title">用户列表</span>
+                    <span class="um-panel-hint">口令只存哈希，界面上不提供查看</span>
+                    <button class="um-btn um-btn-primary" @click="openUserCreate">＋ 新增用户</button>
+                </div>
+
+                <div class="um-search">
+                    <input class="um-input" v-model="userQuery.keyword" placeholder="登录名 / 显示名"
+                           @keyup.enter="loadUsers(1)" />
+                    <select class="um-select" v-model="userQuery.status">
+                        <option value="">全部状态</option>
+                        <option value="1">启用</option>
+                        <option value="0">停用</option>
+                    </select>
+                    <select class="um-select" v-model="userQuery.roleId">
+                        <option value="">全部角色</option>
+                        <option v-for="r in roles" :key="r.id" :value="String(r.id)">{{ r.name }}</option>
+                    </select>
+                    <button class="um-btn" @click="loadUsers(1)">查询</button>
+                    <button class="um-btn" @click="resetUserQuery">重置</button>
+                </div>
+
+                <div class="um-table-wrap">
+                    <table class="um-table">
+                        <thead>
+                        <tr>
+                            <th class="um-col-no">序号</th>
+                            <th>登录名</th>
+                            <th>显示名</th>
+                            <th>邮箱</th>
+                            <th>角色</th>
+                            <th>状态</th>
+                            <th class="um-col-time">最后登录</th>
+                            <th class="um-col-ops">操作</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr v-for="(row, i) in userRows" :key="row.id">
+                            <td class="um-col-no">{{ rowNo(i, userPage, userSize) }}</td>
+                            <td>{{ row.username }}</td>
+                            <td>{{ row.nickname || '—' }}</td>
+                            <td>{{ row.email || '—' }}</td>
+                            <td>
+                                <span v-if="row.roleNames" class="um-tag is-role">{{ row.roleNames }}</span>
+                                <span v-else>—</span>
+                            </td>
+                            <td>
+                                <span class="um-tag" :class="row.status === 1 ? 'is-on' : 'is-off'">
+                                    {{ row.status === 1 ? '启用' : '停用' }}
+                                </span>
+                            </td>
+                            <td class="um-col-time">{{ fmtTime(row.lastLoginAt) }}</td>
+                            <td class="um-col-ops">
+                                <div class="um-ops">
+                                    <button class="um-op" @click="openUserEdit(row)">编辑</button>
+                                    <button class="um-op" @click="openResetPassword(row)">重置口令</button>
+                                    <button class="um-op is-danger" @click="removeUser(row)">删除</button>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr v-if="!userLoading && !userRows.length">
+                            <td class="um-empty" colspan="8">暂无数据</td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="um-pager">
+                    <span>共 <b class="um-pager-num">{{ userTotal }}</b> 条</span>
+                    <button class="um-pager-btn" :disabled="userPage <= 1" @click="loadUsers(userPage - 1)">上一页</button>
+                    <span>第 <b class="um-pager-num">{{ userPage }}</b> / {{ userPages }} 页</span>
+                    <button class="um-pager-btn" :disabled="userPage >= userPages" @click="loadUsers(userPage + 1)">下一页</button>
+                    <select class="um-select" v-model.number="userSize" @change="loadUsers(1)">
+                        <option :value="10">10 条/页</option>
+                        <option :value="20">20 条/页</option>
+                        <option :value="50">50 条/页</option>
+                    </select>
+                </div>
+            </section>
+
+            <!-- ==================== 角色 ==================== -->
+            <section v-show="tab === 'role'" class="um-panel">
+                <div class="um-panel-head">
+                    <span class="um-panel-title">角色列表</span>
+                    <span class="um-panel-hint">编码是授权判定依据，创建后不可修改</span>
+                    <button class="um-btn um-btn-primary" @click="openRoleCreate">＋ 新增角色</button>
+                </div>
+
+                <div class="um-search">
+                    <input class="um-input" v-model="roleQuery.keyword" placeholder="角色编码 / 名称"
+                           @keyup.enter="loadRoles(1)" />
+                    <button class="um-btn" @click="loadRoles(1)">查询</button>
+                    <button class="um-btn" @click="resetRoleQuery">重置</button>
+                </div>
+
+                <div class="um-table-wrap">
+                    <table class="um-table">
+                        <thead>
+                        <tr>
+                            <th class="um-col-no">序号</th>
+                            <th>编码</th>
+                            <th>名称</th>
+                            <th>说明</th>
+                            <th class="um-col-ops">操作</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr v-for="(row, i) in roleRows" :key="row.id">
+                            <td class="um-col-no">{{ rowNo(i, rolePage, roleSize) }}</td>
+                            <td><span class="um-tag is-role">{{ row.code }}</span></td>
+                            <td>{{ row.name }}</td>
+                            <td>{{ row.description || '—' }}</td>
+                            <td class="um-col-ops">
+                                <div class="um-ops">
+                                    <button class="um-op" @click="openRoleEdit(row)">编辑</button>
+                                    <button class="um-op is-danger" @click="removeRole(row)">删除</button>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr v-if="!roleLoading && !roleRows.length">
+                            <td class="um-empty" colspan="5">暂无数据</td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="um-pager">
+                    <span>共 <b class="um-pager-num">{{ roleTotal }}</b> 条</span>
+                    <button class="um-pager-btn" :disabled="rolePage <= 1" @click="loadRoles(rolePage - 1)">上一页</button>
+                    <span>第 <b class="um-pager-num">{{ rolePage }}</b> / {{ rolePages }} 页</span>
+                    <button class="um-pager-btn" :disabled="rolePage >= rolePages" @click="loadRoles(rolePage + 1)">下一页</button>
+                    <select class="um-select" v-model.number="roleSize" @change="loadRoles(1)">
+                        <option :value="10">10 条/页</option>
+                        <option :value="20">20 条/页</option>
+                        <option :value="50">50 条/页</option>
+                    </select>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- ==================== 用户表单 ==================== -->
+    <div class="um-mask" v-if="userModal.open" @click.self="closeUserModal">
+        <div class="um-modal">
+            <div class="um-modal-head">
+                <span>{{ userModal.mode === 'create' ? '新增用户' : '编辑用户' }}</span>
+                <button class="um-modal-close" @click="closeUserModal" title="关闭">✕</button>
+            </div>
+            <div class="um-modal-body">
+                <div class="um-field">
+                    <label class="um-label">登录名<span class="um-req">*</span></label>
+                    <input class="um-input" v-model="userModal.form.username" :disabled="userModal.mode === 'edit'"
+                           placeholder="2~64 位字母、数字、下划线、点、短横线或 @" maxlength="64" />
+                    <p class="um-field-hint" v-if="userModal.mode === 'edit'">登录名是审计标识，创建后不可修改</p>
+                </div>
+                <div class="um-field" v-if="userModal.mode === 'create'">
+                    <label class="um-label">口令<span class="um-req">*</span></label>
+                    <input class="um-input" type="password" v-model="userModal.form.password"
+                           placeholder="6~64 位" maxlength="64" />
+                </div>
+                <div class="um-field">
+                    <label class="um-label">显示名</label>
+                    <input class="um-input" v-model="userModal.form.nickname" placeholder="留空则显示登录名" maxlength="64" />
+                </div>
+                <div class="um-field">
+                    <label class="um-label">邮箱</label>
+                    <input class="um-input" v-model="userModal.form.email" placeholder="可选" maxlength="128" />
+                </div>
+                <div class="um-field">
+                    <label class="um-label">状态</label>
+                    <select class="um-select" v-model.number="userModal.form.status">
+                        <option :value="1">启用</option>
+                        <option :value="0">停用</option>
+                    </select>
+                </div>
+                <div class="um-field">
+                    <label class="um-label">角色</label>
+                    <div class="um-checks">
+                        <label class="um-check" v-for="r in roles" :key="r.id"
+                               :class="{ 'is-on': userModal.form.roleIds.includes(r.id) }">
+                            <input type="checkbox" :value="r.id" v-model="userModal.form.roleIds" />
+                            <span>{{ r.name }}</span>
+                        </label>
+                    </div>
+                    <p class="um-field-hint">不勾选任何角色时，新增用户会自动绑定「普通用户」</p>
+                </div>
+                <p class="um-form-error" :class="{ 'is-visible': !!userModal.error }">{{ userModal.error }}</p>
+            </div>
+            <div class="um-modal-foot">
+                <button class="um-btn" @click="closeUserModal">取消</button>
+                <button class="um-btn um-btn-primary" :disabled="userModal.saving" @click="saveUser">
+                    {{ userModal.saving ? '保存中…' : '保存' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== 重置口令 ==================== -->
+    <div class="um-mask" v-if="pwdModal.open" @click.self="closePwdModal">
+        <div class="um-modal is-dialog">
+            <div class="um-modal-head">
+                <span>重置口令</span>
+                <button class="um-modal-close" @click="closePwdModal" title="关闭">✕</button>
+            </div>
+            <div class="um-modal-body">
+                <p class="um-modal-msg">为用户「{{ pwdModal.username }}」设置新口令（无需原口令）。</p>
+                <div class="um-field">
+                    <label class="um-label">新口令<span class="um-req">*</span></label>
+                    <input class="um-input" type="password" v-model="pwdModal.password" placeholder="6~64 位" maxlength="64" />
+                </div>
+                <p class="um-form-error" :class="{ 'is-visible': !!pwdModal.error }">{{ pwdModal.error }}</p>
+            </div>
+            <div class="um-modal-foot">
+                <button class="um-btn" @click="closePwdModal">取消</button>
+                <button class="um-btn um-btn-primary" :disabled="pwdModal.saving" @click="submitPassword">
+                    {{ pwdModal.saving ? '提交中…' : '确定' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== 角色表单 ==================== -->
+    <div class="um-mask" v-if="roleModal.open" @click.self="closeRoleModal">
+        <div class="um-modal">
+            <div class="um-modal-head">
+                <span>{{ roleModal.mode === 'create' ? '新增角色' : '编辑角色' }}</span>
+                <button class="um-modal-close" @click="closeRoleModal" title="关闭">✕</button>
+            </div>
+            <div class="um-modal-body">
+                <div class="um-field">
+                    <label class="um-label">角色编码<span class="um-req">*</span></label>
+                    <input class="um-input" v-model="roleModal.form.code" :disabled="roleModal.mode === 'edit'"
+                           placeholder="2~32 位大写字母、数字、下划线或短横线" maxlength="32" />
+                    <p class="um-field-hint" v-if="roleModal.mode === 'edit'">编码是授权判定依据，创建后不可修改</p>
+                </div>
+                <div class="um-field">
+                    <label class="um-label">角色名称<span class="um-req">*</span></label>
+                    <input class="um-input" v-model="roleModal.form.name" placeholder="如：管理员" maxlength="64" />
+                </div>
+                <div class="um-field">
+                    <label class="um-label">说明</label>
+                    <input class="um-input" v-model="roleModal.form.description" placeholder="可选" maxlength="255" />
+                </div>
+                <p class="um-form-error" :class="{ 'is-visible': !!roleModal.error }">{{ roleModal.error }}</p>
+            </div>
+            <div class="um-modal-foot">
+                <button class="um-btn" @click="closeRoleModal">取消</button>
+                <button class="um-btn um-btn-primary" :disabled="roleModal.saving" @click="saveRole">
+                    {{ roleModal.saving ? '保存中…' : '保存' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== 确认 / 提示（自绘，不用原生 confirm/alert） ==================== -->
+    <div class="um-mask" v-if="dialog.open" @click.self="closeDialog(false)">
+        <div class="um-modal is-dialog">
+            <div class="um-modal-head">
+                <span>{{ dialog.title }}</span>
+            </div>
+            <div class="um-modal-body">
+                <p class="um-modal-msg">{{ dialog.message }}</p>
+            </div>
+            <div class="um-modal-foot">
+                <button v-if="dialog.type === 'confirm'" class="um-btn" @click="closeDialog(false)">取消</button>
+                <button class="um-btn" :class="dialog.danger ? 'um-btn-danger' : 'um-btn-primary'"
+                        @click="closeDialog(true)">{{ dialog.okText }}</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/js/user.js"></script>
+</body>
+</html>

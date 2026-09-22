@@ -7,6 +7,7 @@ import org.luo.common.result.RestResult;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -44,6 +45,19 @@ public class GlobalExceptionHandler {
         log.error("未预期的异常", e);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(RestResult.fail(500, "服务器内部错误，请稍后重试"));
+    }
+
+    /**
+     * 请求体的媒体类型不支持（如用 {@code text/plain} 提交 JSON）→ 415。
+     * <p>
+     * 不接这个异常时会落到通用兜底被显示成「服务器内部错误」（500）——客户端明明只是
+     * Content-Type 用错了，却被指向服务端故障，排查方向直接跑偏。
+     */
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<RestResult<Void>> handleUnsupportedMediaType(HttpMediaTypeNotSupportedException e) {
+        log.warn("请求媒体类型不受支持：{}", e.getContentType());
+        return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+                .body(RestResult.fail(415, "请求体格式不受支持，请使用 Content-Type: application/json"));
     }
 
     /** 请求路径不存在（含静态资源未命中）→ 404。 */

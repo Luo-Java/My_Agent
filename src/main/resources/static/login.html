@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>登录 · My_Agent</title>
+    <link rel="stylesheet" href="/css/auth.css" />
+</head>
+<!-- 登录页只是「整页模式的登录框」外壳：结构与校验都在 js/auth.js / css/auth.css，
+     与首页右上角按钮弹出的那个框是同一份，避免两套登录表单各自演化。
+     保留本页是为了给未登录的深链访问（/login.html?redirect=...）一个落地地址。 -->
+<body class="auth-page">
+<noscript>登录需要启用 JavaScript。</noscript>
+
+<script src="/js/auth.js"></script>
+<script>Auth.mountLoginPage();</script>
+</body>
+</html>

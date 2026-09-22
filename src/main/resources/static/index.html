@@ -2,10 +2,14 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="My_Agent —— 多智能体协作平台：规划、检索、数据分析与工具调用" />
     <title>My_Agent · 多智能体协作平台</title>
     <link rel="stylesheet" href="/css/landing.css" />
+    <!-- 右上角登录按钮与登录弹框的样式（auth- 前缀，不与 landing.css 的变量/类名交叉） -->
+    <link rel="stylesheet" href="/css/auth.css" />
 </head>
 <body>
 <!-- 背景层：粒子网络画布 + 网格 + 扫描线 -->
@@ -24,11 +28,13 @@
             <span>My_Agent</span>
         </div>
         <div class="nav-right">
-            <a class="nav-link" href="/edu.html">教务系统</a>
             <span class="nav-status">
                 <span class="dot"></span>
                 <span>服务就绪</span>
             </span>
+            <!-- 登录态挂载点：未登录渲染「登录」按钮（点击弹框，不跳页），已登录渲染用户名 + 用户管理 + 退出。
+                 内容与事件都在 js/auth.js，首页本身不含任何登录逻辑。 -->
+            <span data-auth-nav></span>
         </div>
     </header>
 
@@ -42,15 +48,17 @@
         </p>
 
         <div class="cta-row rise d5">
-            <!-- chat.html 进入与刷新都落在空白欢迎页，不自动打开最近会话（见 app.js onMounted） -->
-            <a class="cta" href="/chat.html">
+            <!-- 两个入口都是受限页，都加 data-auth-required：点击时先确认登录态（未登录就地弹框、
+                 已登录先校验 token 仍有效），确认通过才跳转 —— 见 js/auth.js 的 guardNavigation。
+                 控制台进入与刷新都落在空白欢迎页，不自动打开最近会话（见 app.js onMounted）。 -->
+            <a class="cta" href="/chat.html" data-auth-required>
                 进入控制台
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                      stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M5 12h13M13 6l6 6-6 6" />
                 </svg>
             </a>
-            <a class="cta-secondary" href="/edu.html">
+            <a class="cta-secondary" href="/edu.html" data-auth-required>
                 教务系统
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                      stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -125,6 +133,8 @@
     </footer>
 </div>
 
+<!-- 登录态模块：自动渲染上面的 data-auth-nav 挂载点，并拦截 data-auth-required 链接 -->
+<script src="/js/auth.js"></script>
 <script src="/js/landing.js"></script>
 </body>
 </html>

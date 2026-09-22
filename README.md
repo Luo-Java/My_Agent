@@ -4,6 +4,12 @@
 
 ## 功能特性
 
+### 用户与权限
+
+- **登录鉴权**：JWT（Hutool 签发，HMAC-SHA256）。token 只装身份与有效期，**权限每次请求回库取**，因此改角色 / 停用账号立即生效，不必等 token 过期。
+- **用户与角色管理**（`/user.html`，限 ADMIN）：用户 CRUD + 口令重置、角色 CRUD。口令只存 BCrypt 哈希，列表与详情都不回显。
+- **默认拒绝自锁**：不能停用或删除当前登录账号；摘掉自己最后一个 ADMIN 角色会被拒 —— 系统始终保留至少一个启用状态的管理员。
+
 ### 对话与智能体
 
 - **自定义智能体**：页面创建任意角色（翻译、天气、教育数据分析、代码助手…），配置人设提示词、模型、温度与可用工具；提示词自动汇总到 `agent_code.md`。
@@ -66,6 +72,7 @@ DDL **默认不自动执行**，首次启动前手动执行（脚本幂等，可
 mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS agent DEFAULT CHARSET utf8mb4;"
 mysql -uroot -p agent < src/main/resources/sql/schema.sql   # 建表
 mysql -uroot -p agent < src/main/resources/sql/alter.sql    # 存量库补列（新库可跳过）
+mysql -uroot -p agent < src/main/resources/sql/system.sql   # 用户/角色表 + 初始角色（登录鉴权依赖）
 ```
 
 > 如需应用启动时自动建表，取消 `application.yaml` 中 `spring.sql.init` 整段的注释即可。
@@ -119,7 +126,14 @@ chroma:
   retry-interval-seconds: 60
   upsert-batch-size: 10
 app:
-  api-key: ${APP_API_KEY:}        # 留空=不校验（本地默认）
+  api-key: ${APP_API_KEY:}        # 服务级密钥（脚本/机器调用），留空=不校验
+  jwt:                            # 用户登录态：enabled=true 时 /api/** 除 /api/auth/login 外都要带 token
+    enabled: true
+    secret: ${JWT_SECRET:默认值}   # 默认值写在 application.yaml（固定值，重启不变，本地开箱即用）；留空或不足 32 字节 → 启动生成随机密钥并告警（重启后 token 全部失效）
+    expire-minutes: 720
+    bootstrap-admin: true         # 首次启动且用户表为空时创建初始管理员
+    bootstrap-username: admin
+    bootstrap-password: ${JWT_BOOTSTRAP_PASSWORD:admin123}
   sse: {timeout-seconds: 300, heartbeat-seconds: 15}
   attachment: {dir: ./data/attachments}
 server:
@@ -130,8 +144,21 @@ server:
 
 ### 3.1 部署安全（可选）
 
-- **接口访问控制**：默认不校验（本地开发）。若服务会暴露到局域网/公网，设置 `APP_API_KEY=你的密钥` 后重启，所有 `/api/**` 请求必须携带 `X-Api-Key: 你的密钥`（或 `Authorization: Bearer ...`），否则 401 —— 防止他人直接调用 SQL 查询工具、白嫖 LLM Key、读写知识库。
+- **接口访问控制**：默认不校验（本地开发）。若服务会暴露到局域网/公网，设置 `APP_API_KEY=你的密钥` 后重启，所有 `/api/**` 请求必须携带 `X-Api-Key: 你的密钥`（或 `Authorization: Bearer ...`），否则 401 —— 防止他人直接调用 SQL 查询工具、白嫖 LLM Key、读写知识库。该 401 响应体带 `reason: API_KEY_REQUIRED`（见 `ApiKeyInterceptor`），前端据此与「登录态失效」区分，**不会**因此清掉本地登录凭证。
 - **前端如何带密钥**：页面静态资源不在拦截范围，但页面发出的 `/api` 请求需要密钥。打开页面点顶栏 **🔑 访问密钥**，填入与 `APP_API_KEY` 相同值即可（仅存浏览器 `localStorage`）。前端所有 `/api` 调用统一经 `apiFetch` 自动附加该头；附件图片走 `/files/**`，无需密钥。
+- **登录鉴权（默认开启）**：`/api/**` 除 `POST /api/auth/login` 外都要求 `Authorization: Bearer <token>`，否则 401（带 `reason`，见下），前端会**就地弹出登录框**（`js/auth.js`，不跳页）并展示服务端给出的具体原因。置 `app.jwt.enabled=false` 只关掉**服务端**校验，**前端的守卫仍会拦**：`GET /api/auth/me` 在开关关闭后同样抛 401，前端拿不到「开关已关」这个状态，会一直弹登录框 —— 要真正回到无登录态，得把页面里的 `Auth.requireLogin()` 调用一并去掉。
+  - **拒绝原因可区分**：401 响应体除 `message` 外带机器可读的 `reason`（`NO_TOKEN` / `MALFORMED` / `BAD_SIGNATURE` / `MISSING_EXPIRY` / `EXPIRED` / `USER_UNAVAILABLE`，403 为 `ROLE_DENIED`），拦截器同时落 WARN 日志。前端把服务端 `message` 原样展示，因此「没带凭证」与「凭证不被认（密钥换过）」不再被笼统的「登录已失效」掩盖。
+  - **响应头形状与其余接口一致**：拦截器手写的 401/403 不再调 `setCharacterEncoding`（那会让 Tomcat 把响应头写成 `application/json;charset=UTF-8`，而 Jackson 输出的都是 `application/json`）—— 同一 API 两种形状容易被误读成「带 charset 的请求才 401」。JSON 按规范即 UTF-8，直接写字节。
+  - **启动日志能回答「这次重启换没换密钥」**：`登录鉴权已启用：token 有效期 N 分钟…，签名密钥 N 字节 / 指纹 xxxxxxxx`。指纹是密钥的 SHA-256 前 8 位，只用于跨重启比对（密钥本身不进日志）。看到 `BAD_SIGNATURE` 先比这个：指纹**变了** ⇒ 那份 token 是更早密钥签发的，重新登录一次即可；指纹**没变** ⇒ 不是密钥问题，看下一条。
+  - **同一份合法 token 被随机判为 `BAD_SIGNATURE`（并发验签不可靠，已修复）**：Hutool `HMacJWTSigner` 内部持有**单个** `javax.crypto.Mac`（非线程安全），且 `verify()` 的实现是「用同一个 signer 重新签一遍再比对字符串」。把 `JWTSigner` 当单例字段复用时，Tomcat 并发请求会互相污染 HMAC 计算 —— 表现正是「登录后随便点几下就被弹回登录框」，且**同一 token 有时 200 有时 401**，与密钥、有效期都无关。修复在 `JwtTokenService`：只存 `byte[] secret`，签发/校验各自现建一个 signer（`newSigner()`）。复现与回归脚本：`.workbuddy/tools/probe_token_concurrency.py`（并发打同一 token，统计 200/401 分布，修复后应全 200）。
+  - **401 与 Content-Type 无关**（已实测：同一 token 下 `application/json` 与 `application/json;charset=UTF-8` 状态码完全相同）。用 `text/plain` 提交 JSON 会得到 **415**「请求体格式不受支持」，而不是 500。
+  - **「连不上服务端」不等于「登录失效」**：页面级校验/链接守卫只在服务端明确 401 时才清 token；请求本身失败（服务端重启中）保留登录态，提示「无法连接服务端，请稍后重试」——把网络抖动当成凭证失效会导致一次无谓的重新登录。
+  - **前端按 `reason` 决定要不要清登录态，且清之前先复核**：`js/auth.js` 维护 `TOKEN_FAILURE_REASONS` 白名单（`NO_TOKEN`/`MALFORMED`/`BAD_SIGNATURE`/`MISSING_EXPIRY`/`EXPIRED`/`NO_SUBJECT`/`USER_UNAVAILABLE`），**只有命中才视为「凭证真失效」**；`API_KEY_REQUIRED`（服务级密钥缺失）与非 401 一律**保留** token，只弹提示。命中白名单时也不立即清，先并发安全地 `GET /api/auth/me` 复核（`confirmSession()`，多请求共用一个 in-flight 调用），复核通过则连弹框都不弹 —— 单次 401 不再误踢用户。浏览器控制台可跑 `Auth.diagnose()` 打印本地 token 声明/剩余有效期（不含 token 本身）与服务端 reason。
+  - **签名密钥**：`JWT_SECRET` 必须是 ≥32 字节的固定值。留空或过短时每次启动都会换随机密钥，表现是「一重启所有人都要重新登录」。生成：`openssl rand -hex 32`。注意 `${JWT_SECRET:默认值}` 里**显式设成空串**的环境变量会覆盖默认值，等同于「未配置」。
+  - **有效期**：`app.jwt.expire-minutes` 必须是正数。该字段是 `int`，配置没绑上时默认 0，而 0 分钟意味着 token **一签发就过期** —— 表现是「登录成功后进入页面又让登录」，且不抛任何异常。启动时会打 WARN 并回落到默认 720 分钟。
+  - **初始账号**：`sys_user` 表为空时启动自动创建 `admin`（口令取 `app.jwt.bootstrap-password`，默认 `admin123`），请在 `/user.html` 立即修改；表非空时该引导不再触发。
+  - **权限模型**：`/api/user/**` 与 `/api/role/**` 需 `ADMIN` 角色（`@RequireRole`），其余接口只要求已登录。
+  - **改口令不会踢掉已签发的 token**：token 是无状态的，需要强制下线请先停用该账号（停用状态每次请求都会校验）。
 - **附件安全**：`/files/**` 是免鉴权的同源静态映射，落盘文件名后缀经**白名单化**（图片/文档类保留，其余一律 `.bin`=octet-stream 只下载不渲染），杜绝上传 `.html`/`.svg` 后同源执行脚本。
 - **密钥泄露处理**：若密钥曾以明文提交进仓库，改配置只是止血 —— **必须到服务商控制台轮换/吊销旧 Key**（历史提交里的旧值依然可用）。
 
@@ -151,10 +178,12 @@ mvn clean package && java -jar target/my_agent-0.0.1-SNAPSHOT.jar
 
 ```
 org.luo
-├── MyAgentApplication  # 启动类（@MapperScan 指向 ai.mapper + edu.mapper）
-├── common/             # 共享基础设施（AI 与教务共用）
+├── MyAgentApplication  # 启动类（@MapperScan 指向 ai.mapper + edu.mapper + system.mapper）
+├── common/             # 共享基础设施（AI / 教务 / 用户系统共用）
 │   ├── config/         # CorsConfig / GlobalExceptionHandler / MybatisPlusConfig(分页插件)
-│   │                   # / ApiKeyInterceptor + ApiSecurityConfig(全局鉴权 /api/**)
+│   │                   # / ApiKeyInterceptor + ApiSecurityConfig(服务级密钥 /api/**)
+│   ├── result/         # RestResult / PageResult（统一响应与分页契约）
+│   ├── BaseBO          # 分页入参基类：缺省 10 条、上限 100
 │   └── exception/      # AiBusinessException / AiErrorCode
 ├── ai/                 # AI 多智能体平台
 │   ├── controller/     # ChatController(SSE) / ConversationController / AgentController
@@ -175,6 +204,15 @@ org.luo
 │   ├── config/         # ExecutorConfig(线程池) / ChatMemoryConfig / ToolCallingConfig 等 AI 专用
 │   ├── properties/     # MemoryProperties / RagProperties / VisionProperties / PromptProperties
 │   └── entity/ mapper/ dto/ enums/ constant/
+├── system/             # 用户管理系统（登录鉴权 + 用户/角色 CRUD）
+│   ├── security/       # JwtTokenService(签发/解析) / JwtAuthInterceptor(拦 /api/**)
+│   │                   # / AuthContext(当前用户) / @RequireRole / PasswordHasher(BCrypt)
+│   ├── controller/     # AuthController(/api/auth) / SysUserController(/api/user)
+│   │                   # / SysRoleController(/api/role)  —— 后两个整个控制器限 ADMIN
+│   ├── service/        # AuthService / SysUserService / SysRoleService（+ impl）
+│   ├── entity/ mapper/ dto/ vo/ constant/
+│   ├── config/         # JwtSecurityConfig（把登录拦截器挂到 /api/**）
+│   └── bootstrap/      # UserBootstrap（用户表为空时创建初始管理员）
 └── edu/                # 教务系统（每表独立 Controller/Service + Mapper XML）
     ├── controller/     # 10 个 {表}Controller（统一命令式：POST /page、GET /list、GET /{id}、
     │                   # POST /save、PUT /update、DELETE /delete/{id}）
@@ -187,10 +225,11 @@ org.luo
 resources/
 ├── application.yaml     # 数据源 / 模型 / 平台自身配置
 ├── prompts.yaml         # 全部提示词模板（agent.prompt.*）
-├── sql/schema.sql       # 建表（幂等）
+├── sql/schema.sql       # 对话/知识库/智能体建表（幂等）
 ├── sql/alter.sql        # 存量库补列
+├── sql/system.sql       # 用户/角色表 + 初始角色（幂等）
 ├── mapper/edu/*.xml     # 教务关联查询 SQL（namespace 对应 edu.mapper）
-└── static/              # 前端（index.html / edu.html / js / css）
+└── static/              # 前端（index.html / login.html / chat.html / edu.html / user.html + js / css）
 ```
 
 ### 一轮对话的编排流程
@@ -230,6 +269,39 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 工具注册 | 两类来源统一进 `ToolRegistry`：注解式（`ToolProvider` + `@Tool` 反射）与动态式（`ToolCallbackSource`，如 MCP 远端工具、运行时才知道有哪些）；同名时注解式优先并告警 |
 
 ## API 一览
+
+> 除 `POST /api/auth/login` 外，下表全部接口都要求 `Authorization: Bearer <token>`；标「需 ADMIN」的还要求具备 `ADMIN` 角色。
+
+### 认证
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/auth/login` | 登录（**唯一免登录接口**）→ `{token, expiresIn, user}`；账号停用返回 403 |
+| GET | `/api/auth/me` | 当前登录用户信息 |
+| POST | `/api/auth/password` | 修改自己的口令 `{oldPassword, newPassword}`（校验原口令） |
+
+> 没有 logout 接口：JWT 无状态，服务端没有会话可销毁 —— 退出登录 = 前端丢弃本地 token。
+
+### 用户管理（需 ADMIN）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/user/page` | 分页，筛选走 body：`keyword`（登录名/显示名）、`status`、`roleId` |
+| GET | `/api/user/{id}` | 单条详情 |
+| POST | `/api/user/save` | 新增 `{username, password, nickname, email, status, roleIds}` |
+| PUT | `/api/user/update` | 编辑 `{id, nickname, email, status, roleIds}`（登录名与口令不在此改） |
+| PUT | `/api/user/{id}/password` | 管理员重置他人口令 `{password}` |
+| DELETE | `/api/user/delete/{id}` | 删除用户（连带清理角色关联） |
+
+### 角色管理（需 ADMIN）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/role/page` | 分页，筛选 `keyword`（编码/名称） |
+| GET | `/api/role/list` | 全部角色（用户表单的角色多选、列表筛选用） |
+| POST | `/api/role/save` | 新增 `{code, name, description}`（编码统一转大写后校验格式） |
+| PUT | `/api/role/update` | 编辑 `{id, name, description}`（编码不可改） |
+| DELETE | `/api/role/delete/{id}` | 删除角色；已分配给用户时 409 |
 
 ### 对话
 
@@ -315,6 +387,9 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | `llm_usage` | trace_id, conversation_id, purpose, model, prompt_tokens, completion_tokens, total_tokens, created_at | 裸 LLM 调用成本流水（全量成本口径）：路由/参数抽取/查询改写/视觉/记忆合并各记一条，按用途拆解 |
 | `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING |
 | `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败 |
+| `sys_user` | id, username, password, nickname, email, status, last_login_at, created_at, updated_at | 登录账号；`password` 为 BCrypt 哈希（自带盐），`status=0` 停用后已签发 token 立即失效 |
+| `sys_role` | id, code, name, description | 角色；`code` 是授权判定依据（`@RequireRole` 比的是它），不可修改 |
+| `sys_user_role` | id, user_id, role_id, created_at | 用户-角色多对多授权，权限取并集；无外键约束，删除用户时由服务层清理 |
 
 > 教务系统另用一组**业务表**（与对话主表独立，建表/演示数据见 `sql/business.sql`）：
 > `subject`（科目）、`teacher`（老师）、`class`（班级）、`student`（学生）、`semester`（学期）、
@@ -332,12 +407,19 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 ## 前端界面
 
-- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪、💰 成本。
+- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪、💰 成本；最右为**当前登录用户 + 用户管理入口（仅 ADMIN 可见）+ 退出**。
 - **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）。
 - **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
 - **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。
 - **成本看板弹窗**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。
 - **教务系统**（`/edu.html`，独立入口）：10 张业务表（科目/老师/班级/学生/学期/课程/节次/排课/考试/成绩）的增删改查 + 4 个关联查询看板（学生成绩明细、成绩统计、班级课表、考试日程），复用深色色板，与 AI 对话页分离。单表页与关联查询页共用同一套顶部搜索条（文本输入 + 外键/枚举下拉 + 查询/重置，按 `tableMeta.search` / `queryMeta.search` 声明渲染）、序号列、右下分页（首页/上一页/下一页/尾页/跳页[/每页条数]）；新增与删除走自绘弹窗。
+
+- **登录**：登录界面全站只有一份 —— 结构在 `js/auth.js`（`Auth.openLogin()`），样式在 `css/auth.css`（`auth-` 前缀变量与类名，与各页样式互不污染）。
+  - **首页**（`/index.html`）右上角「登录」按钮：点击**就地弹框**（不跳页），登录后原地变为「用户名 + 用户管理（仅 ADMIN）+ 退出」。首页自身不含登录逻辑，只放一个 `data-auth-nav` 挂载点。
+  - **受限页**（chat / edu / user）**先锁住页面、再确认登录态，最后才决定是否渲染页面**：`Auth.requireLogin()` 在 `<head>` 里同步把整页盖住（`html.auth-locked` + 一句「正在校验登录状态…」），无 token 直接弹登录框；有 token 也先向 `GET /api/auth/me` 确认，**只有确认有效才解除遮罩放行渲染**。所以直接打开 `/chat.html`、`/edu.html` 不会先闪一眼未登录的空壳页（此前只看本地 token、页面照常渲染，等首个接口 401 才弹框，观感是「先进去再被踢出来」）。弹的是**整页观感的登录框**（不透明底，不会把空壳页透出来），登录成功后自动重载当前页；关掉弹框会回到首页 —— 受限页在没有登录态时数据全 401，留在空壳页面上没有意义。运行中 401 同样弹框并提示「登录状态已失效」。需要登录才能走的链接加 `data-auth-required` 即可，点击时由 `Auth.guardNavigation()` **先确认登录态再放行**：未登录就地弹框，已登录也先向 `GET /api/auth/me` 确认 token 仍有效（token 会被服务端单方面作废 —— 过期、账号停用、换密钥重启），确认通过才跳转，避免「先跳进去、再被踢出来」。
+  - `/login.html` 只是弹框的「整页模式」外壳（调 `Auth.mountLoginPage()`），保留它是给未登录的深链访问一个落地地址；登录成功后回跳 `?redirect=`，只接受站内路径，防开放重定向。
+  - token 存 `localStorage`（键 `my_agent_token`），与 `X-Api-Key` 的存法一致；退出登录 = 前端丢弃 token（服务端无会话可销毁）。
+- **用户管理**（`/user.html`，仅 ADMIN）：左侧切换「用户管理 / 角色管理」。用户列表支持关键词/状态/角色筛选，可行新增、编辑（角色为复选框多选）、重置口令、删除；角色列表支持编码/名称筛选，可新增、编辑（编码锁定）、删除。口令全程只写不读，界面上不提供查看。
 
 ## 开发备注
 

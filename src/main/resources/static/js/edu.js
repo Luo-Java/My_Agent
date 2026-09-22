@@ -21,7 +21,8 @@ function apiFetch(url, options) {
         opts.body = JSON.stringify(opts.body);
     }
     opts.headers = headers;
-    return window.fetch(url, opts);
+    // 登录态（Authorization: Bearer）与 401 自动跳登录页统一由 auth.js 处理
+    return window.Auth ? window.Auth.fetch(url, opts) : window.fetch(url, opts);
 }
 
 // ==================== 自绘下拉组件（替代原生 select） ====================
@@ -452,6 +453,13 @@ createApp({
 
         const queryRows = ref([]);
 
+        // 列表请求进行中。用于把 tbody 的占位从「暂无数据」换成「加载中…」：
+        // 切视图时会同步清空 rows/queryRows，若没有这个标志，请求返回前的那一帧会先显示「暂无数据」。
+        const listLoading = ref(false);
+        // 请求序号：只认最后一次发出的请求。快速连点菜单/翻页时，先发的响应可能后到，
+        // 若不加丢弃，会把新视图的列表覆盖成旧视图的数据。
+        let reqSeq = 0;
+
         // 下拉选项缓存：{ 表key: [{value,label}] }。按需从各表自己的 GET /list 取，文案后端已拼好
         const optionsCache = reactive({});
         const optionsLoading = {};
@@ -573,34 +581,63 @@ createApp({
             page.value = p;
             const meta = currentMeta.value;
             const cond = collectSearch();
-            // 各表统一命令式：分页与筛选条件一起走 body
-            const r = await apiFetch(`/api/edu/${meta.endpoint}/page`, {
-                method: 'POST', body: Object.assign({ page: p, size: pageSize.value }, cond),
-            });
-            if (!r.ok) { const e = await r.json(); await askAlert(e.message || '加载失败', { title: '加载失败' }); return; }
-            const res = await r.json();
-            const data = res.data || {};
-            rows.value = data.records || [];
-            total.value = data.total || 0;
-            totalPages.value = data.pages || 0;
-            // 当前页可能因删除而越界（末页被删空）→ 回退到最后一页
-            if (!rows.value.length && data.pages && p > data.pages) return loadPage(data.pages);
+            const seq = ++reqSeq;
+            listLoading.value = true;
+            try {
+                // 各表统一命令式：分页与筛选条件一起走 body
+                const r = await apiFetch(`/api/edu/${meta.endpoint}/page`, {
+                    method: 'POST', body: Object.assign({ page: p, size: pageSize.value }, cond),
+                });
+                if (!r.ok) { const e = await r.json(); await askAlert(e.message || '加载失败', { title: '加载失败' }); return; }
+                const res = await r.json();
+                if (seq !== reqSeq) return;   // 已有更新的请求在途 → 丢弃本次结果
+                const data = res.data || {};
+                // 后端 join 偶发返回空元素（null/undefined）或类型异常，模板对 row[列] 取值会抛
+                // “Cannot read properties of ... (reading '列名')”（班级课表视图的 startTime 列就曾这样报错）。
+                // 落库前把每行兜底成对象，模板层另有 row ? ... : '' 二次防护。
+                const recs = Array.isArray(data.records) ? data.records : [];
+                rows.value = recs.map(r => (r && typeof r === 'object') ? r : {});
+                total.value = data.total || 0;
+                totalPages.value = data.pages || 0;
+                // 当前页可能因删除而越界（末页被删空）→ 回退到最后一页
+                if (!rows.value.length && data.pages && p > data.pages) return loadPage(data.pages);
+            } catch (e) {
+                // 连接层失败（服务端重启 / 断网）不会走上面的 !r.ok 分支：不提示就是静默失败，
+                // 页面只留一个空列表，看不出是没数据还是没连上。
+                if (seq === reqSeq) await askAlert('无法连接服务端，请稍后重试。', { title: '加载失败' });
+            } finally {
+                // 递归回退时 seq 已被内层刷新，由内层负责收尾，避免外层提前摘掉加载态
+                if (seq === reqSeq) listLoading.value = false;
+            }
         }
 
         // 关联查询：四个查询都是分页接口，和单表页共用 page / pageSize 状态
         async function loadQuery(p) {
             page.value = p;
             const q = queryMetaObj.value;
-            const r = await apiFetch(`/api/edu/${q.endpoint}?page=${p}&size=${pageSize.value}` +
-                queryString(collectSearch(), '&'));
-            if (!r.ok) { const e = await r.json().catch(() => ({})); await askAlert(e.message || '加载失败', { title: '加载失败' }); return; }
-            const res = await r.json();
-            const data = res.data || {};
-            queryRows.value = data.records || [];
-            total.value = data.total || 0;
-            totalPages.value = data.pages || 0;
-            // 与单表页一致：末页数据被删后回退，避免停在空页
-            if (!queryRows.value.length && data.pages && p > data.pages) return loadQuery(data.pages);
+            const seq = ++reqSeq;
+            listLoading.value = true;
+            try {
+                const r = await apiFetch(`/api/edu/${q.endpoint}?page=${p}&size=${pageSize.value}` +
+                    queryString(collectSearch(), '&'));
+                if (!r.ok) { const e = await r.json().catch(() => ({})); await askAlert(e.message || '加载失败', { title: '加载失败' }); return; }
+                const res = await r.json();
+                if (seq !== reqSeq) return;   // 与 loadPage 同理：丢弃过期响应
+                const data = res.data || {};
+                const qrecs = Array.isArray(data.records) ? data.records : [];
+                // 双保险：模板层已对 undefined 行兜底（row ? row[c] : ''），这里再强制每行是对象，
+                // 防止后端 join 偶发返回的空元素（null）在 fmtQueryCell 取值时抛 “reading 'xxx' of null”。
+                queryRows.value = qrecs.map(r => (r && typeof r === 'object') ? r : {});
+                total.value = data.total || 0;
+                totalPages.value = data.pages || 0;
+                // 与单表页一致：末页数据被删后回退，避免停在空页
+                if (!queryRows.value.length && data.pages && p > data.pages) return loadQuery(data.pages);
+            } catch (e) {
+                // 与单表页同理：连接层失败要说出来，不能只留空列表
+                if (seq === reqSeq) await askAlert('无法连接服务端，请稍后重试。', { title: '加载失败' });
+            } finally {
+                if (seq === reqSeq) listLoading.value = false;
+            }
         }
 
         // 查询参数串：值统一 encodeURIComponent，空值由调用方先过滤掉
@@ -678,6 +715,17 @@ createApp({
             current.table = null;
             current.query = null;
             page.value = 1;
+            // 切换视图即刻清掉上一视图的列表与分页计数。表头是同步换的，而数据要等请求回来，
+            // 旧行若留着就会以「新表头 + 旧数据」出现在请求返回前的那一帧（四个查询列口径不同，
+            // 缺的字段全显示成「—」，满屏错位的数字）—— 观感就是列表闪一下。
+            // 计数一并归零：否则分页条会短暂显示上一个查询的「共 N 条」。
+            rows.value = [];
+            queryRows.value = [];
+            total.value = 0;
+            totalPages.value = 0;
+            // 加载态在这里同步置位，而不是等 loadPage/loadQuery 起来再置：
+            // 后者要等 ensureOptions 的 then（另一个 microtask），中间那一帧会渲染成「暂无数据」。
+            listLoading.value = item.view !== 'dashboard';
             if (item.view === 'table') {
                 current.table = item.key;
                 const meta = tableMeta[item.key];
@@ -829,6 +877,19 @@ createApp({
             await loadPage(page.value);
         }
 
+        // 顶栏登录用户区：登录态由 auth.js 统一维护（未登录时本页在 <head> 就被拦下跳转）。
+        const authUser = ref(window.Auth ? window.Auth.getUser() : null);
+        const authName = computed(() => (window.Auth ? window.Auth.displayName() : ''));
+        // 只决定「用户管理」入口显不显示；真正的权限闸门是服务端的 @RequireRole
+        const authIsAdmin = computed(() => !!(window.Auth && window.Auth.hasRole('ADMIN')));
+
+        /** 退出登录：JWT 无状态，服务端没有会话可销毁，清掉本地 token 即登出。 */
+        function authLogout() {
+            if (window.Auth) {
+                window.Auth.logout();
+            }
+        }
+
         onMounted(() => {
             const tip = document.getElementById('boot-tip');
             if (tip) tip.remove();
@@ -837,7 +898,7 @@ createApp({
 
         return {
             menuGroups, queryColumnLabels,
-            current, rows, page, pageSize, total, totalPages,
+            current, rows, page, pageSize, total, totalPages, listLoading,
             queryRows, dash, form,
             currentLabel, currentColumns, editableColumns, queryColumns,
             fieldOptions, fmtCell, fmtQueryCell, rowNo,
@@ -847,6 +908,8 @@ createApp({
             searchForm, searchFields, searchOptions, doSearch, resetSearch,
             switchView, switchFromUrl, isActive, openCreate, openEdit, saveForm, removeRow,
             dialog, closeDialog,
+            // 顶栏登录用户区：用户名 / 用户管理入口（仅 ADMIN 可见）/ 退出
+            authUser, authName, authIsAdmin, authLogout,
         };
     }
 }).component('ui-select', UiSelect).mount('#app');

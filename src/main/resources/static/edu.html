@@ -2,9 +2,15 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>教务管理系统</title>
     <!-- 前端依赖本地化（与 AI 对话页共用同一份 lib）。Vue 3.5.43 / ECharts 5.6.0。 -->
+    <!-- 登录态与接口鉴权：必须最先、就地加载（不能加 defer）—— requireLogin 会先锁住页面，
+         确认登录态后才放行渲染；未登录/已失效直接弹整页登录框（见 js/auth.js）。 -->
+    <script src="/js/auth.js"></script>
+    <script>Auth.requireLogin();</script>
     <script src="/js/lib/vue.global.prod.js"></script>
     <script src="/js/lib/echarts.min.js"></script>
     <link rel="stylesheet" href="/css/edu.css" />
@@ -25,6 +31,12 @@
         </div>
         <div class="edu-topbar-right">
             <a class="back-chat" href="/chat.html" title="前往 AI 对话">前往 AI 对话 →</a>
+            <!-- 登录用户区：登录态由 auth.js 维护；「用户管理」仅 ADMIN 可见（服务端另有 @RequireRole 兜底） -->
+            <span class="auth-box">
+                <span class="auth-user" :title="authName ? '当前登录：' + authName : ''">{{ authName }}</span>
+                <a v-if="authIsAdmin" class="auth-entry" href="/user.html" title="用户与角色管理">用户管理</a>
+                <button class="auth-entry" @click="authLogout" title="退出登录（清除本浏览器的登录态）">退出</button>
+            </span>
         </div>
     </header>
 
@@ -104,7 +116,7 @@
                         </div>
                     </div>
 
-                    <div class="edu-table-wrap">
+                    <div class="edu-table-wrap" :class="{ 'is-loading': listLoading && !rows.length }">
                         <table class="edu-table">
                             <thead>
                             <tr>
@@ -114,16 +126,19 @@
                             </tr>
                             </thead>
                             <tbody>
-                            <tr v-for="(row, i) in rows" :key="row.id">
+                            <tr v-for="(row, i) in rows" :key="row ? row.id : i">
                                 <td class="edu-td-no">{{ rowNo(i) }}</td>
-                                <td v-for="c in currentColumns" :key="c.key">{{ fmtCell(row[c.key], c) }}</td>
+                                <td v-for="c in currentColumns" :key="c.key">{{ fmtCell(row ? row[c.key] : '', c) }}</td>
                                 <td class="edu-td-ops">
                                     <button class="edu-link" @click="openEdit(row)">编辑</button>
                                     <span class="edu-td-sep"></span>
                                     <button class="edu-link edu-link-danger" @click="removeRow(row)">删除</button>
                                 </td>
                             </tr>
-                            <tr v-if="!rows.length">
+                            <tr v-if="listLoading && !rows.length">
+                                <td class="edu-loading" :colspan="currentColumns.length + 2">加载中…</td>
+                            </tr>
+                            <tr v-else-if="!rows.length">
                                 <td class="edu-empty" :colspan="currentColumns.length + 2">暂无数据</td>
                             </tr>
                             </tbody>
@@ -172,7 +187,7 @@
                         <span class="edu-panel-title">{{ currentLabel }}</span>
                     </div>
 
-                    <div class="edu-table-wrap">
+                    <div class="edu-table-wrap" :class="{ 'is-loading': listLoading && !queryRows.length }">
                         <table class="edu-table">
                             <thead>
                             <tr>
@@ -183,9 +198,12 @@
                             <tbody>
                             <tr v-for="(row, i) in queryRows" :key="i">
                                 <td class="edu-td-no">{{ rowNo(i) }}</td>
-                                <td v-for="c in queryColumns" :key="c">{{ fmtQueryCell(row[c], c) }}</td>
+                                <td v-for="c in queryColumns" :key="c">{{ fmtQueryCell(row ? row[c] : '', c) }}</td>
                             </tr>
-                            <tr v-if="!queryRows.length">
+                            <tr v-if="listLoading && !queryRows.length">
+                                <td class="edu-loading" :colspan="queryColumns.length + 1">加载中…</td>
+                            </tr>
+                            <tr v-else-if="!queryRows.length">
                                 <td class="edu-empty" :colspan="queryColumns.length + 1">暂无数据</td>
                             </tr>
                             </tbody>

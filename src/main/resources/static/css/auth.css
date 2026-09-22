@@ -1,0 +1,272 @@
+/* 登录弹框 + 右上角鉴权区样式（全站唯一一份，由 js/auth.js 使用）。
+ *
+ * 与页面样式的关系：类名统一 auth- 前缀 + 变量 --auth-*，不复用页面变量，
+ * 因此可被 landing / chat / edu 任一套主题的页面同时引入而不互相污染
+ * （登录弹框是覆盖层，深色玻璃卡片配深色遮罩在任何底色的页面上都可读，
+ *  不做「跟随页面主题」的双套配色 —— 那会让这份文件翻倍且难测）。
+ *
+ * 字号约束：全部整数 px，正文 13px 起；次要文字用 --auth-text-soft（深底可读亮度下限）。
+ * 层级：现有弹窗最高 z-index 300，覆盖层取 1000。
+ */
+
+:root {
+    --auth-bg: #05080f;
+    --auth-primary: #3b82f6;
+    --auth-primary-hover: #2f74e8;
+    --auth-text: #e8eefc;
+    --auth-text-soft: #93a6c8;
+    --auth-card: rgba(16, 26, 48, .92);
+    --auth-card-border: rgba(110, 160, 255, .2);
+    --auth-field: rgba(8, 14, 26, .72);
+    --auth-field-border: rgba(110, 160, 255, .22);
+    --auth-danger: #f87171;
+}
+
+/* ===== 覆盖层（弹框与登录页共用） ===== */
+.auth-veil {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 20px;
+    overflow-y: auto;
+    background: rgba(3, 7, 16, .66);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    animation: auth-fade .16s ease-out;
+}
+
+/* 整页模式（/login.html）：无遮罩语义，铺满光晕背景 */
+.auth-veil.is-page {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background:
+        radial-gradient(900px 560px at 50% -10%, rgba(59, 130, 246, .26), transparent 62%),
+        radial-gradient(680px 460px at 88% 92%, rgba(34, 211, 238, .12), transparent 60%),
+        var(--auth-bg);
+}
+
+/* 登录页外壳：该类写在 HTML 里而不是由 JS 添加，否则弹框出现前会闪一下白底 */
+body.auth-page {
+    height: 100%;
+    margin: 0;
+    background: var(--auth-bg);
+}
+
+@keyframes auth-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes auth-pop {
+    from { opacity: 0; transform: translateY(10px) scale(.985); }
+    to { opacity: 1; transform: none; }
+}
+
+/* ===== 卡片 ===== */
+.auth-modal {
+    position: relative;
+    width: 100%;
+    max-width: 380px;
+    padding: 30px 28px 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI",
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: var(--auth-text);
+    background: var(--auth-card);
+    border: 1px solid var(--auth-card-border);
+    border-radius: 14px;
+    box-shadow: 0 22px 60px rgba(3, 8, 20, .55);
+    animation: auth-pop .18s ease-out;
+}
+
+.auth-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    color: var(--auth-text-soft);
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: color .16s ease, background-color .16s ease;
+}
+
+.auth-close:hover {
+    color: var(--auth-text);
+    background: rgba(120, 170, 255, .12);
+}
+
+.auth-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 22px;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: .3px;
+    color: var(--auth-text);
+}
+
+.auth-brand svg {
+    display: block;
+    width: 11px;
+    height: 11px;
+}
+
+.auth-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    background: linear-gradient(140deg, var(--auth-primary), #22d3ee);
+}
+
+.auth-title {
+    margin: 0 0 6px;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: .5px;
+}
+
+.auth-sub {
+    margin: 0 0 24px;
+    font-size: 13px;
+    color: var(--auth-text-soft);
+}
+
+/* ===== 表单 ===== */
+.auth-field {
+    display: block;
+    margin-bottom: 16px;
+}
+
+.auth-label {
+    display: block;
+    margin-bottom: 7px;
+    font-size: 13px;
+    color: var(--auth-text-soft);
+}
+
+.auth-input {
+    width: 100%;
+    height: 40px;
+    padding: 0 12px;
+    font-size: 14px;
+    font-family: inherit;
+    color: var(--auth-text);
+    background: var(--auth-field);
+    border: 1px solid var(--auth-field-border);
+    border-radius: 8px;
+    outline: none;
+    transition: border-color .16s ease, box-shadow .16s ease;
+}
+
+.auth-input::placeholder { color: #5d6d8c; }
+
+.auth-input:focus {
+    border-color: var(--auth-primary);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, .18);
+}
+
+/* 浏览器自动填充会把输入框刷成白底，显式压回深色 */
+.auth-input:-webkit-autofill,
+.auth-input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--auth-text);
+    -webkit-box-shadow: 0 0 0 40px #0d1526 inset;
+}
+
+/* 错误提示：固定最小高度占位，出现时不把按钮顶下去 */
+.auth-error {
+    min-height: 18px;
+    margin: 0 0 12px;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--auth-danger);
+    visibility: hidden;
+}
+
+.auth-error.is-visible { visibility: visible; }
+
+.auth-submit {
+    width: 100%;
+    height: 40px;
+    font-size: 14px;
+    font-family: inherit;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #ffffff;
+    background: var(--auth-primary);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color .16s ease, opacity .16s ease;
+}
+
+.auth-submit:hover:not(:disabled) { background: var(--auth-primary-hover); }
+
+.auth-submit:disabled {
+    opacity: .62;
+    cursor: default;
+}
+
+/* ===== 右上角鉴权区（挂载点：任意元素加 data-auth-nav） ===== */
+.auth-nav {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.auth-nav-btn {
+    padding: 6px 13px;
+    font-size: 13px;
+    font-family: inherit;
+    color: #dce9ff;
+    background: rgba(59, 130, 246, .18);
+    border: 1px solid rgba(120, 170, 255, .34);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color .22s ease, background-color .22s ease;
+}
+
+.auth-nav-btn:hover {
+    background: rgba(59, 130, 246, .3);
+    border-color: rgba(120, 170, 255, .6);
+}
+
+.auth-nav-user {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--auth-text-soft);
+}
+
+.auth-nav-link {
+    padding: 0;
+    font-size: 13px;
+    font-family: inherit;
+    color: #cfe0fb;
+    text-decoration: none;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: color .22s ease;
+}
+
+.auth-nav-link:hover { color: #ffffff; }
+
+@media (max-width: 520px) {
+    .auth-modal { padding: 24px 20px 18px; }
+    .auth-nav-user { display: none; }
+}

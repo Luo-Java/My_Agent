@@ -176,11 +176,18 @@
     }
 
     /* ---------- 3) Enter 直接进入控制台（输入框在外时也能用） ---------- */
+    // 和两个入口按钮走同一条路：经 Auth.guardNavigation 先确认登录态再跳。
+    // 这里自己 location.href 的话，未登录按 Enter 会「先跳进 chat、再被弹框」，
+    // 与按钮的行为不一致（按钮是就地弹框）。
     document.addEventListener('keydown', function (e) {
         var tag = (e.target && e.target.tagName) || '';
         if (tag === 'INPUT' || tag === 'TEXTAREA' || e.isComposing) { return; }
-        if (e.key === 'Enter') {
-            window.location.href = '/chat.html'; // chat.html 不自动打开最近会话，落在空白欢迎页
+        if (e.key !== 'Enter') { return; }
+        var target = '/chat.html'; // chat.html 不自动打开最近会话，落在空白欢迎页
+        if (window.Auth && window.Auth.guardNavigation) {
+            window.Auth.guardNavigation(target);
+        } else {
+            window.location.href = target;
         }
     });
 })();

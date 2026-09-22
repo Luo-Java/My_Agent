@@ -223,6 +223,15 @@ body {
     color: var(--text-soft);
     padding: 32px !important;
 }
+/* 加载占位行：与「暂无数据」同形；.is-loading 撑住卡片高度，
+   让「切视图 → 数据到达」过程中面板高度基本不动（高度反复伸缩同样是「闪」）。
+   最低高度取整页表格的近似值：表头 ≈ 34px + 每行 ≈ 40px，覆盖默认 10 条/页。 */
+.edu-loading {
+    text-align: center;
+    color: var(--text-soft);
+    padding: 32px !important;
+}
+.edu-table-wrap.is-loading { min-height: 420px; }
 
 /* ── 分页 ── */
 .edu-pager {
@@ -534,3 +543,40 @@ body {
 /* 筛选下拉固定宽度；分页大小下拉紧凑 */
 .edu-filter-ui { min-width: 130px; }
 .edu-page-size-ui { min-width: 96px; }
+
+/* ══ 顶栏登录用户区（登录态见 js/auth.js）══
+   与 chat 页 .auth-box 同一套外观（那边的定义在 style.css，改样式两处同步）。 */
+.auth-box {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 8px;
+    flex: none;
+}
+
+.auth-user {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-soft);
+}
+
+.auth-entry {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.auth-entry:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }

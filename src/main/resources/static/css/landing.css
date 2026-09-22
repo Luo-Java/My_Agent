@@ -122,24 +122,6 @@ body {
     color: var(--land-text-soft);
 }
 
-.nav-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 13px;
-    border-radius: 8px;
-    font-size: 13px;
-    color: #cfe0fb;
-    text-decoration: none;
-    border: 1px solid rgba(120, 170, 255, .22);
-    transition: border-color .22s ease, background .22s ease;
-}
-
-.nav-link:hover {
-    border-color: rgba(120, 170, 255, .5);
-    background: rgba(120, 170, 255, .1);
-}
-
 .nav-status {
     display: flex;
     align-items: center;

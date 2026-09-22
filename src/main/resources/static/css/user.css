@@ -1,0 +1,439 @@
+/* 用户管理页（/user.html）专用样式 —— 与 style.css / edu.css 相互独立，仅本页引入。
+   色板与 edu.css 保持一致（同为深色板，换肤需两处同步）。
+   字号约束：全部整数 px，正文 13px 起；次要文字用 --text-soft（深底可读下限，勿再调暗）。 */
+
+:root {
+    color-scheme: dark;
+    --primary: #3b82f6;
+    --primary-text: #7cb0ff;
+    --primary-soft: rgba(59, 130, 246, .16);
+    --cyan: #22d3ee;
+    --danger: #f87171;
+    --success: #34d399;
+
+    --bg: #05080f;
+    --panel: #0b1220;
+    --surface: rgba(255, 255, 255, .04);
+
+    --border: rgba(110, 160, 255, .14);
+    --border-strong: rgba(110, 160, 255, .30);
+
+    --text: #e8eefc;
+    --text-soft: #93a6c8;
+}
+
+* { box-sizing: border-box; }
+
+[v-cloak] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI",
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    color: var(--text);
+    background:
+        radial-gradient(900px 560px at 50% -14%, rgba(59, 130, 246, .16), transparent 62%),
+        var(--bg);
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ===== 顶栏 ===== */
+.um-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 13px 20px;
+    background: linear-gradient(180deg, rgba(17, 27, 48, .92), rgba(11, 18, 32, .78));
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 1px 0 rgba(34, 211, 238, .10) inset, 0 10px 24px rgba(0, 0, 0, .28);
+}
+
+.um-topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.um-topbar-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+.um-title { font-size: 16px; font-weight: 600; }
+
+.um-link {
+    font-size: 13px;
+    color: var(--text-soft);
+    text-decoration: none;
+    white-space: nowrap;
+}
+.um-link:hover { color: var(--primary-text); }
+
+/* 顶栏登录用户区（与 chat/edu 的 .auth-* 同款） */
+.auth-box { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+
+.auth-user {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-soft);
+}
+
+/* ===== 主体布局 ===== */
+.um-layout {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    padding: 16px 20px 28px;
+    max-width: 1320px;
+    margin: 0 auto;
+}
+
+.um-tabs {
+    flex: none;
+    width: 132px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    position: sticky;
+    top: 16px;
+}
+
+.um-tab {
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    text-align: left;
+    color: var(--text-soft);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.um-tab:hover { background: var(--surface); color: var(--text); }
+.um-tab.is-active {
+    background: var(--primary-soft);
+    color: var(--primary-text);
+    border-color: rgba(59, 130, 246, .28);
+    font-weight: 500;
+}
+
+.um-main { flex: 1; min-width: 0; }
+
+/* ===== 卡片 ===== */
+.um-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.um-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+}
+
+.um-panel-title { font-size: 14px; font-weight: 600; }
+.um-panel-hint { font-size: 12px; color: var(--text-soft); }
+.um-panel-head .um-btn { margin-left: auto; }
+
+/* ===== 筛选条 ===== */
+.um-search {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+}
+
+.um-input,
+.um-select {
+    height: 32px;
+    padding: 0 10px;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--text);
+    background-color: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+}
+.um-input { width: 190px; }
+.um-input::placeholder { color: #5d6d8c; }
+.um-input:focus,
+.um-select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, .16); }
+
+/* 原生 select：底色必须写 background-color（background 简写会丢自绘箭头）；
+   option 必须显式给底色与文字色，否则弹层在深色页面上是白底黑字。 */
+.um-select { width: 130px; cursor: pointer; }
+.um-select option { background-color: var(--panel); color: var(--text); }
+
+/* ===== 按钮 ===== */
+.um-btn {
+    height: 32px;
+    padding: 0 13px;
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all .15s ease;
+}
+.um-btn:hover:not(:disabled) { border-color: var(--border-strong); background: rgba(255, 255, 255, .07); }
+.um-btn:disabled { opacity: .55; cursor: default; }
+
+.um-btn-primary {
+    color: #ffffff;
+    background: var(--primary);
+    border-color: var(--primary);
+}
+.um-btn-primary:hover:not(:disabled) { background: #2f74e8; border-color: #2f74e8; }
+
+/* 危险操作：淡红底 + 描边，不用高饱和实底（会抢过主按钮的权重） */
+.um-btn-danger {
+    color: #fca5a5;
+    background: rgba(248, 113, 113, .14);
+    border-color: rgba(248, 113, 113, .36);
+}
+.um-btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, .22); border-color: rgba(248, 113, 113, .5); }
+
+/* 表格行内的小按钮 */
+.um-op {
+    padding: 3px 9px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--text-soft);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all .15s ease;
+}
+.um-op:hover { color: var(--primary-text); border-color: var(--primary); background: var(--primary-soft); }
+.um-op.is-danger:hover { color: #fca5a5; border-color: rgba(248, 113, 113, .5); background: rgba(248, 113, 113, .14); }
+
+/* ===== 表格 ===== */
+.um-table-wrap { overflow-x: auto; }
+
+.um-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+/* 表头底用不透明色：半透明底在横向滚动时会透出下层文字 */
+.um-table thead th {
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 500;
+    font-size: 12px;
+    color: var(--text-soft);
+    white-space: nowrap;
+    background: linear-gradient(rgba(255, 255, 255, .05), rgba(255, 255, 255, .05)), var(--panel);
+    border-bottom: 1px solid var(--border);
+}
+
+.um-table tbody td {
+    padding: 10px 12px;
+    color: var(--text);
+    border-bottom: 1px solid rgba(110, 160, 255, .07);
+    vertical-align: middle;
+}
+
+.um-table tbody tr:hover { background: rgba(59, 130, 246, .06); }
+.um-table tbody tr:last-child td { border-bottom: none; }
+
+/* 列宽：序号与操作列固定，其余按内容分配（禁 th{width:1%} + last-child:auto 那套） */
+.um-table th.um-col-no { width: 64px; }
+.um-table th.um-col-time { width: 150px; }
+.um-table th.um-col-ops { width: 190px; }
+
+.um-table td.um-col-no { color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.um-table td.um-col-time { color: var(--text-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* 操作列右对齐：必须带祖先前缀，否则被 .um-table thead th 那条 (0,1,2) 压掉 */
+.um-table th.um-col-ops,
+.um-table td.um-col-ops { text-align: right; }
+
+.um-ops { display: flex; gap: 6px; justify-content: flex-end; }
+
+.um-empty {
+    padding: 28px 12px;
+    text-align: center;
+    color: var(--text-soft);
+}
+
+/* ===== 状态标签 ===== */
+.um-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    line-height: 18px;
+    white-space: nowrap;
+}
+.um-tag.is-on { color: #6ee7b7; background: rgba(16, 185, 129, .14); }
+.um-tag.is-off { color: #cbd5e1; background: rgba(148, 163, 184, .16); }
+.um-tag.is-role { color: var(--primary-text); background: var(--primary-soft); }
+
+/* ===== 分页 ===== */
+.um-pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 11px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-soft);
+}
+
+.um-pager-btn {
+    height: 28px;
+    padding: 0 11px;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.um-pager-btn:hover:not(:disabled) { border-color: var(--border-strong); }
+.um-pager-btn:disabled { opacity: .45; cursor: default; }
+
+.um-pager-num { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* ===== 弹窗 ===== */
+.um-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(3, 7, 16, .62);
+}
+
+.um-modal {
+    width: 100%;
+    max-width: 520px;
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 26px 64px rgba(0, 0, 0, .6);
+}
+
+.um-modal.is-dialog { max-width: 400px; }
+
+.um-modal-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.um-modal-close {
+    margin-left: auto;
+    width: 26px;
+    height: 26px;
+    font-size: 15px;
+    line-height: 1;
+    color: var(--text-soft);
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.um-modal-close:hover { color: var(--text); background: var(--surface); }
+
+/* min-height:0 必须写：flex 子项默认 min-height:auto 不收缩，内容会顶破 max-height 被裁掉 */
+.um-modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+.um-modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+}
+
+.um-modal-msg { font-size: 13px; line-height: 1.75; color: var(--text); word-break: break-word; }
+
+/* ===== 表单 ===== */
+.um-field { margin-bottom: 14px; }
+
+.um-label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 13px;
+    color: var(--text-soft);
+}
+.um-label .um-req { color: var(--danger); margin-left: 2px; }
+
+.um-field .um-input,
+.um-field .um-select { width: 100%; }
+
+.um-field-hint {
+    margin: 6px 0 0;
+    font-size: 12px;
+    color: var(--text-soft);
+    line-height: 1.6;
+}
+
+/* 角色多选：复选框列表（不用原生 multiple select —— 弹层由系统绘制、样式不可控） */
+.um-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.um-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    color: var(--text-soft);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+.um-check:hover { border-color: var(--border-strong); color: var(--text); }
+.um-check.is-on { color: var(--primary-text); border-color: var(--primary); background: var(--primary-soft); }
+.um-check input { accent-color: var(--primary); cursor: pointer; }
+
+/* 弹窗内的错误提示：保留占位，出现时不顶动按钮 */
+.um-form-error {
+    min-height: 18px;
+    margin: 0 0 10px;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--danger);
+    visibility: hidden;
+}
+.um-form-error.is-visible { visibility: visible; }

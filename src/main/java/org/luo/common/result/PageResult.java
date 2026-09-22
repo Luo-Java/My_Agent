@@ -44,4 +44,15 @@ public class PageResult<T> {
     public static <T> PageResult<T> of(IPage<T> p, List<T> records) {
         return new PageResult<>(records, p.getTotal(), p.getCurrent(), p.getSize(), p.getPages());
     }
+
+    /**
+     * 由原始分页对象 + 转换后的记录列表构造。
+     * <p>
+     * 与 {@link #of(IPage, List)} 的区别：记录类型可与分页对象的元素类型不同，用于
+     * 「按实体分页查询、对外输出 VO」的场景（{@code of} 的两个参数要求同一类型，无法直接表达）。
+     * total / page / size / pages 原样搬运自查询结果。
+     */
+    public static <T> PageResult<T> ofMapped(IPage<?> source, List<T> records) {
+        return new PageResult<>(records, source.getTotal(), source.getCurrent(), source.getSize(), source.getPages());
+    }
 }

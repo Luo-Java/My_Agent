@@ -47,10 +47,18 @@ public class ApiKeyInterceptor implements HandlerInterceptor {
         if (provided != null && constantTimeEquals(apiKey, provided)) {
             return true;
         }
+        // 与其余接口保持同一种响应头形状：setCharacterEncoding 会让 Tomcat 追加 ;charset=UTF-8，
+        // 而 Jackson 输出的都是 application/json —— 同一 API 两种形状会误导排查。
+        // JSON 按规范即 UTF-8，直接写字节，编码由本方法保证。
+        //
+        // reason 必须与 JwtAuthInterceptor 的 TokenStatus 区分开：两处闸门都回 401，前端凭 reason
+        // 判断「该不该清掉本地登录态」——本闸门拒绝的是服务级密钥，与用户登录态无关，
+        // 若混为一谈就会把「密钥没配」变成「所有人都被强制重新登录」（见 auth.js 的 reason 白名单）。
+        String body = "{\"code\":401,\"message\":\"未授权：缺少或错误的 X-Api-Key\","
+                + "\"reason\":\"API_KEY_REQUIRED\"}";
         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-        response.getWriter().write("{\"code\":401,\"message\":\"未授权：缺少或错误的 X-Api-Key\"}");
+        response.getOutputStream().write(body.getBytes(StandardCharsets.UTF_8));
         return false;
     }
 

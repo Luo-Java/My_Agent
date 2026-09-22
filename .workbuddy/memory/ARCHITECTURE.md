@@ -261,5 +261,19 @@
 
 **未验证 / 验收**：应用未启动（按项目约定不由 AI 启动），故「无 server 时零副作用」目前只有静态证据
 （两个自动配置类带 `@ConditionalOnProperty` / `@ConditionalOnMissingBean` 守卫）。验收方式：启动日志出现
-`MCP 工具加载：N 个`，且 `GET /api/agent/tools` 能列出 `MCP` 分组的工具；再建个测试智能体写
-`tools_json: ["<工具名>"]` 试调。
+`MCP 工具加载：N 个`，且 `  GET /api/agent/tools` 能列出 `MCP` 分组的工具；再建个测试智能体写
+  `tools_json: ["<工具名>"]` 试调。
+
+## 九、补充（合并自旧日志 9-01 / 9-12 / 9-21，原 9-xx.md 已删）
+
+### 有界工具循环（2026-09-21）
+Spring AI 2.0 工具调用**天生 do…while 循环**（返回 toolCall 就执行、拼回再调，直到停止），默认**无迭代上限**，模型反复调同一工具会死循环。"工具组合调用"要做的不是实现循环，而是**装刹车**：覆盖 `ToolCallingAdvisor.Builder<?>` bean（默认来自 `ChatClientAutoConfiguration`，`@ConditionalOnMissingBean`），自建 `BoundedToolCallingAdvisor`（ThreadLocal 计数 + 软刹车 `augmentSystemMessage`），配置 `agent.tool-call.*`（`max-iterations=10` / `repeat-threshold=3`）。
+
+### 成本看板（独立 `llm_usage` 流水表，2026-09-21）
+7 处裸 `ChatModel.call()`（视觉 / 记忆合并 / 路由 / 参数抽取 / 改写）生命周期无法都塞进当轮 RoundTrace，故**不硬塞**，新增旁路表 `llm_usage`，5 处裸调用各记一条（purpose=ROUTE/CLARIFY/REWRITE/VISION/MEMORY_MERGE）；`CostService` 聚合 `llm_usage`（全量裸调用）+ `agent_trace`（回答本身）。聚合 SQL 用 `@Select` + `DATE_FORMAT` GROUP BY（项目此前无 @Select 先例）。
+
+### 提示词外置约定（2026-09-01）
+提示词集中外置到 `prompts.yaml`（`agent.prompt.*`），动态变量用 `{占位符}` 模板、**运行时替换**（不用 String.format，规避 % 与 MessageFormat 大括号转义冲突）；yaml 里写**字面 JSON 花括号必须转义 `\{ \}`**（ST4 把 `{...}` 当表达式，否则抛 'true' came as a complete surprise），中文尖括号 `<...>` 在 `{ }` 分隔符下安全。改提示词改 yaml 即可、无需重编译。
+
+### ChatMemory 装配唯一性（2026-09-12，坑勿踩）
+`DbChatMemory` 仅靠 `ChatMemoryConfig` 的 `@Bean @ConditionalOnMissingBean(ChatMemory.class)` 注册（类上无 stereotype 注解）；**别在任何别处再定义 `@Bean ChatMemory`**（两个用户配置类顺序不确定 → `NoUniqueBeanDefinitionException`）。Spring AI 自带 `MessageWindowChatMemory` 自动配置因条件不成立被跳过，但其 `InMemoryChatMemoryRepository` 成孤儿 bean（无害，但注入 `ChatMemoryRepository` 会意外拿到内存版）。
