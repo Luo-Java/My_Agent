@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.ClazzMapper">
+
+    <select id="selectClazzPage" resultType="org.luo.edu.vo.ClazzVO">
+        select c.*, t.name as headTeacherName
+        from class c
+        left join teacher t on c.head_teacher_id = t.id
+        where 1=1
+        <if test="dto.name != null and dto.name != ''">
+            and c.name like concat('%', #{dto.name}, '%')
+        </if>
+        <if test="dto.headTeacherId != null">
+            and c.head_teacher_id = #{dto.headTeacherId}
+        </if>
+        order by c.id desc
+    </select>
+</mapper>

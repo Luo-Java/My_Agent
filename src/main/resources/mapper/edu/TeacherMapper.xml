@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.TeacherMapper">
+
+    <select id="selectTeacherPage" resultType="org.luo.edu.vo.TeacherVO">
+        select t.*, s.name as subjectName
+        from teacher t
+        left join subject s on t.subject_id = s.id
+        where 1=1
+        <if test="dto.name != null and dto.name != ''">
+            and t.name like concat('%', #{dto.name}, '%')
+        </if>
+        <if test="dto.subjectId != null">
+            and t.subject_id = #{dto.subjectId}
+        </if>
+        order by t.id desc
+    </select>
+</mapper>

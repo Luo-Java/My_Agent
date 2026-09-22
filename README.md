@@ -151,31 +151,46 @@ mvn clean package && java -jar target/my_agent-0.0.1-SNAPSHOT.jar
 
 ```
 org.luo
-├── controller/      # ChatController(SSE) / ConversationController / AgentController
-│                    # / KnowledgeBaseController / AttachmentController / TraceController
-├── service/         # ChatService(编排门面) / ConversationService / AgentService
-│                    # / KbService / KbSearchService / ChunkingService
-├── agent/           # AgentRouter(智能路由) / ParamFillingService(参数补全) / PlannerService(规划)
-│                    # / MemoryMergeService(记忆合并) / PromptService / QueryRewriteService(查询改写)
-│   └── handler/     # RoundHandler + AgentRoundHandler / PlannerRoundHandler / RoundResult
-├── chat/            # ChatComposer(请求装配：人设/记忆/材料/工具/RAG)
-├── advisor/         # ToolUsageLoggingAdvisor / RoundTraceAdvisor
-├── tool/            # ToolRegistry(能力池) / ToolProvider(注解式工具) / ToolCallbackSource(动态工具接缝)
-│                    # / McpToolSource(MCP 远端工具) / WeatherTools / DateResolver
-│                    # / SqlQueryTool / SqlSafety / SqlSchemaTool / ChartTool
-├── memory/          # DbChatMemory(Spring AI ChatMemory 的 DB 实现)
-├── trace/           # RoundTrace(一轮收集器) / TraceService(异步落库)
-├── infrastructure/  # attachment(解析/落盘) / chroma(客户端/副本同步) / document
-│                    # / rerank(DashScope 精排) / vision(多模态)
-├── config/          # ApiSecurity / CorsConfig / ExecutorConfig(线程池) / MemoryProperties
-│                    # / RagProperties / VisionProperties / PromptProperties / GlobalExceptionHandler
-├── entity/ mapper/ dto/ enums/ exception/ constant/
+├── MyAgentApplication  # 启动类（@MapperScan 指向 ai.mapper + edu.mapper）
+├── common/             # 共享基础设施（AI 与教务共用）
+│   ├── config/         # CorsConfig / GlobalExceptionHandler / MybatisPlusConfig(分页插件)
+│   │                   # / ApiKeyInterceptor + ApiSecurityConfig(全局鉴权 /api/**)
+│   └── exception/      # AiBusinessException / AiErrorCode
+├── ai/                 # AI 多智能体平台
+│   ├── controller/     # ChatController(SSE) / ConversationController / AgentController
+│   │                   # / KnowledgeBaseController / AttachmentController / TraceController
+│   ├── service/        # ChatService(编排门面) / ConversationService / AgentService
+│   │                   # / KbService / KbSearchService / ChunkingService
+│   ├── agent/          # AgentRouter(智能路由) / ParamFillingService / PlannerService
+│   │                   # / MemoryMergeService / PromptService / QueryRewriteService
+│   │   └── handler/    # RoundHandler + AgentRoundHandler / PlannerRoundHandler / RoundResult
+│   ├── chat/           # ChatComposer(请求装配：人设/记忆/材料/工具/RAG)
+│   ├── advisor/        # ToolUsageLoggingAdvisor / RoundTraceAdvisor
+│   ├── tool/           # ToolRegistry / ToolProvider(注解式) / ToolCallbackSource(动态工具接缝)
+│   │                   # / McpToolSource(MCP) / WeatherTools / DateResolver
+│   │                   # / SqlQueryTool / SqlSafety / SqlSchemaTool / ChartTool
+│   ├── memory/         # DbChatMemory(Spring AI ChatMemory 的 DB 实现)
+│   ├── trace/          # RoundTrace / TraceService(异步落库) / LlmUsageService
+│   ├── infrastructure/ # attachment / chroma(客户端+副本同步) / document / rerank / vision
+│   ├── config/         # ExecutorConfig(线程池) / ChatMemoryConfig / ToolCallingConfig 等 AI 专用
+│   ├── properties/     # MemoryProperties / RagProperties / VisionProperties / PromptProperties
+│   └── entity/ mapper/ dto/ enums/ constant/
+└── edu/                # 教务系统（每表独立 Controller/Service + Mapper XML）
+    ├── controller/     # 10 个 {表}Controller（统一命令式：POST /page、GET /list、GET /{id}、
+    │                   # POST /save、PUT /update、DELETE /delete/{id}）
+    │                   # / EduQueryController(4 关联查询) / EduMetaController(看板)
+    ├── dto/ vo/        # {表}DTO（筛选条件，继承 BaseBO）、{表}VO（join 出的可读名）、OptionVO（下拉选项）
+    ├── service/        # 10 个 {表}Service extends IService（分页/下拉/写操作 + 唯一性校验 + 删除前引用校验）
+    │                   # / EduQueryService(关联查询) / EduMetaService(看板统计)
+    ├── entity/         # 10 个教务实体（Clazz/Course/Score/... 驼峰字段）
+    └── mapper/         # 10 个 BaseMapper + 跨表分页/下拉 SQL（见 mapper/edu/*.xml）
 resources/
 ├── application.yaml     # 数据源 / 模型 / 平台自身配置
 ├── prompts.yaml         # 全部提示词模板（agent.prompt.*）
 ├── sql/schema.sql       # 建表（幂等）
 ├── sql/alter.sql        # 存量库补列
-└── static/              # 前端（index.html / js/app.js / css/style.css）
+├── mapper/edu/*.xml     # 教务关联查询 SQL（namespace 对应 edu.mapper）
+└── static/              # 前端（index.html / edu.html / js / css）
 ```
 
 ### 一轮对话的编排流程
@@ -301,6 +316,20 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING |
 | `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败 |
 
+> 教务系统另用一组**业务表**（与对话主表独立，建表/演示数据见 `sql/business.sql`）：
+> `subject`（科目）、`teacher`（老师）、`class`（班级）、`student`（学生）、`semester`（学期）、
+> `course`（课程）、`period`（节次）、`course_arrangement`（排课）、`exam`（考试）、`score`（成绩）。
+> 这 10 张表由教务系统（`/edu.html`）读写，走 `/api/edu/**` 接口，与 AI 对话数据完全分离。
+> 接口统一为**命令式**：`POST /api/edu/{表}/page`（筛选条件走 body）、`GET /api/edu/{表}/list`
+> （下拉选项，只回 `id` + 拼好的可读文案）、`GET /api/edu/{表}/{id}`、`POST /api/edu/{表}/save`、
+> `PUT /api/edu/{表}/update`（id 在 body）、`DELETE /api/edu/{表}/delete/{id}`；
+> 外键列的可读名由服务端 join 进 `{表}VO`，前端不再做 id→名称映射，也没有集中的字典接口。
+> 4 个只读关联查询为顶层路径 `GET /api/edu/score-detail`、`/score-stats`、`/timetable`、`/schedule`，
+> **四个都分页**（`page`/`size`，默认每页 10 条、上限 100，一律回 `PageResult`；行是类型化投影
+> `ScoreDetailVO` / `ScoreStatsVO` / `TimetableVO` / `ScheduleVO`，不用 `Map`）；均可带筛选参数：成绩明细 `classId`/`subjectId`/`semesterId`/`keyword`
+> （模糊匹配学生姓名或学号）、成绩统计 `classId`/`subjectId`/`semesterId`、班级课表 `classId`/`teacherId`/`dayOfWeek`、
+> 考试日程 `classId`/`subjectId`/`semesterId`，不传即不过滤。
+
 ## 前端界面
 
 - **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪、💰 成本。
@@ -308,6 +337,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 - **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
 - **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。
 - **成本看板弹窗**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。
+- **教务系统**（`/edu.html`，独立入口）：10 张业务表（科目/老师/班级/学生/学期/课程/节次/排课/考试/成绩）的增删改查 + 4 个关联查询看板（学生成绩明细、成绩统计、班级课表、考试日程），复用深色色板，与 AI 对话页分离。单表页与关联查询页共用同一套顶部搜索条（文本输入 + 外键/枚举下拉 + 查询/重置，按 `tableMeta.search` / `queryMeta.search` 声明渲染）、序号列、右下分页（首页/上一页/下一页/尾页/跳页[/每页条数]）；新增与删除走自绘弹窗。
 
 ## 开发备注
 

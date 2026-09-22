@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>教务管理系统</title>
+    <!-- 前端依赖本地化（与 AI 对话页共用同一份 lib）。Vue 3.5.43 / ECharts 5.6.0。 -->
+    <script src="/js/lib/vue.global.prod.js"></script>
+    <script src="/js/lib/echarts.min.js"></script>
+    <link rel="stylesheet" href="/css/edu.css" />
+</head>
+<body>
+<div id="boot-tip" style="position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:24px;background:#05080f;color:#93a6c8;text-align:center;font:14px/1.8 -apple-system,'Segoe UI','Microsoft YaHei UI',sans-serif;">
+    <div>教务系统加载中…<br />
+        <span style="font-size:13px;">若长时间停在此处，请确认 /js/lib/vue.global.prod.js 可访问（HTTP 200）。</span>
+    </div>
+</div>
+
+<div id="app" v-cloak>
+    <!-- 顶部栏 -->
+    <header class="edu-topbar">
+        <div class="edu-topbar-left">
+            <a class="back-home" href="/" title="返回首页">← 返回首页</a>
+            <span class="edu-title">教务管理系统</span>
+        </div>
+        <div class="edu-topbar-right">
+            <a class="back-chat" href="/chat.html" title="前往 AI 对话">前往 AI 对话 →</a>
+        </div>
+    </header>
+
+    <div class="edu-layout">
+        <!-- 左侧导航（一级分组可折叠 + 二级菜单项） -->
+        <aside class="edu-sidebar">
+            <div class="edu-nav-group" v-for="g in menuGroups" :key="g.title">
+                <button class="edu-nav-group-head" :class="{ 'is-open': isGroupOpen(g) }"
+                        @click="toggleGroup(g)">
+                    <span>{{ g.title }}</span>
+                    <span class="edu-nav-arrow" aria-hidden="true"></span>
+                </button>
+                <div v-show="isGroupOpen(g)" class="edu-nav-group-body">
+                    <button v-for="item in g.items" :key="item.key"
+                            class="edu-nav-item" :class="{ active: isActive(item) }"
+                            @click="switchView(item)">
+                        {{ item.label }}
+                    </button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- 右侧内容 -->
+        <main class="edu-main">
+            <!-- 看板视图 -->
+            <template v-if="current.view === 'dashboard'">
+                <div class="edu-toolbar">
+                    <span class="edu-crumb">数据看板</span>
+                    <div class="edu-toolbar-actions">
+                        <button class="edu-btn" @click="loadDashboard">刷新</button>
+                    </div>
+                </div>
+                <div v-if="dash" class="edu-dash">
+                    <div class="edu-dash-cards">
+                        <div class="edu-dash-card"><div class="edu-dash-num">{{ dash.studentCount }}</div><div class="edu-dash-label">学生</div></div>
+                        <div class="edu-dash-card"><div class="edu-dash-num">{{ dash.teacherCount }}</div><div class="edu-dash-label">老师</div></div>
+                        <div class="edu-dash-card"><div class="edu-dash-num">{{ dash.classCount }}</div><div class="edu-dash-label">班级</div></div>
+                        <div class="edu-dash-card"><div class="edu-dash-num">{{ dash.courseCount }}</div><div class="edu-dash-label">课程</div></div>
+                        <div class="edu-dash-card"><div class="edu-dash-num">{{ dash.scoreCount }}</div><div class="edu-dash-label">成绩记录</div></div>
+                    </div>
+                    <div class="edu-dash-charts">
+                        <div class="edu-dash-panel">
+                            <div class="edu-dash-panel-title">各年级学生分布</div>
+                            <div id="dash-grade-chart" class="edu-dash-chart"></div>
+                        </div>
+                        <div class="edu-dash-panel">
+                            <div class="edu-dash-panel-title">各科教师分布</div>
+                            <div id="dash-subject-chart" class="edu-dash-chart"></div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+
+            <!-- 数据表视图 -->
+            <template v-else-if="current.view === 'table'">
+                <!-- 基础数据搜索（置顶；按 tableMeta.search 声明渲染，回车或查询按钮触发） -->
+                <div v-if="searchFields.length" class="edu-search-bar">
+                    <div v-for="f in searchFields" :key="f.key" class="edu-search-field">
+                        <span class="edu-search-label">{{ f.label }}</span>
+                        <input v-if="!f.fkOptions && !f.options" v-model="searchForm[f.key]" class="edu-search"
+                               :placeholder="f.placeholder || ''" @keyup.enter="doSearch">
+                        <ui-select v-else v-model="searchForm[f.key]" :options="searchOptions(f)"
+                                   :placeholder="f.allLabel || '全部'" class="edu-filter-ui" @change="doSearch"></ui-select>
+                    </div>
+                    <div class="edu-search-btns">
+                        <button class="edu-btn edu-btn-primary" @click="doSearch">查询</button>
+                        <button class="edu-btn" @click="resetSearch">重置</button>
+                    </div>
+                </div>
+
+                <div class="edu-panel">
+                    <!-- 卡片头：标题 + 操作按钮（表单右上） -->
+                    <div class="edu-panel-head">
+                        <span class="edu-panel-title">{{ currentLabel }}</span>
+                        <div class="edu-toolbar-actions">
+                            <button class="edu-btn edu-btn-primary" @click="openCreate">＋ 新增</button>
+                        </div>
+                    </div>
+
+                    <div class="edu-table-wrap">
+                        <table class="edu-table">
+                            <thead>
+                            <tr>
+                                <th class="edu-th-no">序号</th>
+                                <th v-for="c in currentColumns" :key="c">{{ c.label }}</th>
+                                <th class="edu-th-ops">操作</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr v-for="(row, i) in rows" :key="row.id">
+                                <td class="edu-td-no">{{ rowNo(i) }}</td>
+                                <td v-for="c in currentColumns" :key="c.key">{{ fmtCell(row[c.key], c) }}</td>
+                                <td class="edu-td-ops">
+                                    <button class="edu-link" @click="openEdit(row)">编辑</button>
+                                    <span class="edu-td-sep"></span>
+                                    <button class="edu-link edu-link-danger" @click="removeRow(row)">删除</button>
+                                </td>
+                            </tr>
+                            <tr v-if="!rows.length">
+                                <td class="edu-empty" :colspan="currentColumns.length + 2">暂无数据</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="edu-panel-foot">
+                        <div class="edu-pager">
+                            <button class="edu-btn" :disabled="page <= 1" @click="goPage(1)">首页</button>
+                            <button class="edu-btn" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
+                            <span class="edu-pager-info">第 {{ page }} / {{ totalPages || 1 }} 页 · 共 {{ total }} 条</span>
+                            <button class="edu-btn" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+                            <button class="edu-btn" :disabled="page >= totalPages" @click="goPage(totalPages || 1)">尾页</button>
+                            <label class="edu-jump">
+                                跳至
+                                <input class="edu-jump-input" type="text" inputmode="numeric" placeholder="页码"
+                                       v-model="jumpTo" @keyup.enter="doJump">
+                                页
+                            </label>
+                            <ui-select v-model="pageSize" :options="pageSizeOptions" class="edu-page-size-ui" @change="loadPage(1)"></ui-select>
+                        </div>
+                    </div>
+                </div>
+            </template>
+
+            <!-- 关联查询视图 -->
+            <template v-else>
+                <!-- 关联查询搜索（与表格页同一套：输入框/下拉 + 查询/重置，按 queryMeta.search 声明渲染） -->
+                <div v-if="searchFields.length" class="edu-search-bar">
+                    <div v-for="f in searchFields" :key="f.key" class="edu-search-field">
+                        <span class="edu-search-label">{{ f.label }}</span>
+                        <input v-if="!f.fkOptions && !f.options" v-model="searchForm[f.key]" class="edu-search"
+                               :placeholder="f.placeholder || ''" @keyup.enter="doSearch">
+                        <ui-select v-else v-model="searchForm[f.key]" :options="searchOptions(f)"
+                                   :placeholder="f.allLabel || '全部'" class="edu-filter-ui" @change="doSearch"></ui-select>
+                    </div>
+                    <div class="edu-search-btns">
+                        <button class="edu-btn edu-btn-primary" @click="doSearch">查询</button>
+                        <button class="edu-btn" @click="resetSearch">重置</button>
+                    </div>
+                </div>
+
+                <div class="edu-panel">
+                    <!-- 卡片头：标题（操作按钮在表格卡片右上） -->
+                    <div class="edu-panel-head">
+                        <span class="edu-panel-title">{{ currentLabel }}</span>
+                    </div>
+
+                    <div class="edu-table-wrap">
+                        <table class="edu-table">
+                            <thead>
+                            <tr>
+                                <th class="edu-th-no">序号</th>
+                                <th v-for="c in queryColumns" :key="c">{{ queryColumnLabels[c] || c }}</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr v-for="(row, i) in queryRows" :key="i">
+                                <td class="edu-td-no">{{ rowNo(i) }}</td>
+                                <td v-for="c in queryColumns" :key="c">{{ fmtQueryCell(row[c], c) }}</td>
+                            </tr>
+                            <tr v-if="!queryRows.length">
+                                <td class="edu-empty" :colspan="queryColumns.length + 1">暂无数据</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="edu-panel-foot">
+                        <div class="edu-pager">
+                            <button class="edu-btn" :disabled="page <= 1" @click="goPage(1)">首页</button>
+                            <button class="edu-btn" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
+                            <span class="edu-pager-info">第 {{ page }} / {{ totalPages || 1 }} 页 · 共 {{ total }} 条</span>
+                            <button class="edu-btn" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+                            <button class="edu-btn" :disabled="page >= totalPages" @click="goPage(totalPages || 1)">尾页</button>
+                            <label class="edu-jump">
+                                跳至
+                                <input class="edu-jump-input" type="text" inputmode="numeric" placeholder="页码"
+                                       v-model="jumpTo" @keyup.enter="doJump">
+                                页
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </main>
+    </div>
+
+    <!-- 新增/编辑弹窗 -->
+    <div class="edu-modal-mask" v-if="form.open" @click.self="form.open = false">
+        <div class="edu-modal">
+            <div class="edu-modal-head">
+                <span>{{ form.id ? '编辑' : '新增' }} · {{ currentLabel }}</span>
+                <button class="edu-modal-close" @click="form.open = false">✕</button>
+            </div>
+            <div class="edu-modal-body">
+                <div v-for="c in editableColumns" :key="c.key" class="edu-form-row">
+                    <label class="edu-form-label">{{ c.label }}</label>
+                    <ui-select v-if="c.fkOptions || c.options" v-model="form.data[c.key]"
+                               :options="fieldOptions(c)" class="edu-form-select-ui"></ui-select>
+                    <input v-else v-model="form.data[c.key]" class="edu-form-input" type="text"
+                           :placeholder="c.placeholder || ''" />
+                </div>
+                <div v-if="!editableColumns.length" class="edu-empty">该表无可编辑字段</div>
+            </div>
+            <div class="edu-modal-foot">
+                <button class="edu-btn" @click="form.open = false">取消</button>
+                <button class="edu-btn edu-btn-primary" :disabled="form.saving" @click="saveForm">
+                    {{ form.saving ? '保存中…' : '保存' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 确认 / 提示弹窗（自绘，替代原生 confirm / alert） -->
+    <div class="edu-modal-mask" v-if="dialog.open" @click.self="closeDialog(false)">
+        <div class="edu-modal is-dialog">
+            <div class="edu-modal-head">
+                <span>{{ dialog.title }}</span>
+                <button class="edu-modal-close" @click="closeDialog(false)">✕</button>
+            </div>
+            <div class="edu-modal-body">
+                <p class="edu-dialog-text">{{ dialog.message }}</p>
+            </div>
+            <div class="edu-modal-foot">
+                <button v-if="dialog.mode === 'confirm'" class="edu-btn" @click="closeDialog(false)">取消</button>
+                <button class="edu-btn" :class="dialog.danger ? 'edu-btn-danger' : 'edu-btn-primary'"
+                        @click="closeDialog(true)">{{ dialog.mode === 'alert' ? '知道了' : dialog.okText }}</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/js/edu.js"></script>
+</body>
+</html>

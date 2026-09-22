@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.ExamMapper">
+
+    <select id="selectExamPage" resultType="org.luo.edu.vo.ExamVO">
+        select e.*, c.name as className, s.name as subjectName, sem.name as semesterName
+        from exam e
+        left join class c on e.class_id = c.id
+        left join subject s on e.subject_id = s.id
+        left join semester sem on e.semester_id = sem.id
+        where 1=1
+        <if test="dto.classId != null">
+            and e.class_id = #{dto.classId}
+        </if>
+        <if test="dto.subjectId != null">
+            and e.subject_id = #{dto.subjectId}
+        </if>
+        <if test="dto.semesterId != null">
+            and e.semester_id = #{dto.semesterId}
+        </if>
+        order by e.id desc
+    </select>
+    <!-- 考试安排（只读关联查询），筛选条件由 dto 携带。 -->
+    <select id="selectSchedule" resultType="org.luo.edu.vo.ScheduleVO">
+        SELECT e.id,
+               c.name AS className, su.name AS subjectName, sem.name AS semesterName,
+               e.exam_date AS examDate, e.exam_time AS examTime
+        FROM exam e
+        JOIN class c ON e.class_id = c.id
+        JOIN subject su ON e.subject_id = su.id
+        JOIN semester sem ON e.semester_id = sem.id
+        <where>
+            <if test="dto.classId != null">AND c.id = #{dto.classId}</if>
+            <if test="dto.subjectId != null">AND su.id = #{dto.subjectId}</if>
+            <if test="dto.semesterId != null">AND sem.id = #{dto.semesterId}</if>
+        </where>
+        ORDER BY e.exam_date, c.id, su.id
+    </select>
+    <!-- 下拉文案在 SQL 里拼好，避免前端二次拼装。 -->
+    <select id="selectOptions" resultType="org.luo.edu.vo.OptionVO">
+        select e.id as id,
+               concat(c.name, ' · ', s.name, ' · ', sem.name, ' · ', e.exam_date) as label
+        from exam e
+        join class c on e.class_id = c.id
+        join subject s on e.subject_id = s.id
+        join semester sem on e.semester_id = sem.id
+        order by e.id
+    </select>
+</mapper>

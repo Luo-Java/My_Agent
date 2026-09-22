@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.StudentMapper">
+
+    <select id="selectStudentPage" resultType="org.luo.edu.vo.StudentVO">
+        select st.*, c.name as className
+        from student st
+        left join class c on st.class_id = c.id
+        where 1=1
+        <if test="dto.name != null and dto.name != ''">
+            and st.name like concat('%', #{dto.name}, '%')
+        </if>
+        <if test="dto.classId != null">
+            and st.class_id = #{dto.classId}
+        </if>
+        order by st.id desc
+    </select>
+</mapper>

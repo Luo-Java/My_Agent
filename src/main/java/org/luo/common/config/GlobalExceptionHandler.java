@@ -1,0 +1,67 @@
+package org.luo.common.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.luo.common.exception.AiBusinessException;
+import org.luo.common.exception.AiErrorCode;
+import org.luo.common.result.RestResult;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
+
+/**
+ * 全局异常处理：统一把异常转成 {@link RestResult}（{@code {code, message, data}}）JSON，
+ * 与控制器返回同形状，避免裸 500 / 堆栈泄露给客户端。
+ * <p>
+ * 业务代码统一抛 {@link AiBusinessException}，因此这里只兜底几类常见异常：
+ * 业务异常（400）、运行时异常（500）、其他异常（500）、资源不存在（404）。
+ * SSE 流开始后的异常由聊天控制器自行终止，不经过此处。
+ */
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /** 业务异常（业务代码统一抛出）→ 按 {@link AiErrorCode} 返回对应 HTTP 状态码，透出提示语。 */
+    @ExceptionHandler(AiBusinessException.class)
+    public ResponseEntity<RestResult<Void>> handleBusiness(AiBusinessException e) {
+        int code = e.getCode();
+        log.warn("业务异常：状态码={}，提示={}", code, e.getMessage());
+        return ResponseEntity.status(code).body(RestResult.fail(code, e.getMessage()));
+    }
+
+    /** 未预期异常兜底（运行时 + 受检）→ 500；其中请求体/参数解析类客户端错误降级为 400。
+     *  AiBusinessException 与 NoResourceFoundException 有更具体的 handler，不受本方法影响。 */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<RestResult<Void>> handleUnexpected(Exception e) {
+        if (e instanceof HttpMessageNotReadableException || e instanceof MethodArgumentTypeMismatchException) {
+            log.warn("客户端参数错误：{}", e.getMessage());
+            return ResponseEntity.badRequest().body(RestResult.fail(400, "请求参数缺失或格式错误"));
+        }
+        log.error("未预期的异常", e);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(RestResult.fail(500, "服务器内部错误，请稍后重试"));
+    }
+
+    /** 请求路径不存在（含静态资源未命中）→ 404。 */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<RestResult<Void>> handleNotFound(NoResourceFoundException e) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(RestResult.fail(404, "资源不存在"));
+    }
+
+    /**
+     * 上传内容超过 {@code spring.servlet.multipart.max-file-size / max-request-size} → 413。
+     * <p>
+     * 不接这个异常时会落到通用兜底分支被当成「服务器内部错误」（500），前端只看到「服务器错误」，
+     * 完全不知道是文件太大。提示语中的上限需与 application.yaml 的 multipart 配置保持一致。
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<RestResult<Void>> handleUploadTooLarge(MaxUploadSizeExceededException e) {
+        log.warn("上传内容超限：{}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
+                .body(RestResult.fail(413, "上传文件过大（单文件上限 20MB），请压缩或减少附件后重试"));
+    }
+}

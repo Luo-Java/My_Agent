@@ -1,17 +1,17 @@
 package org.luo;
 
-import org.luo.properties.MemoryProperties;
-import org.luo.properties.PromptProperties;
-import org.luo.properties.RagProperties;
-import org.luo.properties.ToolCallProperties;
-import org.luo.properties.VisionProperties;
+import org.luo.ai.properties.MemoryProperties;
+import org.luo.ai.properties.PromptProperties;
+import org.luo.ai.properties.RagProperties;
+import org.luo.ai.properties.ToolCallProperties;
+import org.luo.ai.properties.VisionProperties;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 @SpringBootApplication
-@MapperScan("org.luo.mapper")
+@MapperScan({"org.luo.ai.mapper", "org.luo.edu.mapper"})
 @EnableConfigurationProperties({PromptProperties.class, VisionProperties.class, RagProperties.class,
         MemoryProperties.class, ToolCallProperties.class})
 public class MyAgentApplication {

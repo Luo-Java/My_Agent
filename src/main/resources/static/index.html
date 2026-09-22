@@ -24,8 +24,11 @@
             <span>My_Agent</span>
         </div>
         <div class="nav-right">
-            <span class="dot"></span>
-            <span>服务就绪</span>
+            <a class="nav-link" href="/edu.html">教务系统</a>
+            <span class="nav-status">
+                <span class="dot"></span>
+                <span>服务就绪</span>
+            </span>
         </div>
     </header>
 
@@ -42,6 +45,13 @@
             <!-- chat.html 进入与刷新都落在空白欢迎页，不自动打开最近会话（见 app.js onMounted） -->
             <a class="cta" href="/chat.html">
                 进入控制台
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 12h13M13 6l6 6-6 6" />
+                </svg>
+            </a>
+            <a class="cta-secondary" href="/edu.html">
+                教务系统
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                      stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M5 12h13M13 6l6 6-6 6" />

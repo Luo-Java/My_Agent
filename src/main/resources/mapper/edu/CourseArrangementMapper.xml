@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.CourseArrangementMapper">
+
+    <select id="selectCourseArrangementPage" resultType="org.luo.edu.vo.CourseArrangementVO">
+        select a.*,
+               concat(c.name, ' · ', s.name, ' · ', t.name, ' · ', sem.name) as courseLabel,
+               concat('第', p1.period_no, '节 ', p1.start_time) as startPeriodLabel,
+               concat('第', p2.period_no, '节 ', p2.end_time) as endPeriodLabel
+        from course_arrangement a
+        left join course co on a.course_id = co.id
+        left join class c on co.class_id = c.id
+        left join subject s on co.subject_id = s.id
+        left join teacher t on co.teacher_id = t.id
+        left join semester sem on co.semester_id = sem.id
+        left join period p1 on a.start_period_id = p1.id
+        left join period p2 on a.end_period_id = p2.id
+        where 1=1
+        <if test="dto.classId != null">
+            and co.class_id = #{dto.classId}
+        </if>
+        <if test="dto.teacherId != null">
+            and co.teacher_id = #{dto.teacherId}
+        </if>
+        order by a.day_of_week, p1.period_no, a.id
+    </select>
+    <!-- 班级课表（只读关联查询，学生端/看板共用），筛选条件由 dto 携带。 -->
+    <select id="selectTimetable" resultType="org.luo.edu.vo.TimetableVO">
+        SELECT a.id,
+               c.name AS className, su.name AS subjectName, t.name AS teacherName,
+               a.day_of_week AS dayOfWeek, a.classroom,
+               p1.period_no AS startPeriod, p1.start_time AS startTime,
+               p2.period_no AS endPeriod, p2.end_time AS endTime
+        FROM course_arrangement a
+        JOIN course co ON a.course_id = co.id
+        JOIN class c ON co.class_id = c.id
+        JOIN subject su ON co.subject_id = su.id
+        JOIN teacher t ON co.teacher_id = t.id
+        JOIN period p1 ON a.start_period_id = p1.id
+        JOIN period p2 ON a.end_period_id = p2.id
+        <where>
+            <if test="dto.classId != null">AND c.id = #{dto.classId}</if>
+            <if test="dto.teacherId != null">AND t.id = #{dto.teacherId}</if>
+            <if test="dto.dayOfWeek != null">AND a.day_of_week = #{dto.dayOfWeek}</if>
+        </where>
+        ORDER BY a.day_of_week, p1.period_no
+    </select>
+    <!-- 下拉文案在 SQL 里拼好，避免前端二次拼装。 -->
+    <select id="selectOptions" resultType="org.luo.edu.vo.OptionVO">
+        select a.id as id,
+               concat(c.name, ' · ', s.name, ' · ', t.name, ' · ',
+                      elt(a.day_of_week, '周一', '周二', '周三', '周四', '周五', '周六', '周日'),
+                      ' 第', p1.period_no, '-', p2.period_no, '节') as label
+        from course_arrangement a
+        join course co on a.course_id = co.id
+        join class c on co.class_id = c.id
+        join subject s on co.subject_id = s.id
+        join teacher t on co.teacher_id = t.id
+        join period p1 on a.start_period_id = p1.id
+        join period p2 on a.end_period_id = p2.id
+        order by a.id
+    </select>
+</mapper>

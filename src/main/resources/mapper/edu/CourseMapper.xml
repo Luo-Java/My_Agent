@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.CourseMapper">
+
+    <select id="selectCoursePage" resultType="org.luo.edu.vo.CourseVO">
+        select co.*, c.name as className, s.name as subjectName,
+               t.name as teacherName, sem.name as semesterName
+        from course co
+        left join class c on co.class_id = c.id
+        left join subject s on co.subject_id = s.id
+        left join teacher t on co.teacher_id = t.id
+        left join semester sem on co.semester_id = sem.id
+        where 1=1
+        <if test="dto.classId != null">
+            and co.class_id = #{dto.classId}
+        </if>
+        <if test="dto.subjectId != null">
+            and co.subject_id = #{dto.subjectId}
+        </if>
+        <if test="dto.teacherId != null">
+            and co.teacher_id = #{dto.teacherId}
+        </if>
+        <if test="dto.semesterId != null">
+            and co.semester_id = #{dto.semesterId}
+        </if>
+        order by co.id desc
+    </select>
+    <!-- 下拉文案在 SQL 里拼好，避免前端二次拼装。 -->
+    <select id="selectOptions" resultType="org.luo.edu.vo.OptionVO">
+        select co.id as id,
+               concat(c.name, ' · ', s.name, ' · ', t.name, ' · ', sem.name) as label
+        from course co
+        join class c on co.class_id = c.id
+        join subject s on co.subject_id = s.id
+        join teacher t on co.teacher_id = t.id
+        join semester sem on co.semester_id = sem.id
+        order by co.id
+    </select>
+</mapper>

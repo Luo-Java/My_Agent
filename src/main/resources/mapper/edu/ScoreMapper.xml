@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.edu.mapper.ScoreMapper">
+
+    <select id="selectScorePage" resultType="org.luo.edu.vo.ScoreVO">
+        select s.*, st.name as studentName, st.student_no as studentNo, c.name as className,
+               sub.name as subjectName, e.exam_date as examDate, e.exam_time as examTime
+        from score s
+        left join student st on s.student_id = st.id
+        left join class c on st.class_id = c.id
+        left join exam e on s.exam_id = e.id
+        left join subject sub on e.subject_id = sub.id
+        where 1=1
+        <if test="dto.classId != null">
+            and st.class_id = #{dto.classId}
+        </if>
+        <if test="dto.subjectId != null">
+            and e.subject_id = #{dto.subjectId}
+        </if>
+        <if test="dto.studentId != null">
+            and s.student_id = #{dto.studentId}
+        </if>
+        order by s.id desc
+    </select>
+    <!-- 学生成绩明细（只读关联查询）：join student/class/exam/semester/subject 出可读名称，筛选条件由 dto 携带。 -->
+    <select id="selectScoreDetail" resultType="org.luo.edu.vo.ScoreDetailVO">
+        SELECT s.id,
+               st.name AS studentName, st.student_no AS studentNo, c.name AS className,
+               su.name AS subjectName, sem.name AS semesterName,
+               e.exam_date AS examDate, e.exam_time AS examTime, s.score
+        FROM score s
+        JOIN student st ON s.student_id = st.id
+        JOIN class c ON st.class_id = c.id
+        JOIN exam e ON s.exam_id = e.id
+        JOIN subject su ON e.subject_id = su.id
+        JOIN semester sem ON e.semester_id = sem.id
+        <where>
+            <if test="dto.classId != null">AND c.id = #{dto.classId}</if>
+            <if test="dto.subjectId != null">AND su.id = #{dto.subjectId}</if>
+            <if test="dto.semesterId != null">AND sem.id = #{dto.semesterId}</if>
+            <if test="dto.keyword != null and dto.keyword != ''">
+                AND (st.name LIKE CONCAT('%', #{dto.keyword}, '%')
+                     OR st.student_no LIKE CONCAT('%', #{dto.keyword}, '%'))
+            </if>
+        </where>
+        ORDER BY s.id
+    </select>
+
+    <!-- 成绩统计（只读关联查询）：按考试聚合人数/均分/最高/最低，筛选条件由 dto 携带。 -->
+    <select id="selectStats" resultType="org.luo.edu.vo.ScoreStatsVO">
+        SELECT c.name AS className, su.name AS subjectName, sem.name AS semesterName,
+               e.exam_date AS examDate,
+               COUNT(*) AS studentCount,
+               ROUND(AVG(s.score), 2) AS avgScore,
+               MAX(s.score) AS maxScore,
+               MIN(s.score) AS minScore
+        FROM score s
+        JOIN exam e ON s.exam_id = e.id
+        JOIN class c ON e.class_id = c.id
+        JOIN subject su ON e.subject_id = su.id
+        JOIN semester sem ON e.semester_id = sem.id
+        <where>
+            <if test="dto.classId != null">AND c.id = #{dto.classId}</if>
+            <if test="dto.subjectId != null">AND su.id = #{dto.subjectId}</if>
+            <if test="dto.semesterId != null">AND sem.id = #{dto.semesterId}</if>
+        </where>
+        GROUP BY e.id, c.name, su.name, sem.name, e.exam_date
+        ORDER BY e.exam_date, c.id, su.id
+    </select>
+    <!-- 下拉文案在 SQL 里拼好，避免前端二次拼装。 -->
+    <select id="selectOptions" resultType="org.luo.edu.vo.OptionVO">
+        select s.id as id,
+               concat(st.name, ' · ', sub.name, ' · ', e.exam_date, ' · ', s.score) as label
+        from score s
+        join student st on s.student_id = st.id
+        join exam e on s.exam_id = e.id
+        join subject sub on e.subject_id = sub.id
+        order by s.id
+    </select>
+</mapper>
