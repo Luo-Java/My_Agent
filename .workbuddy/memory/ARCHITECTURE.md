@@ -72,7 +72,7 @@
   注入**当轮 system**，仅当轮可见；③ 展示元数据 `attachmentsJson`（type/filename/storedName/size，**不含正文**）
   → 落 `chat_message.attachments_json`，仅供历史回看。**红线**：`DbChatMemory.get()` 只读 `content`。
   入口 `POST /api/chat/attachment/process`；静态访问 `/files/**`（`AttachmentWebConfig`，**不带 `/api` 前缀**
-  否则 `<img>` 无法带 X-Api-Key 被 401）；落盘目录 `app.attachment.dir`。
+  否则 `<img>` 无法带 `Authorization` 头被 401）；落盘目录 `app.attachment.dir`。
   上传上限：**必须显式配置 `spring.servlet.multipart`**（现 `20MB`/文件、`80MB`/请求）。Spring 默认只有
   1MB/文件、10MB/请求，而前端 `app.js` 允许 `15MB × 5` 个附件 ⇒ 不配就是「浏览器能选中、服务端拒收」。
   超限异常由 `GlobalExceptionHandler` 转 **413**（不接会落通用兜底被当成 500）。**约定：后端上限 ≥ 前端允许值**。
@@ -86,8 +86,11 @@
   **`AgentService.deleteAgent` 级联删专属库时同样要清**（它曾只删 MySQL 三表）。
   **必须「先取 chunkIds → 再删 MySQL → 最后删向量」**，顺序不可换：MySQL 行删掉后就再也查不到该清哪些 id。
   漏了会永久残留孤儿向量——Chroma 回填（`POST /api/kb/chroma/sync`）是 **upsert-only、不清孤儿**。
-- **鉴权**：`app.api-key`(env `APP_API_KEY`) → `ApiKeyInterceptor` 校验 `/api/**` 的 `X-Api-Key`(兼容 Bearer)，
-  401 常量比较。
+- **鉴权（`/api/**` 的唯一闸门）**：`app.jwt`(env `JWT_SECRET`) → `JwtAuthInterceptor` 校验
+  `Authorization: Bearer <token>`（白名单只有 `POST /api/auth/login`），每请求回库复核状态+角色。
+  旧的**服务级密钥** `app.api-key`/`APP_API_KEY` + `ApiKeyInterceptor`/`ApiSecurityConfig` **已删除**
+  （2026-09-29）：它与登录流程冲突 —— 启用后连 `POST /api/auth/login` 都会被拒（前端登录请求只带
+  `Authorization`，不带 `X-Api-Key`），用户进不来；而 `/api/**` 已由 JWT 全覆盖，机器调用也得先登录。
 
 ---
 

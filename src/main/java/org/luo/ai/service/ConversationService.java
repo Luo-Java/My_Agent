@@ -17,12 +17,18 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import org.luo.ai.entity.Agent;
 import org.luo.ai.memory.DbChatMemory;
 
 /**
  * 会话与消息业务服务：负责 conversation 与 chat_message 两张表的持久化。
+ * <p>
+ * <b>会话按用户隔离</b>：所有对外方法都带 {@code userId} 并落到 SQL 条件上（列表过滤、改名/开关/删除带
+ * {@code user_id} 条件、读取先校验归属），非本人会话一律按 404 处理 —— 不区分「不存在」与「不属于你」，
+ * 避免他人用会话 ID 探测是否存在。用户身份由 Controller 在 HTTP 线程取出后传参进来，
+ * <b>本类内不读 {@code AuthContext}</b>：流式对话的执行体跑在弹性线程上，ThreadLocal 在那里已失效。
  */
 @Slf4j
 @Service
@@ -36,37 +42,13 @@ public class ConversationService {
         this.chatMessageMapper = chatMessageMapper;
     }
 
-    /** 创建新会话，可绑定智能体（其名称作为初始标题）。 */
+    /** 创建新会话：可绑定智能体或标记为规划模式（planner 优先，与 agentId 互斥）。会话归属 {@code userId}。 */
     @Transactional
-    public Conversation createConversation(Long agentId, String agentName) {
-        log.info("创建会话：agentId={}", agentId);
+    public Conversation createConversation(Long agentId, String agentName, boolean planner, Long userId) {
+        log.info("创建会话：agentId={}，planner={}，userId={}", agentId, planner, userId);
         Conversation c = new Conversation();
         c.setId(UUID.randomUUID().toString());
-        if (agentId != null) {
-            c.setAgentId(agentId);
-            c.setAgentBindSource(AgentBindSource.EXPLICIT);   // 用户显式绑定：保持粘住，不因话题切换解绑
-            c.setTitle(agentName != null ? agentName : "新对话");
-        } else {
-            c.setTitle("新对话");
-        }
-        LocalDateTime now = LocalDateTime.now();
-        c.setCreatedAt(now);
-        c.setUpdatedAt(now);
-        conversationMapper.insert(c);
-        return c;
-    }
-
-    /** 创建新会话（默认助手，不绑定智能体）。 */
-    public Conversation createConversation() {
-        return createConversation(null, null);
-    }
-
-    /** 创建新会话：可绑定智能体或标记为规划模式（planner 优先，与 agentId 互斥）。 */
-    @Transactional
-    public Conversation createConversation(Long agentId, String agentName, boolean planner) {
-        log.info("创建会话：agentId={}，planner={}", agentId, planner);
-        Conversation c = new Conversation();
-        c.setId(UUID.randomUUID().toString());
+        c.setUserId(userId);
         if (planner) {
             // 规划模式会话：不参与 Agent 路由
             c.setPlanner(true);
@@ -85,21 +67,55 @@ public class ConversationService {
         return c;
     }
 
-    /** 创建规划模式会话。 */
-    @Transactional
-    public Conversation createPlannerConversation() {
-        return createConversation(null, null, true);
+    /** 创建新会话（普通/智能体会话），会话归属 {@code userId}。 */
+    public Conversation createConversation(Long agentId, String agentName, Long userId) {
+        return createConversation(agentId, agentName, false, userId);
     }
 
-    /** 重命名会话（标题自动 trim）。 */
+    /** 创建规划模式会话，会话归属 {@code userId}。 */
     @Transactional
-    public void renameConversation(String conversationId, String title) {
+    public Conversation createPlannerConversation(Long userId) {
+        return createConversation(null, null, true, userId);
+    }
+
+    /**
+     * 载入归属该用户的会话；不存在<b>或不属于该用户</b>时一律抛 404。
+     * 两种情形共用同一提示，避免他人拿会话 ID 判断存在性（探测）。
+     */
+    public Conversation requireOwned(String conversationId, Long userId) {
+        Conversation c = conversationId == null ? null : conversationMapper.selectById(conversationId);
+        if (c == null || !Objects.equals(c.getUserId(), userId)) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "会话不存在");
+        }
+        return c;
+    }
+
+    /**
+     * 校验访问权（不存在<b>不</b>报错，留给 {@link #ensureConversation} 创建）：仅当会话已存在且
+     * 属于他人时抛 404。供对话入口在 HTTP 线程「前置挡掉越权」用 —— 流式接口一旦进入异步再抛异常，
+     * 就只能退化成 SSE 里的一条 error 事件，拿不到真正的 404 状态码。
+     */
+    public void checkAccess(String conversationId, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return;
-        log.info("重命名会话：id={}，新标题={}", conversationId, title != null ? title.trim() : "(null)");
-        // 单趟 UPDATE：无需先查库（会话不存在时更新 0 行无副作用）
-        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+        Conversation c = conversationMapper.selectById(conversationId);
+        if (c != null && !Objects.equals(c.getUserId(), userId)) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "会话不存在");
+        }
+    }
+
+    /** 重命名会话（标题自动 trim）。仅本人会话可改；不存在或非本人抛 404（一趟 UPDATE 影响 0 行即视为 404）。 */
+    @Transactional
+    public void renameConversation(String conversationId, String title, Long userId) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        log.info("重命名会话：id={}，userId={}，新标题={}", conversationId, userId,
+                title != null ? title.trim() : "(null)");
+        int updated = conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
+                .eq(Conversation::getUserId, userId)
                 .set(Conversation::getTitle, title == null ? "" : title.trim()));
+        if (updated == 0) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "会话不存在");
+        }
     }
 
     /** 更新 planner 单列（不覆盖其他内存态字段）。 */
@@ -113,50 +129,53 @@ public class ConversationService {
 
     /**
      * 前端「🧭 智能规划」开关写回（仅 planner 单列）。<b>planner 与 agentId 互斥</b>：
-     * 开启规划且会话已绑定智能体时抛 {@link AiBusinessException}。
+     * 开启规划且会话已绑定智能体时抛 {@link AiBusinessException}。仅本人会话可改。
      */
     @Transactional
-    public void updatePlannerSwitch(String conversationId, Boolean enabled) {
+    public void updatePlannerSwitch(String conversationId, Boolean enabled, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return;
         boolean on = Boolean.TRUE.equals(enabled);
-        if (on) {
-            Conversation c = conversationMapper.selectById(conversationId);
-            if (c == null) return;   // 不存在的会话静默（更新 0 行无副作用）
-            if (c.getAgentId() != null) {
-                throw new AiBusinessException(AiErrorCode.BAD_REQUEST,
-                        "绑定智能体的会话不支持规划模式（planner 与 agentId 互斥）");
-            }
+        Conversation c = requireOwned(conversationId, userId);
+        if (on && c.getAgentId() != null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST,
+                    "绑定智能体的会话不支持规划模式（planner 与 agentId 互斥）");
         }
         conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
+                .eq(Conversation::getUserId, userId)
                 .set(Conversation::getPlanner, on));
         log.debug("更新会话规划开关：id={}，enabled={}", conversationId, on);
     }
 
-    /** 前端「📚 RAG」开关写回（仅 rag_enabled 单列）。不校验库是否存在：库被删则检索侧自动降级为不带资料。 */
-    public void updateRagEnabled(String conversationId, Boolean enabled) {
+    /** 前端「📚 RAG」开关写回（仅 rag_enabled 单列）。仅本人会话可改，非本人/不存在抛 404。不校验库是否存在：库被删则检索侧自动降级为不带资料。 */
+    public void updateRagEnabled(String conversationId, Boolean enabled, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return;
-        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+        int updated = conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
+                .eq(Conversation::getUserId, userId)
                 .set(Conversation::getRagEnabled, Boolean.TRUE.equals(enabled)));
+        if (updated == 0) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "会话不存在");
+        }
         log.debug("更新会话 RAG 开关：id={}，enabled={}", conversationId, Boolean.TRUE.equals(enabled));
     }
 
-    /** 删除会话及其全部消息。 */
+    /** 删除会话及其全部消息。仅本人会话可删，非本人/不存在抛 404。 */
     @Transactional
-    public void deleteConversation(String conversationId) {
+    public void deleteConversation(String conversationId, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return;
-        log.info("删除会话：id={}", conversationId);
+        requireOwned(conversationId, userId);
+        log.info("删除会话：id={}，userId={}", conversationId, userId);
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
         chatMessageMapper.delete(qw);
         conversationMapper.deleteById(conversationId);
     }
 
-    /** 列出会话，按最近更新时间倒序。 */
-    public List<Conversation> listConversations() {
+    /** 列出该用户的会话，按最近更新时间倒序（他人会话不出现在列表中）。 */
+    public List<Conversation> listConversations(Long userId) {
         QueryWrapper<Conversation> qw = new QueryWrapper<>();
-        qw.orderByDesc("updated_at");
+        qw.eq("user_id", userId).orderByDesc("updated_at");
         return conversationMapper.selectList(qw);
     }
 
@@ -275,20 +294,25 @@ public class ConversationService {
         return conversationMapper.selectById(conversationId);
     }
 
-    /** 会话不存在则补建（默认助手）并返回，存在则直接返回，供 chat/stream 复用本次查询结果。 */
+    /** 会话不存在则补建（默认助手，归属 {@code userId}）并返回，存在则校验归属后返回；他人会话抛 404，供 chat/stream 复用本次查询结果。 */
     @Transactional
-    public Conversation ensureConversation(String conversationId) {
+    public Conversation ensureConversation(String conversationId, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return null;
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null) {
-            log.info("确保会话存在：新建会话 {}", conversationId);
+            log.info("确保会话存在：新建会话 {}，userId={}", conversationId, userId);
             c = new Conversation();
             c.setId(conversationId);
+            c.setUserId(userId);
             c.setTitle("新对话");
             LocalDateTime now = LocalDateTime.now();
             c.setCreatedAt(now);
             c.setUpdatedAt(now);
             conversationMapper.insert(c);
+        } else if (!Objects.equals(c.getUserId(), userId)) {
+            // 会话 ID 已存在但归属他人：按不存在处理，堵死「猜/拿别人的 ID 接手会话」这条路
+            log.warn("拒绝接管他人会话：id={}，请求者={}，归属者={}", conversationId, userId, c.getUserId());
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "会话不存在");
         }
         return c;
     }

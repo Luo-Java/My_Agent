@@ -8,7 +8,9 @@ import org.luo.ai.dto.ResumeTaskRequest;
 import org.luo.ai.dto.StreamEvent;
 import org.luo.ai.entity.Task;
 import org.luo.ai.service.ChatService;
+import org.luo.ai.service.ConversationService;
 import org.luo.ai.service.TaskService;
+import org.luo.system.security.AuthContext;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
@@ -40,12 +42,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 不用 {@code 0L} 永不超时——上游卡死会让连接与异步线程永久泄漏）；心跳（{@code app.sse.heartbeat-seconds}，
  * 默认 15s）——前置链（路由→参数抽取→改写→检索）期间无字节流出，反向代理会当空闲切断长连接，
  * 周期发 {@link StreamEvent#ping()} 保活。
+ * <p>
+ * <b>会话按用户隔离</b>：用户在 <b>HTTP 线程</b>取出（{@link AuthContext#require()}）后作为参数向下传 ——
+ * 流式执行体跑在弹性线程上，ThreadLocal 在那里已经失效，不能在异步链路里再读。越权会话在 HTTP 线程
+ * 就被 {@link ConversationService#checkAccess} 挡成 404，而不是退化成 SSE 里的一条 error 事件。
  */
 @RestController
 @RequestMapping("/api/chat")
 public class ChatController {
 
     private final ChatService chatService;
+    private final ConversationService conversationService;
     private final TaskService taskService;
 
     /** SSE 连接最长存活时间（秒）。必须有限，默认 300s，足够覆盖最长的规划 + 多轮工具调用。 */
@@ -63,11 +70,13 @@ public class ChatController {
      */
     private final ScheduledExecutorService heartbeatScheduler;
 
-    public ChatController(ChatService chatService, TaskService taskService,
+    public ChatController(ChatService chatService, ConversationService conversationService,
+                          TaskService taskService,
                           @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
                           @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds,
                           @Qualifier("sseHeartbeatScheduler") ScheduledExecutorService heartbeatScheduler) {
         this.chatService = chatService;
+        this.conversationService = conversationService;
         this.taskService = taskService;
         this.sseTimeoutSeconds = sseTimeoutSeconds;
         this.heartbeatSeconds = heartbeatSeconds;
@@ -77,11 +86,13 @@ public class ChatController {
     /** 同步对话：等待完整回复后一次性返回 {@code {"content": "..."}}。 */
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
-        String conversationId = resolveConversationId(request.conversationId());
+        Long userId = AuthContext.require().id();
+        String conversationId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(conversationId, userId);
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
         AttachmentBundle bundle = extractAttachments(request.attachments());
         String reply = chatService.chat(conversationId, request.message(),
-                bundle.material(), bundle.metaJson(), request.planner());
+                bundle.material(), bundle.metaJson(), request.planner(), userId);
         // Map.of 拒绝 null 值：出口再兜一道，避免上游漏判空把一次 200 变成 500
         return Map.of("content", reply == null ? "" : reply);
     }
@@ -95,11 +106,14 @@ public class ChatController {
     public SseEmitter stream(@RequestBody ChatRequest request) {
         // 有限超时（而非 0L=永不超时）：上游卡死时连接与异步线程能自动释放，不会永久泄漏
         SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
-        String conversationId = resolveConversationId(request.conversationId());
+        // 身份在 HTTP 线程取出后向下传：进入异步（boundedElastic）后 ThreadLocal 失效
+        Long userId = AuthContext.require().id();
+        String conversationId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(conversationId, userId);   // 越权会话在建立 SSE 之前就 404
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
         AttachmentBundle bundle = extractAttachments(request.attachments());
         Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(),
-                bundle.material(), bundle.metaJson(), request.planner());
+                bundle.material(), bundle.metaJson(), request.planner(), userId);
 
         // 流结束标记：心跳任务据此自停；同时保证「流结束后不再往已完成的 emitter 写」
         AtomicBoolean finished = new AtomicBoolean(false);
@@ -162,8 +176,10 @@ public class ChatController {
     @PostMapping(value = "/task/resume", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter resume(@RequestBody ResumeTaskRequest request) {
         SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
-        String conversationId = resolveConversationId(request.conversationId());
-        Flux<StreamEvent> flux = chatService.resume(conversationId);
+        Long userId = AuthContext.require().id();
+        String conversationId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(conversationId, userId);
+        Flux<StreamEvent> flux = chatService.resume(conversationId, userId);
 
         AtomicBoolean finished = new AtomicBoolean(false);
         Disposable subscription = flux.doOnNext(event -> {
@@ -210,10 +226,13 @@ public class ChatController {
         return emitter;
     }
 
-    /** 查询当前会话的未完成任务（前端「继续执行」提示条用）；无 RUNNING 任务返回 null。 */
+    /** 查询当前会话的未完成任务（前端「继续执行」提示条用）；无 RUNNING 任务返回 null。仅本人会话可查。 */
     @GetMapping("/task/running")
     public Task running(@RequestParam String conversationId) {
-        return taskService.findRunning(resolveConversationId(conversationId));
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(conversationId, userId);
+        conversationService.checkAccess(scopedId, userId);
+        return taskService.findRunning(scopedId);
     }
 
     /**
@@ -263,8 +282,11 @@ public class ChatController {
         };
     }
 
-    /** 会话 ID 为空时回退到默认会话，避免前端首次对话未建会话。 */
-    private String resolveConversationId(String id) {
-        return (id == null || id.isBlank()) ? "default" : id;
+    /**
+     * 会话 ID 为空时回退到「当前用户的默认会话」。<b>必须带 userId</b>：早先固定退化成公共的
+     * {@code "default"}，会话按用户隔离后两个用户会撞进同一个 ID（后者被判 404），故按用户派生。
+     */
+    private String resolveConversationId(String id, Long userId) {
+        return (id == null || id.isBlank()) ? ("default-" + userId) : id;
     }
 }

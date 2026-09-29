@@ -1,27 +1,21 @@
 // 教务系统前端（/edu.html）。Vue 由 /js/lib/vue.global.prod.js 提供。
-// 复用 AI 对话页同一套 X-Api-Key（localStorage 键 my_agent_api_key），走 /api/edu/** 接口。
+// 走 /api/edu/** 接口；登录态由 auth.js 统一处理。
 if (typeof Vue === 'undefined') {
     console.error('[启动失败] Vue 未加载：请确认 /js/lib/vue.global.prod.js 可访问（HTTP 200）。');
     throw new Error('Vue 未加载，前端无法启动');
 }
 const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick } = Vue;
 
-// ==================== API 封装（自动附加 X-Api-Key） ====================
-const API_KEY_STORAGE = 'my_agent_api_key';
-function getApiKey() {
-    try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
-}
+// ==================== API 封装 ====================
 function apiFetch(url, options) {
     const opts = Object.assign({}, options || {});
     const headers = Object.assign({}, opts.headers || {});
-    const key = getApiKey();
-    if (key) headers['X-Api-Key'] = key;
     if (opts.body && typeof opts.body === 'object') {
         headers['Content-Type'] = 'application/json';
         opts.body = JSON.stringify(opts.body);
     }
     opts.headers = headers;
-    // 登录态（Authorization: Bearer）与 401 自动跳登录页统一由 auth.js 处理
+    // 登录态（Authorization: Bearer）与 401 就地弹登录框统一由 auth.js 处理
     return window.Auth ? window.Auth.fetch(url, opts) : window.fetch(url, opts);
 }
 
@@ -877,18 +871,8 @@ createApp({
             await loadPage(page.value);
         }
 
-        // 顶栏登录用户区：登录态由 auth.js 统一维护（未登录时本页在 <head> 就被拦下跳转）。
-        const authUser = ref(window.Auth ? window.Auth.getUser() : null);
-        const authName = computed(() => (window.Auth ? window.Auth.displayName() : ''));
-        // 只决定「用户管理」入口显不显示；真正的权限闸门是服务端的 @RequireRole
-        const authIsAdmin = computed(() => !!(window.Auth && window.Auth.hasRole('ADMIN')));
-
-        /** 退出登录：JWT 无状态，服务端没有会话可销毁，清掉本地 token 即登出。 */
-        function authLogout() {
-            if (window.Auth) {
-                window.Auth.logout();
-            }
-        }
+        // 顶栏登录用户区（用户名 + 下拉菜单）不在这里 —— 整块由 js/auth.js 渲染到 data-auth-nav
+        // 挂载点上，四页共用同一份实现（未登录时本页在 <head> 就被拦下）。
 
         onMounted(() => {
             const tip = document.getElementById('boot-tip');
@@ -908,8 +892,6 @@ createApp({
             searchForm, searchFields, searchOptions, doSearch, resetSearch,
             switchView, switchFromUrl, isActive, openCreate, openEdit, saveForm, removeRow,
             dialog, closeDialog,
-            // 顶栏登录用户区：用户名 / 用户管理入口（仅 ADMIN 可见）/ 退出
-            authUser, authName, authIsAdmin, authLogout,
         };
     }
 }).component('ui-select', UiSelect).mount('#app');

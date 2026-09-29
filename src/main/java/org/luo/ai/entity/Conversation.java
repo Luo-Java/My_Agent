@@ -15,6 +15,12 @@ public class Conversation {
     @TableId(value = "id", type = IdType.INPUT)
     private String id;
 
+    /**
+     * 所属用户 ID，关联 sys_user.id。<b>会话按用户隔离</b>：列表/读取/改名/开关/删除一律带该条件，
+     * 非本人会话按「不存在」处理（不泄漏他人会话是否存在）。为空表示历史遗留数据，不归属任何用户。
+     */
+    private Long userId;
+
     private String title;
 
     /** 绑定的智能体 ID，关联 agent.id（自增主键）；为空表示使用默认助手。 */

@@ -44,16 +44,16 @@ body {
     border-bottom: 1px solid var(--border);
 }
 .edu-topbar-left { display: flex; align-items: center; gap: 16px; }
-.edu-topbar-right { display: flex; align-items: center; }
+.edu-topbar-right { display: flex; align-items: center; gap: 8px; }
 .edu-title { font-size: 16px; font-weight: 600; }
-.back-home, .back-chat {
+.back-home {
     color: var(--primary-text);
     text-decoration: none;
     font-size: 13px;
     opacity: .85;
     transition: opacity .15s;
 }
-.back-home:hover, .back-chat:hover { opacity: 1; }
+.back-home:hover { opacity: 1; }
 
 /* ── 布局 ── */
 .edu-layout { display: flex; height: calc(100vh - 52px); }
@@ -543,40 +543,3 @@ body {
 /* 筛选下拉固定宽度；分页大小下拉紧凑 */
 .edu-filter-ui { min-width: 130px; }
 .edu-page-size-ui { min-width: 96px; }
-
-/* ══ 顶栏登录用户区（登录态见 js/auth.js）══
-   与 chat 页 .auth-box 同一套外观（那边的定义在 style.css，改样式两处同步）。 */
-.auth-box {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-left: 8px;
-    flex: none;
-}
-
-.auth-user {
-    max-width: 120px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-soft);
-}
-
-.auth-entry {
-    padding: 5px 12px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13px;
-    font-weight: 500;
-    font-family: inherit;
-    line-height: 1;
-    white-space: nowrap;
-    text-decoration: none;
-    cursor: pointer;
-    transition: all .15s ease;
-}
-.auth-entry:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }

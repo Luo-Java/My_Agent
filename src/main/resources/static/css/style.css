@@ -2128,7 +2128,6 @@ button {
 
 .btn-ghost:hover { background: rgba(255, 255, 255, .06); }
 
-
 /* ===== 知识库管理（RAG） ===== */
 .kb-manage .agent-manage-new:disabled { opacity: .5; cursor: not-allowed; }
 .kb-manage .agent-manage-head { align-items: center; }
@@ -2463,22 +2462,8 @@ button {
 .kb-chunk-search:focus { border-color: var(--primary); }
 
 /* ===== 链路追踪（可观测，只读弹窗） ===== */
-/* 头部入口按钮：靠右对齐，弱化存在感（工具性入口，不抢主线） */
-.trace-btn {
-    margin-left: auto;
-    padding: 5px 12px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all .15s ease;
-    line-height: 1;
-    white-space: nowrap;
-}
-.trace-btn:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }
+/* 顶栏入口按钮「追踪 / 成本 / 教务系统」的样式不在这里：chat / edu / user 三页共用，
+   已抽到 css/topbar.css（.nav-pill）。定义只留一份，避免两处维护出观感差异。 */
 
 .modal-trace { max-width: 860px; width: 92vw; }
 
@@ -2671,16 +2656,12 @@ button {
 
 .trace-tool-text { color: var(--text-soft); word-break: break-all; width: 100%; }
 
-/* 顶栏「访问密钥」按钮：复用 .trace-btn 外观，但紧贴右侧「追踪」按钮
-   （.trace-btn 自带 margin-left:auto 会把整组推到最右，这里抵消掉自身的那份，避免两按钮被拉开）。 */
-.key-btn { margin-left: 0; }
-.key-btn-on { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }
-
 /* ══ 成本看板（全量成本口径）══
    与「追踪」弹窗共用 modal-trace 骨架，这里只补看板专属：总览指标卡 + 分段天数切换 + 图表容器。 */
 .modal-cost { max-width: 920px; }
 
-.cost-btn { margin-left: 8px; }
+/* .cost-btn 曾靠 margin-left 与「追踪」拉开，现统一由 .header-actions 的 gap 负责，不再单独补间距。
+   类名保留：它仍标记「成本」这个入口，便于单独定位。 */
 
 .cost-body {
     display: flex;
@@ -2862,42 +2843,19 @@ button {
    挂载完成后 Vue 会自动摘掉 v-cloak 属性，由 chat.html 的 #boot-tip 承担失败提示。 */
 [v-cloak] { display: none !important; }
 
-/* ══ 顶栏登录用户区（登录态见 js/auth.js）══
-   跟在「成本」按钮右侧：.trace-btn 自带 margin-left:auto（把自己推开靠右），
-   这里抵消自身那份额外间距、并让用户名/管理入口/退出靠成一组。 */
-.auth-box {
+/* ══ 顶栏右侧动作区（chat 页）══
+   统一承载「追踪 / 成本 / 教务系统 / 登录用户区」，由本容器的 margin-left:auto 整体推靠最右。
+   靠右必须挂在这里，不能挂在某个按钮上：那按钮可能因条件不渲染（如无会话时的「追踪」），
+   一旦缺席就没人撑开，整组会塌回标题旁边。按钮间距同样由这里的 gap 统一，各自不再补 margin-left。 */
+.header-actions {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    margin-left: 8px;
+    gap: 10px;
+    margin-left: auto;
     flex: none;
 }
 
-/* 用户名：过长截断，不挤占顶栏标题 */
-.auth-user {
-    max-width: 120px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-soft);
-}
-
-/* 与 .trace-btn 同款胶囊外观：管理入口是 <a>、退出是 <button>，这里统一成一种视觉 */
-.auth-entry {
-    padding: 5px 12px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13px;
-    font-weight: 500;
-    font-family: inherit;
-    line-height: 1;
-    white-space: nowrap;
-    text-decoration: none;
-    cursor: pointer;
-    transition: all .15s ease;
-}
-.auth-entry:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }
+/* ══ 顶栏登录用户区 ══
+   用户名 + 下拉菜单由 js/auth.js 渲染到 `data-auth-nav` 挂载点，样式在 css/auth.css
+   （.auth-nav / .auth-user-trigger / .auth-menu），与页面主题无关。
+   这里原有 chat 页一套 .auth-box / .auth-user / .auth-entry，随挂载点统一而删除。 */

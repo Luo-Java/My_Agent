@@ -18,6 +18,8 @@
     <script src="/js/lib/marked.umd.min.js"></script>
     <script src="/js/lib/echarts.min.js"></script>
     <link rel="stylesheet" href="/css/style.css" />
+    <!-- 顶栏胶囊入口（追踪 / 成本 / 教务系统）：三页共用一份，见 css/topbar.css -->
+    <link rel="stylesheet" href="/css/topbar.css" />
 </head>
 <body>
 <!-- 启动提示：JS（Vue/app.js）就绪后由 app.js 移除。样式内联，不依赖 style.css。
@@ -98,25 +100,23 @@
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
                 <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
                 <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
-                <!-- 访问密钥：服务端配置 app.api-key / APP_API_KEY 后，这里填入相同值即可正常调用；
-                     只存本浏览器 localStorage，不随页面源码分发。未启用服务端鉴权时留空即可。 -->
-                <button class="trace-btn key-btn" :class="{ 'key-btn-on': apiKeySet }" @click="editApiKey"
-                        :title="apiKeySet ? '已保存访问密钥（点击可修改或清除）' : '服务端启用 APP_API_KEY 后，在此填入相同密钥（仅存于本浏览器）'">
-                    🔑 {{ apiKeySet ? '已授权' : '访问密钥' }}
-                </button>
-                <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
-                <button v-if="currentId" class="trace-btn" @click="openTrace"
-                        title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
-                <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话 -->
-                <button class="trace-btn cost-btn" @click="openCost"
-                        title="查看全量成本看板：按天趋势与按用途拆解（回答 + 路由/参数抽取/查询改写/视觉/记忆合并）">💰 成本</button>
-                <!-- 登录用户区：登录态由 auth.js 维护；「用户管理」仅 ADMIN 可见（服务端另有 @RequireRole 兜底） -->
-                <span class="auth-box">
-                    <span class="auth-user" :title="authName ? '当前登录：' + authName : ''">{{ authName }}</span>
-                    <a v-if="authIsAdmin" class="auth-entry" href="/user.html"
-                       title="用户与角色管理">用户管理</a>
-                    <button class="auth-entry" @click="authLogout"
-                            title="退出登录（清除本浏览器的登录态）">退出</button>
+                <!-- 右侧动作区：整体靠最右（.header-actions 的 margin-left:auto）。
+                     靠右由本容器统一负责，不依赖某个按钮自带 margin-left:auto ——
+                     「追踪」按钮在无会话时不渲染，若把靠右挂在它身上，整组会塌回标题旁边。 -->
+                <span class="header-actions">
+                    <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
+                    <button v-if="currentId" class="nav-pill" @click="openTrace"
+                            title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
+                    <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话 -->
+                    <button class="nav-pill cost-btn" @click="openCost"
+                            title="查看全量成本看板：按天趋势与按用途拆解（回答 + 路由/参数抽取/查询改写/视觉/记忆合并）">💰 成本</button>
+                    <!-- 教务系统入口：跳 /edu.html（与 edu 页顶栏的「前往 AI 对话」互为对称入口） -->
+                    <a class="nav-pill" href="/edu.html"
+                       title="前往教务管理系统：学生/教师/班级/课程/成绩/课表">🎓 教务系统</a>
+                    <!-- 登录用户区：内容全部由 js/auth.js 渲染（挂载点 data-auth-nav）——
+                         用户名点击展开下拉：个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录。
+                         四页顶栏共用同一实现，页面自身不含登录逻辑；顶栏不再有裸露的「退出」按钮。 -->
+                    <span data-auth-nav></span>
                 </span>
             </header>
             <!-- 未完成任务提示条：当前会话存在 RUNNING 任务时显示（断点续跑入口）。

@@ -64,19 +64,6 @@ body {
 }
 .um-link:hover { color: var(--primary-text); }
 
-/* 顶栏登录用户区（与 chat/edu 的 .auth-* 同款） */
-.auth-box { display: inline-flex; align-items: center; gap: 8px; flex: none; }
-
-.auth-user {
-    max-width: 120px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-soft);
-}
-
 /* ===== 主体布局 ===== */
 .um-layout {
     display: flex;

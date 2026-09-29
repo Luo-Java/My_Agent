@@ -21,7 +21,7 @@ import java.util.List;
  * 「调了哪些工具、花了多少 token、耗时多久」。数据由 {@link TraceService} 在本轮回复产出后异步落库，本接口不参与写入。
  * <p>
  * GET /api/trace（列表，可按 conversationId 过滤，时间倒序）、GET /api/trace/{traceId}（单轮详情）；
- * 走统一 {@code /api/**} 鉴权（ApiKeyInterceptor）。
+ * 走统一 {@code /api/**} 登录鉴权（JwtAuthInterceptor）。
  */
 @RestController
 @RequestMapping("/api/trace")

@@ -12,6 +12,8 @@
     <script>Auth.requireLogin();</script>
     <script src="/js/lib/vue.global.prod.js"></script>
     <link rel="stylesheet" href="/css/user.css" />
+    <!-- 顶栏胶囊入口：与对话页、教务页共用一份，见 css/topbar.css -->
+    <link rel="stylesheet" href="/css/topbar.css" />
 </head>
 <body>
 <div id="boot-tip" style="position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:24px;background:#05080f;color:#93a6c8;text-align:center;font:14px/1.8 -apple-system,'Segoe UI','Microsoft YaHei UI',sans-serif;">
@@ -28,11 +30,10 @@
             <span class="um-title">用户管理</span>
         </div>
         <div class="um-topbar-right">
-            <a class="um-link" href="/edu.html" title="前往教务系统" data-auth-required>教务系统 →</a>
-            <span class="auth-box">
-                <span class="auth-user" :title="authName ? '当前登录：' + authName : ''">{{ authName }}</span>
-                <button class="um-btn" @click="authLogout" title="退出登录（清除本浏览器的登录态）">退出</button>
-            </span>
+            <a class="nav-pill" href="/edu.html" title="前往教务系统" data-auth-required>🎓 教务系统</a>
+            <!-- 登录用户区：内容全部由 js/auth.js 渲染（挂载点 data-auth-nav）——
+                 用户名点击展开下拉：个人信息 / 修改口令 / 用户管理 / 退出登录。 -->
+            <span data-auth-nav></span>
         </div>
     </header>
 

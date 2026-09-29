@@ -24,7 +24,7 @@ import java.util.UUID;
  * <b>与记忆无关</b>：落盘只是磁盘字节，既不进 LLM 上下文、也不影响 token（DbChatMemory 只读写
  * chat_message.content）；记忆里仅保留 attachments_json 的展示元数据。文件经 {@code /files/**}
  * 静态映射对外只读访问（AttachmentWebConfig，刻意不带 {@code /api} 前缀，以免 {@code <img>} 无法带
- * X-Api-Key 被 401）。
+ * {@code Authorization} 头被 401）。
  * <p>
  * <b>落盘后缀受白名单约束</b>：{@code /files/**} 是<b>免鉴权</b>的同源静态映射，浏览器按后缀推断
  * Content-Type 决定渲染还是下载——若原样沿用上传者后缀，一个 .html/.svg 就会被当页面/脚本执行，

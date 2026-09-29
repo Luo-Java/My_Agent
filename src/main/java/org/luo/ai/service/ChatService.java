@@ -68,25 +68,16 @@ public class ChatService {
         this.traceService = traceService;
     }
 
-    /** 同步对话（无附件）：历史注入与本轮落库由 MessageChatMemoryAdvisor 自动完成。 */
-    public String chat(String conversationId, String message) {
-        return chat(conversationId, message, "", "", null);
-    }
-
-    /** 同步对话：{@code planner} 非空时覆盖并写回会话形态，null 则跟随会话默认。 */
-    public String chat(String conversationId, String message, Boolean planner) {
-        return chat(conversationId, message, "", "", planner);
-    }
-
     /**
      * 同步对话（带附件）。{@code material} 仅当轮注入模型；{@code attachmentsJson} 仅落库供历史回看，
-     * 两者都不进记忆、不占 token。
+     * 两者都不进记忆、不占 token。<b>{@code userId}</b> 为当前登录用户：会话归属校验与（不存在时的）
+     * 补建都靠它，故必须由 HTTP 线程取出后传进来（异步线程读不到 {@code AuthContext}）。
      */
     public String chat(String conversationId, String message, String material, String attachmentsJson,
-                       Boolean planner) {
-        log.info("同步对话：会话={}，planner={}，有附件={}", conversationId, planner,
+                       Boolean planner, Long userId) {
+        log.info("同步对话：会话={}，userId={}，planner={}，有附件={}", conversationId, userId, planner,
                 material != null && !material.isBlank());
-        Conversation conv = conversationService.ensureConversation(conversationId);
+        Conversation conv = conversationService.ensureConversation(conversationId, userId);
         // 落库前水位：附件/引用只写本轮新增消息，避免误挂历史消息
         Long watermark = needsWatermark(conv, attachmentsJson)
                 ? conversationService.maxMessageId(conversationId) : null;
@@ -110,25 +101,15 @@ public class ChatService {
         return out.reply();
     }
 
-    /** 流式对话（无附件）：事件类型见 {@link StreamEvent}（{@code progress} 仅展示不进记忆，{@code token} 唯一进记忆）。 */
-    public Flux<StreamEvent> stream(String conversationId, String message) {
-        return stream(conversationId, message, "", "", null);
-    }
-
-    /** 流式对话：{@code planner} 非空时覆盖并写回会话形态。数据优先于记忆（见 {@link #afterReply}）。 */
-    public Flux<StreamEvent> stream(String conversationId, String message, Boolean planner) {
-        return stream(conversationId, message, "", "", planner);
-    }
-
     /**
      * 流式对话（带附件），执行体见 {@link #doStream}：跑在 {@link Schedulers#boundedElastic()} 上，
-     * HTTP 线程立即返回、SSE 先建立，进度才能实时推送。
+     * HTTP 线程立即返回、SSE 先建立，进度才能实时推送。<b>{@code userId}</b> 由调用方在 HTTP 线程取出后传入。
      */
     public Flux<StreamEvent> stream(String conversationId, String message, String material, String attachmentsJson,
-                                    Boolean planner) {
+                                    Boolean planner, Long userId) {
         return Flux.<StreamEvent>create(sink -> {
                     try {
-                        doStream(conversationId, message, material, attachmentsJson, sink, planner);
+                        doStream(conversationId, message, material, attachmentsJson, sink, planner, userId);
                     } catch (Exception e) {
                         log.error("流式对话失败：会话={}，错误={}", conversationId, e.getMessage(), e);
                         sink.next(StreamEvent.error("对话出错：" + e.getMessage()));
@@ -143,12 +124,12 @@ public class ChatService {
 
     /**
      * 显式续跑未完成任务（流式）：按会话定位唯一 RUNNING 任务，回填已完成步骤、只跑剩余步骤。
-     * 事件类型与 {@link #stream} 一致（progress 播报、token 正文、citations 引用、error 错误）。
+     * 事件类型与 {@link #stream} 一致（progress 播报 / token 正文 / citations 引用 / error 错误）。
      */
-    public Flux<StreamEvent> resume(String conversationId) {
+    public Flux<StreamEvent> resume(String conversationId, Long userId) {
         return Flux.<StreamEvent>create(sink -> {
                     try {
-                        doResume(conversationId, sink);
+                        doResume(conversationId, sink, userId);
                     } catch (Exception e) {
                         log.error("续跑任务失败：会话={}，错误={}", conversationId, e.getMessage(), e);
                         sink.next(StreamEvent.error("续跑失败：" + e.getMessage()));
@@ -161,9 +142,9 @@ public class ChatService {
     }
 
     /** 续跑执行体（跑在弹性线程上），结果经 sink 推送。 */
-    private void doResume(String conversationId, FluxSink<StreamEvent> sink) {
+    private void doResume(String conversationId, FluxSink<StreamEvent> sink, Long userId) {
         log.info("续跑任务：会话={}", conversationId);
-        Conversation conv = conversationService.ensureConversation(conversationId);
+        Conversation conv = conversationService.ensureConversation(conversationId, userId);
         Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
         RoundTrace trace = startTrace(conversationId, "");
         trace.mode(MODE_PLANNER);
@@ -195,10 +176,10 @@ public class ChatService {
 
     /** 流式执行体（跑在弹性线程上，可阻塞调用 LLM），结果经 sink 推送。 */
     private void doStream(String conversationId, String message, String material, String attachmentsJson,
-                          FluxSink<StreamEvent> sink, Boolean planner) {
-        log.info("流式对话：会话={}，planner={}，有附件={}", conversationId, planner,
+                          FluxSink<StreamEvent> sink, Boolean planner, Long userId) {
+        log.info("流式对话：会话={}，userId={}，planner={}，有附件={}", conversationId, userId, planner,
                 material != null && !material.isBlank());
-        Conversation conv = conversationService.ensureConversation(conversationId);
+        Conversation conv = conversationService.ensureConversation(conversationId, userId);
         // 落库前水位：附件/引用只写本轮新增消息，避免误挂历史消息
         Long watermark = needsWatermark(conv, attachmentsJson)
                 ? conversationService.maxMessageId(conversationId) : null;

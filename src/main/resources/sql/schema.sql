@@ -1,6 +1,7 @@
 -- 会话表：每个对话会话对应一条记录
 CREATE TABLE IF NOT EXISTS conversation (
     id         VARCHAR(64)  NOT NULL                   COMMENT '会话ID（业务层生成的UUID）',
+    user_id    BIGINT       DEFAULT NULL               COMMENT '所属用户ID，关联 sys_user.id；会话按用户隔离，仅本人可见（NULL=历史遗留，不归属任何用户）',
     title      VARCHAR(255) DEFAULT '新对话'           COMMENT '会话标题，默认“新对话”，由首条用户消息派生（最多20字）',
     agent_id   BIGINT       DEFAULT NULL               COMMENT '绑定的智能体ID，关联 agent.id（自增主键），为空表示默认助手',
     planner        TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否规划模式会话：1=动态规划器（运行时由 LLM 规划多智能体步骤），0=普通/智能体会话',
@@ -12,6 +13,8 @@ CREATE TABLE IF NOT EXISTS conversation (
     summarized_count  INT         DEFAULT 0                  COMMENT '已被摘要覆盖的最旧消息条数（按时间正序索引）',
     core_facts        TEXT        DEFAULT NULL               COMMENT '用户核心信息（长期关键事实：姓名/身份/偏好/待办等），随摘要一起由LLM提取更新',
     PRIMARY KEY (id),
+    -- 会话列表按「当前用户」过滤，走此索引；会话按 user_id 隔离，用户之间互不可见
+    INDEX idx_user (user_id),
     INDEX idx_agent (agent_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '会话表：记录一次完整的多轮对话';
 

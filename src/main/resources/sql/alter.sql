@@ -45,3 +45,12 @@ ALTER TABLE chat_message ADD COLUMN citations_json TEXT DEFAULT NULL COMMENT '�
 -- 值为多轮查询改写（指代消解）的产物；NULL 表示未改写（未开 RAG / 首轮无历史 / 关闭改写 / 模型判定原话已自包含）。
 -- 单独留痕是为了让「RAG 没命中」可归因：究竟是改写跑偏了，还是知识库里确实没有。
 ALTER TABLE agent_trace ADD COLUMN retrieval_query VARCHAR(1000) DEFAULT NULL COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）' AFTER user_message;
+
+-- 兼容已存在旧表：conversation 表补充「所属用户」列（列已存在时被忽略），实现「会话按用户隔离」——
+-- 每个用户只能列出 / 打开 / 修改 / 删除自己的会话，越权访问按 404 处理（不泄漏他人会话是否存在）。
+-- 存量会话该列为 NULL，不归属任何用户，对所有人不可见；如需把存量会话归给某个用户，
+-- 可执行：UPDATE conversation SET user_id = <用户ID> WHERE user_id IS NULL;（谨慎：一旦有多个用户请勿盲目全量赋值）
+ALTER TABLE conversation ADD COLUMN user_id BIGINT DEFAULT NULL COMMENT '所属用户ID，关联 sys_user.id；会话按用户隔离，仅本人可见（NULL=历史遗留，不归属任何用户）';
+
+-- 会话列表按 user_id 过滤，补索引（索引已存在时被忽略）
+ALTER TABLE conversation ADD INDEX idx_user (user_id);

@@ -218,8 +218,12 @@ body.auth-page {
     cursor: default;
 }
 
-/* ===== 右上角鉴权区（挂载点：任意元素加 data-auth-nav） ===== */
+/* ===== 右上角鉴权区（挂载点：任意元素加 data-auth-nav） =====
+   四页顶栏（landing / chat / edu / user）共用同一份实现：未登录渲染「登录」按钮，
+   已登录渲染用户名触发器 + 下拉菜单（个人信息 / 修改口令 / 用户管理 / 退出登录）。
+   position:relative 是下拉菜单的定位参照，缺了它菜单会跑到最近的定位祖先上去。 */
 .auth-nav {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 10px;
@@ -266,7 +270,163 @@ body.auth-page {
 
 .auth-nav-link:hover { color: #ffffff; }
 
+/* ===== 已登录：用户名触发器（点击展开下拉） =====
+   顶栏不再出现裸露的「退出」按钮 —— 个人信息 / 修改口令 / 用户管理 / 退出登录 全部收进下拉，
+   顶栏只留一个用户名，四页观感一致。 */
+.auth-user-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 190px;
+    padding: 5px 11px;
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--auth-text);
+    background: rgba(59, 130, 246, .14);
+    border: 1px solid rgba(120, 170, 255, .28);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background-color .16s ease, border-color .16s ease;
+}
+
+.auth-user-trigger:hover,
+.auth-user-trigger.is-open {
+    background: rgba(59, 130, 246, .28);
+    border-color: rgba(120, 170, 255, .55);
+}
+
+.auth-user-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.auth-user-caret {
+    flex: none;
+    font-size: 10px;
+    opacity: .75;
+    transition: transform .16s ease;
+}
+
+.auth-user-trigger.is-open .auth-user-caret { transform: rotate(180deg); }
+
+/* ===== 下拉菜单 ===== */
+.auth-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 1200;
+    min-width: 196px;
+    padding: 6px;
+    text-align: left;
+    background: var(--auth-card);
+    border: 1px solid var(--auth-card-border);
+    border-radius: 12px;
+    box-shadow: 0 16px 34px rgba(3, 8, 20, .5);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    animation: auth-pop .14s ease-out;
+}
+
+/* 显隐走 [hidden] 属性：只靠 display 会被上面的声明盖住，必须显式再声明一次 */
+.auth-menu[hidden] { display: none; }
+
+.auth-menu-head {
+    padding: 8px 10px 9px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid rgba(110, 160, 255, .16);
+}
+
+.auth-menu-name {
+    display: block;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--auth-text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.auth-menu-role {
+    display: block;
+    margin-top: 3px;
+    font-size: 12px;
+    color: var(--auth-text-soft);
+}
+
+.auth-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-sizing: border-box;
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    color: #dbe7ff;
+    text-align: left;
+    text-decoration: none;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color .14s ease, color .14s ease;
+}
+
+.auth-menu-item:hover { color: #ffffff; background: rgba(110, 160, 255, .14); }
+
+.auth-menu-sep {
+    height: 1px;
+    margin: 6px 4px;
+    background: rgba(110, 160, 255, .16);
+}
+
+.auth-menu-item.is-danger { color: #f9a8a8; }
+.auth-menu-item.is-danger:hover { color: #fecaca; background: rgba(248, 113, 113, .16); }
+
+/* ===== 账号弹框（个人信息 / 修改口令）：复用 .auth-modal 骨架，只补内容区 ===== */
+.auth-modal.is-account { max-width: 440px; }
+
+.auth-info {
+    margin: 2px 0 18px;
+    border: 1px solid rgba(110, 160, 255, .16);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.auth-info-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
+    border-top: 1px solid rgba(110, 160, 255, .12);
+}
+
+.auth-info-row:first-child { border-top: none; }
+
+.auth-info-key { flex: none; width: 76px; color: var(--auth-text-soft); }
+
+.auth-info-val {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--auth-text);
+    word-break: break-all;
+}
+
+.auth-hint {
+    margin: 0 0 14px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--auth-text-soft);
+}
+
+/* 同一行提示元素兼作成功态（改密成功后复用 .auth-error 的位置，只换颜色） */
+.auth-error.is-ok { color: #6ee7b7; }
+
 @media (max-width: 520px) {
     .auth-modal { padding: 24px 20px 18px; }
-    .auth-nav-user { display: none; }
+    .auth-user-trigger { max-width: 110px; }
 }

@@ -1,5 +1,5 @@
 // 用户管理页（/user.html）。Vue 由 /js/lib/vue.global.prod.js 提供。
-// 登录态与鉴权统一走 auth.js；本页所有 /api 请求都经 apiFetch（附 X-Api-Key + Authorization）。
+// 登录态与鉴权统一走 auth.js；本页所有 /api 请求都经 apiFetch（附 Authorization）。
 //
 // 权限：整个 /api/user/** 与 /api/role/** 在后端由 @RequireRole("ADMIN") 把关，
 // 前端这里只做「非管理员直接劝返」，不作为安全边界。
@@ -9,16 +9,10 @@ if (typeof Vue === 'undefined') {
 }
 const { createApp, ref, reactive, computed, onMounted } = Vue;
 
-// ==================== API 封装（与 edu.js 同一套：自动附加 X-Api-Key） ====================
-const API_KEY_STORAGE = 'my_agent_api_key';
-function getApiKey() {
-    try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
-}
+// ==================== API 封装（与 edu.js 同一套） ====================
 function apiFetch(url, options) {
     const opts = Object.assign({}, options || {});
     const headers = Object.assign({}, opts.headers || {});
-    const key = getApiKey();
-    if (key) headers['X-Api-Key'] = key;
     if (opts.body && typeof opts.body === 'object') {
         headers['Content-Type'] = 'application/json';
         opts.body = JSON.stringify(opts.body);
@@ -47,11 +41,8 @@ async function request(url, options, alertTitle) {
 
 createApp({
     setup() {
-        // 顶栏登录用户区
-        const authName = computed(() => (window.Auth ? window.Auth.displayName() : ''));
-        function authLogout() {
-            if (window.Auth) window.Auth.logout();
-        }
+        // 顶栏登录用户区（用户名 + 下拉菜单）不在这里 —— 整块由 js/auth.js 渲染到 data-auth-nav
+        // 挂载点上，四页共用同一份实现，本页不再持有登录态判断或退出逻辑。
 
         const tab = ref('user');
 
@@ -363,7 +354,7 @@ createApp({
         });
 
         return {
-            authName, authLogout, tab, switchTab,
+            tab, switchTab,
             roles,
             userRows, userPage, userSize, userTotal, userPages, userLoading, userQuery, loadUsers, resetUserQuery,
             roleRows, rolePage, roleSize, roleTotal, rolePages, roleLoading, roleQuery,

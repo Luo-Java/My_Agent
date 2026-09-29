@@ -126,7 +126,6 @@ chroma:
   retry-interval-seconds: 60
   upsert-batch-size: 10
 app:
-  api-key: ${APP_API_KEY:}        # 服务级密钥（脚本/机器调用），留空=不校验
   jwt:                            # 用户登录态：enabled=true 时 /api/** 除 /api/auth/login 外都要带 token
     enabled: true
     secret: ${JWT_SECRET:默认值}   # 默认值写在 application.yaml（固定值，重启不变，本地开箱即用）；留空或不足 32 字节 → 启动生成随机密钥并告警（重启后 token 全部失效）
@@ -142,10 +141,9 @@ server:
 
 > **配置前缀必须是顶层 `agent.*`**（对应 `@ConfigurationProperties("agent.*")`）。历史上曾因缩进错误被挂到 `spring:` 下导致整段静默失效，改动务必核对。
 
-### 3.1 部署安全（可选）
+### 3.1 部署安全
 
-- **接口访问控制**：默认不校验（本地开发）。若服务会暴露到局域网/公网，设置 `APP_API_KEY=你的密钥` 后重启，所有 `/api/**` 请求必须携带 `X-Api-Key: 你的密钥`（或 `Authorization: Bearer ...`），否则 401 —— 防止他人直接调用 SQL 查询工具、白嫖 LLM Key、读写知识库。该 401 响应体带 `reason: API_KEY_REQUIRED`（见 `ApiKeyInterceptor`），前端据此与「登录态失效」区分，**不会**因此清掉本地登录凭证。
-- **前端如何带密钥**：页面静态资源不在拦截范围，但页面发出的 `/api` 请求需要密钥。打开页面点顶栏 **🔑 访问密钥**，填入与 `APP_API_KEY` 相同值即可（仅存浏览器 `localStorage`）。前端所有 `/api` 调用统一经 `apiFetch` 自动附加该头；附件图片走 `/files/**`，无需密钥。
+- **接口访问控制**：登录鉴权是全项目**唯一**的接口闸门 —— `/api/**` 除 `POST /api/auth/login` 外都要求 `Authorization: Bearer <token>`，否则 401。把服务暴露到局域网/公网时，靠的就是它（外加反向代理/网关）。**旧的服务级密钥（`app.api-key` / `APP_API_KEY` → `ApiKeyInterceptor`）已移除**：它与登录流程冲突——启用后连 `POST /api/auth/login` 都会被拒（前端登录请求只带 `Authorization`，不带 `X-Api-Key`），用户根本进不来；而 `/api/**` 已由 JWT 全覆盖，机器调用同样得先登录，那道闸门不再提供额外保护。若仍需要「不登录即可调用的机器接口」，应单独开一条路径并显式放行，不要复用全局闸门。
 - **登录鉴权（默认开启）**：`/api/**` 除 `POST /api/auth/login` 外都要求 `Authorization: Bearer <token>`，否则 401（带 `reason`，见下），前端会**就地弹出登录框**（`js/auth.js`，不跳页）并展示服务端给出的具体原因。置 `app.jwt.enabled=false` 只关掉**服务端**校验，**前端的守卫仍会拦**：`GET /api/auth/me` 在开关关闭后同样抛 401，前端拿不到「开关已关」这个状态，会一直弹登录框 —— 要真正回到无登录态，得把页面里的 `Auth.requireLogin()` 调用一并去掉。
   - **拒绝原因可区分**：401 响应体除 `message` 外带机器可读的 `reason`（`NO_TOKEN` / `MALFORMED` / `BAD_SIGNATURE` / `MISSING_EXPIRY` / `EXPIRED` / `USER_UNAVAILABLE`，403 为 `ROLE_DENIED`），拦截器同时落 WARN 日志。前端把服务端 `message` 原样展示，因此「没带凭证」与「凭证不被认（密钥换过）」不再被笼统的「登录已失效」掩盖。
   - **响应头形状与其余接口一致**：拦截器手写的 401/403 不再调 `setCharacterEncoding`（那会让 Tomcat 把响应头写成 `application/json;charset=UTF-8`，而 Jackson 输出的都是 `application/json`）—— 同一 API 两种形状容易被误读成「带 charset 的请求才 401」。JSON 按规范即 UTF-8，直接写字节。
@@ -181,7 +179,6 @@ org.luo
 ├── MyAgentApplication  # 启动类（@MapperScan 指向 ai.mapper + edu.mapper + system.mapper）
 ├── common/             # 共享基础设施（AI / 教务 / 用户系统共用）
 │   ├── config/         # CorsConfig / GlobalExceptionHandler / MybatisPlusConfig(分页插件)
-│   │                   # / ApiKeyInterceptor + ApiSecurityConfig(服务级密钥 /api/**)
 │   ├── result/         # RestResult / PageResult（统一响应与分页契约）
 │   ├── BaseBO          # 分页入参基类：缺省 10 条、上限 100
 │   └── exception/      # AiBusinessException / AiErrorCode
@@ -317,15 +314,17 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/chat/conversation` | 开新会话（可传 `agentId` 绑定智能体，或 `planner:true` 建规划会话） |
-| PUT | `/api/chat/conversation/{id}` | 重命名会话 |
-| PUT | `/api/chat/conversation/{id}/planner` | 更新规划开关 `{enabled}`（绑定智能体的会话不可开启） |
-| PUT | `/api/chat/conversation/{id}/rag` | 更新 RAG 开关 `{enabled}` |
-| DELETE | `/api/chat/conversation/{id}` | 删除会话及全部消息 |
-| GET | `/api/chat/conversations` | 会话列表（按最近更新倒序） |
-| GET | `/api/chat/history?conversationId=` | 读取会话历史消息 |
+| POST | `/api/chat/conversation` | 开新会话（可传 `agentId` 绑定智能体，或 `planner:true` 建规划会话）；归属当前登录用户 |
+| PUT | `/api/chat/conversation/{id}` | 重命名会话（仅本人） |
+| PUT | `/api/chat/conversation/{id}/planner` | 更新规划开关 `{enabled}`（绑定智能体的会话不可开启；仅本人） |
+| PUT | `/api/chat/conversation/{id}/rag` | 更新 RAG 开关 `{enabled}`（仅本人） |
+| DELETE | `/api/chat/conversation/{id}` | 删除会话及全部消息（仅本人） |
+| GET | `/api/chat/conversations` | **当前用户**的会话列表（按最近更新倒序） |
+| GET | `/api/chat/history?conversationId=` | 读取会话历史消息（仅本人） |
 | POST | `/api/chat/task/resume` | SSE 流式续跑未完成任务（显式按钮触发）：回填已完成步骤、只跑剩余步骤 |
-| GET | `/api/chat/task/running?conversationId=` | 查询当前会话的 RUNNING 任务（无则 null，供「继续执行」提示条） |
+| GET | `/api/chat/task/running?conversationId=` | 查询当前会话的 RUNNING 任务（无则 null，供「继续执行」提示条；仅本人） |
+
+> **会话按用户隔离**：`/api/chat/**` 全部要求登录，会话归属 `conversation.user_id`。列表只回本人会话；对他人会话做读取/改名/开关/删除一律返回 **404**（与「会话不存在」不可区分，避免用 ID 探测）。身份在 HTTP 线程由 `AuthContext.require()` 取出后作为参数传入服务层 —— 流式执行体跑在弹性线程上，`ThreadLocal` 在那里已失效。
 
 ### 智能体
 
@@ -377,7 +376,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 表 | 关键列 | 说明 |
 |---|---|---|
-| `conversation` | id, title, agent_id, planner, agent_bind_source, rag_enabled, summary, summarized_count, core_facts | 会话：绑定智能体、规划/RAG 开关、滚动摘要与核心事实 |
+| `conversation` | id, **user_id**, title, agent_id, planner, agent_bind_source, rag_enabled, summary, summarized_count, core_facts | 会话：**归属用户（按 user_id 隔离，仅本人可见）**、绑定智能体、规划/RAG 开关、滚动摘要与核心事实 |
 | `chat_message` | id, conversation_id, role, content, attachments_json, citations_json, created_at | 消息明细；附件元数据与引用来源**独立列**，不进记忆、不占 token |
 | `agent` | id, name, agent_code, icon, description, system_prompt, param_schema, tools_json, model, temperature, avatar_color | 智能体：人设、参数清单、工具白名单、模型/温度覆盖 |
 | `kb` | id, name, agent_id, description, doc_count, chunk_strategy, chunk_overlap | 知识库；`agent_id` 为空即通用全局库 |
@@ -407,7 +406,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 ## 前端界面
 
-- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）、🔑 访问密钥、🔍 追踪、💰 成本；最右为**当前登录用户 + 用户管理入口（仅 ADMIN 可见）+ 退出**。
+- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）；右侧动作区**整体靠最右**，依次为 🔍 追踪（无会话时不显示）、💰 成本、🎓 教务系统（跳 `/edu.html`，与 edu 页的「前往 AI 对话」互为对称入口）、以及**登录用户区**。靠右由容器 `.header-actions` 统一负责（`margin-left:auto` + `gap`），各按钮不自带 `margin-left` —— 否则「追踪」这类条件渲染的按钮一缺席，整组就会塌回标题旁边。
+- **登录用户区（四页统一，只有一个用户名）**：顶栏不再出现裸露的「退出」按钮 —— 点击用户名展开下拉：**个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录**。四页（index / chat / edu / user）都是 `js/auth.js` 渲染到 `data-auth-nav` 挂载点的**同一份实现**，页面自身不含登录逻辑；细节见「登录」一节。
 - **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）。
 - **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
 - **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。
@@ -415,10 +415,11 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 - **教务系统**（`/edu.html`，独立入口）：10 张业务表（科目/老师/班级/学生/学期/课程/节次/排课/考试/成绩）的增删改查 + 4 个关联查询看板（学生成绩明细、成绩统计、班级课表、考试日程），复用深色色板，与 AI 对话页分离。单表页与关联查询页共用同一套顶部搜索条（文本输入 + 外键/枚举下拉 + 查询/重置，按 `tableMeta.search` / `queryMeta.search` 声明渲染）、序号列、右下分页（首页/上一页/下一页/尾页/跳页[/每页条数]）；新增与删除走自绘弹窗。
 
 - **登录**：登录界面全站只有一份 —— 结构在 `js/auth.js`（`Auth.openLogin()`），样式在 `css/auth.css`（`auth-` 前缀变量与类名，与各页样式互不污染）。
-  - **首页**（`/index.html`）右上角「登录」按钮：点击**就地弹框**（不跳页），登录后原地变为「用户名 + 用户管理（仅 ADMIN）+ 退出」。首页自身不含登录逻辑，只放一个 `data-auth-nav` 挂载点。
+  - **首页**（`/index.html`）右上角「登录」按钮：点击**就地弹框**（不跳页），登录后原地变为用户名的下拉菜单（个人信息 / 修改口令 / 用户管理 / 退出登录）。首页自身不含登录逻辑，只放一个 `data-auth-nav` 挂载点。
   - **受限页**（chat / edu / user）**先锁住页面、再确认登录态，最后才决定是否渲染页面**：`Auth.requireLogin()` 在 `<head>` 里同步把整页盖住（`html.auth-locked` + 一句「正在校验登录状态…」），无 token 直接弹登录框；有 token 也先向 `GET /api/auth/me` 确认，**只有确认有效才解除遮罩放行渲染**。所以直接打开 `/chat.html`、`/edu.html` 不会先闪一眼未登录的空壳页（此前只看本地 token、页面照常渲染，等首个接口 401 才弹框，观感是「先进去再被踢出来」）。弹的是**整页观感的登录框**（不透明底，不会把空壳页透出来），登录成功后自动重载当前页；关掉弹框会回到首页 —— 受限页在没有登录态时数据全 401，留在空壳页面上没有意义。运行中 401 同样弹框并提示「登录状态已失效」。需要登录才能走的链接加 `data-auth-required` 即可，点击时由 `Auth.guardNavigation()` **先确认登录态再放行**：未登录就地弹框，已登录也先向 `GET /api/auth/me` 确认 token 仍有效（token 会被服务端单方面作废 —— 过期、账号停用、换密钥重启），确认通过才跳转，避免「先跳进去、再被踢出来」。
   - `/login.html` 只是弹框的「整页模式」外壳（调 `Auth.mountLoginPage()`），保留它是给未登录的深链访问一个落地地址；登录成功后回跳 `?redirect=`，只接受站内路径，防开放重定向。
-  - token 存 `localStorage`（键 `my_agent_token`），与 `X-Api-Key` 的存法一致；退出登录 = 前端丢弃 token（服务端无会话可销毁）。
+  - token 存 `localStorage`（键 `my_agent_token`）；退出登录 = 前端丢弃 token（服务端无会话可销毁）。
+  - **用户菜单（顶栏唯一入口）**：点击用户名展开下拉，共四项 —— **个人信息**（弹框展示登录名 / 昵称 / 邮箱 / 角色 / 状态 / 最近登录 / 创建时间；先用本地会话快照渲染、再回源 `GET /api/auth/me` 覆盖，避免昵称或角色被改后仍显示旧值。资料**只读**，修改走管理员的「用户管理」）、**修改口令**（弹框三个口令字段，前端即时校验 6~64 位 / 两次一致 / 与原口令不同，提交 `POST /api/auth/password`；成功后**不自动关闭弹框、也不清本地 token** —— 口令要留给用户确认一眼，且 JWT 无状态、改密不影响已签发的 token）、**用户管理**（仅 ADMIN，服务端另有 `@RequireRole` 兜底）、**退出登录**（危险色，置于分隔线之下）。下拉的收起路径三条：再点触发器、点页面空白、按 Esc。
 - **用户管理**（`/user.html`，仅 ADMIN）：左侧切换「用户管理 / 角色管理」。用户列表支持关键词/状态/角色筛选，可行新增、编辑（角色为复选框多选）、重置口令、删除；角色列表支持编码/名称筛选，可新增、编辑（编码锁定）、删除。口令全程只写不读，界面上不提供查看。
 
 ## 开发备注

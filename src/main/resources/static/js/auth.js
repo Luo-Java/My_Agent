@@ -7,8 +7,11 @@
  *         登录成功后自动重载当前页；确认有效才放行显示页面内容；
  *   2) 所有 /api/** 请求统一走 Auth.fetch()（自动附 Authorization；401 按服务端给的 reason
  *      区分「登录态真的失效」与「与登录态无关的 401」，只有前者才清本地登录态，两者都就地弹框提示）；
- *   3) 右上角鉴权区：给任意元素加 data-auth-nav 属性即自动渲染
- *      —— 未登录显示「登录」按钮，已登录显示用户名 + 用户管理（仅 ADMIN）+ 退出；
+ *   3) 右上角用户区：给任意元素加 data-auth-nav 属性即自动渲染
+ *      —— 未登录显示「登录」按钮；已登录只显示一个用户名（点击展开下拉：
+ *         个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录）。四页顶栏共用这一份实现，
+ *         **顶栏不再出现裸露的「退出」按钮** —— 退出属于低频且不可逆的动作，收进下拉减少误触；
+ *         用户管理入口也一并在下拉里（仅 ADMIN，服务端另有 @RequireRole 兜底）；
  *   4) 需要登录才能点的链接加 data-auth-required：未登录时就地弹框，登录后自动前往；
  *      已登录也先向服务端确认 token 仍有效再跳 —— 避免「先进去才发现要重新登录」；
  *   5) /login.html 只是个空壳，调 Auth.mountLoginPage() 以整页模式打开同一个弹框；
@@ -16,8 +19,7 @@
  *      本身），并说明服务端认不认它，reason 一眼可分 NO_TOKEN / BAD_SIGNATURE / EXPIRED。
  *
  * 登录 UI 只有一份：结构在 js/auth.js，样式在 css/auth.css，登录页与弹框共用。
- * token 存 localStorage（键 my_agent_token），与既有 X-Api-Key 的存法一致，不进页面源码。
- * 与 ApiKey 的关系：两者是独立闸门，服务端配置 APP_API_KEY 后，请求需同时带密钥与 token。
+ * token 存 localStorage（键 my_agent_token），不进页面源码。
  */
 (function () {
     'use strict';
@@ -131,13 +133,6 @@
         USER_UNAVAILABLE: 1
     };
 
-    /**
-     * 服务端「没带/带错 X-Api-Key」的 401：这是**服务级密钥**那一闸门拒绝的，与登录态无关。
-     * 早期两处闸门都只回状态码，前端只能把这种 401 也当成「登录失效」—— 于是清掉刚登录拿到的
-     * token、再弹一次登录框：表现就是「登录成功后随便点一下就要求重新登录」，怎么登都不对。
-     */
-    var API_KEY_FAILURE_REASON = 'API_KEY_REQUIRED';
-
     /** 非 401 的失败：服务端没否认登录态，只是这次没答上来（5xx、网关等）。 */
     var SERVER_ERROR_MESSAGE = '暂时无法确认登录状态（服务端异常），请稍后重试';
 
@@ -145,7 +140,7 @@
      * 读服务端给出的拒绝详情（401 响应体里的 reason + message），读不到就回落到兜底文案。
      *
      * 为什么不直接 resp.json()：响应体只能读一次，读掉之后调用方自己的解析会炸 —— 这里用 clone()。
-     * 服务端把「未登录 / 已过期 / 凭证无效 / 账号停用 / 缺访问密钥」分开写清楚了（reason 字段），
+     * 服务端把「未登录 / 已过期 / 凭证无效 / 账号停用」分开写清楚了（reason 字段），
      * 前端据此决定该不该动登录态、该说什么话；自己编一句笼统的话，只会让排查从「看一眼」变成「猜半天」。
      *
      * @return Promise<{reason: string, message: string}>（reason 可能为空串）
@@ -166,14 +161,12 @@
     /**
      * 该 401 是否意味着「本地登录态已失效」—— **只有服务端明确说这份凭证不行时才算**。
      *
-     * reason 缺失时一律按「与登录态无关」处理：401 也可能来自 X-Api-Key 闸门或中间的反向代理，
+     * reason 缺失时一律按「与登录态无关」处理：401 也可能来自中间的反向代理/网关，
      * 而清登录态是不可逆的（用户得重新登录）。宁可让用户多点一次登录框，也不能把一次
-     * 「密钥配错 / 代理拦截」升级成「所有人都要重新登录」。
+     * 「代理拦截」升级成「所有人都要重新登录」。
      */
     function isSessionInvalid(failure) {
         if (!failure) { return false; }
-        // 服务级密钥那一闸门（X-Api-Key）的 401 与登录态无关：显式排除，别让它落进下面的白名单
-        if (failure.reason === API_KEY_FAILURE_REASON) { return false; }
         return !!TOKEN_FAILURE_REASONS[failure.reason];
     }
 
@@ -380,6 +373,68 @@
 
     // ==================== 右上角鉴权区 ====================
 
+    /** 当前展开下拉的宿主（同时只允许一个菜单展开）。 */
+    var openMenuHost = null;
+
+    /** 收起下拉（本来就没展开时是空操作）。 */
+    function closeUserMenu() {
+        if (!openMenuHost) { return; }
+        var menu = openMenuHost.querySelector('.auth-menu');
+        var trigger = openMenuHost.querySelector('.auth-user-trigger');
+        if (menu) { menu.hidden = true; }
+        if (trigger) {
+            trigger.classList.remove('is-open');
+            trigger.setAttribute('aria-expanded', 'false');
+        }
+        openMenuHost = null;
+    }
+
+    /** 展开 / 收起下拉（再点一次用户名即收起）。 */
+    function toggleUserMenu(host) {
+        if (openMenuHost === host) { closeUserMenu(); return; }
+        closeUserMenu();
+        var menu = host.querySelector('.auth-menu');
+        var trigger = host.querySelector('.auth-user-trigger');
+        if (!menu) { return; }
+        menu.hidden = false;
+        if (trigger) {
+            trigger.classList.add('is-open');
+            trigger.setAttribute('aria-expanded', 'true');
+        }
+        openMenuHost = host;
+    }
+
+    // 点页面其它地方 / 按 Esc / 改窗口尺寸都收起下拉。
+    // 触发器与菜单项自己的点击都先 stopPropagation —— 否则「点开就被这个 document 监听立刻收起」。
+    document.addEventListener('click', function () { closeUserMenu(); });
+    document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape' || event.keyCode === 27) { closeUserMenu(); }
+    });
+    window.addEventListener('resize', function () { closeUserMenu(); });
+
+    /** 下拉菜单项（按钮形态；<a> 版本由调用方自建）。点击后自动收起下拉。 */
+    function menuItem(text, onClick) {
+        var el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'auth-menu-item';
+        el.setAttribute('role', 'menuitem');
+        el.textContent = text;
+        el.addEventListener('click', function (event) {
+            event.stopPropagation();
+            closeUserMenu();
+            onClick();
+        });
+        return el;
+    }
+
+    /** 角色展示串：优先后端拼好的 roleNames，其次 roleCodes，都没有则占位符。 */
+    function roleText(user) {
+        if (!user) { return '—'; }
+        if (user.roleNames) { return user.roleNames; }
+        if (Array.isArray(user.roleCodes) && user.roleCodes.length) { return user.roleCodes.join('、'); }
+        return '—';
+    }
+
     function renderNav(host) {
         host.innerHTML = '';
         host.classList.add('auth-nav');
@@ -396,28 +451,71 @@
             return;
         }
 
+        // 触发器：用户名 + ▾。**顶栏只有这一个元素** —— 退出、改密、个人信息都收进下拉，
+        // 「退出」不再裸露在顶栏（低频且不可逆的动作，避免误触）。
+        var trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.className = 'auth-user-trigger';
+        trigger.setAttribute('aria-haspopup', 'menu');
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.title = '账号设置（当前登录：' + Auth.displayName() + '）';
+
         var nameEl = document.createElement('span');
-        nameEl.className = 'auth-nav-user';
+        nameEl.className = 'auth-user-name';
         nameEl.textContent = Auth.displayName();
-        nameEl.title = '当前登录：' + Auth.displayName();
-        host.appendChild(nameEl);
+        var caret = document.createElement('span');
+        caret.className = 'auth-user-caret';
+        caret.setAttribute('aria-hidden', 'true');
+        caret.textContent = '▾';
+        trigger.appendChild(nameEl);
+        trigger.appendChild(caret);
+        trigger.addEventListener('click', function (event) {
+            event.stopPropagation();
+            toggleUserMenu(host);
+        });
+        host.appendChild(trigger);
+
+        var menu = document.createElement('div');
+        menu.className = 'auth-menu';
+        menu.setAttribute('role', 'menu');
+        menu.hidden = true;
+
+        var head = document.createElement('div');
+        head.className = 'auth-menu-head';
+        var headName = document.createElement('span');
+        headName.className = 'auth-menu-name';
+        headName.textContent = Auth.displayName();
+        var headRole = document.createElement('span');
+        headRole.className = 'auth-menu-role';
+        headRole.textContent = roleText(user);
+        head.appendChild(headName);
+        head.appendChild(headRole);
+        menu.appendChild(head);
+
+        menu.appendChild(menuItem('个人信息', function () { openProfile(); }));
+        menu.appendChild(menuItem('修改口令', function () { openChangePassword(); }));
 
         if (Auth.hasRole('ADMIN')) {
             var adminLink = document.createElement('a');
-            adminLink.className = 'auth-nav-link';
+            adminLink.className = 'auth-menu-item';
             adminLink.href = '/user.html';
+            adminLink.setAttribute('role', 'menuitem');
             adminLink.textContent = '用户管理';
             adminLink.title = '用户与角色管理（服务端另有 @RequireRole 兜底）';
-            host.appendChild(adminLink);
+            adminLink.addEventListener('click', function () { closeUserMenu(); });
+            menu.appendChild(adminLink);
         }
 
-        var logoutBtn = document.createElement('button');
-        logoutBtn.type = 'button';
-        logoutBtn.className = 'auth-nav-link';
-        logoutBtn.textContent = '退出';
-        logoutBtn.title = '退出登录（清除本浏览器的登录态）';
-        logoutBtn.addEventListener('click', function () { Auth.logout(); });
-        host.appendChild(logoutBtn);
+        var sep = document.createElement('div');
+        sep.className = 'auth-menu-sep';
+        menu.appendChild(sep);
+
+        var logoutItem = menuItem('退出登录', function () { Auth.logout(); });
+        logoutItem.classList.add('is-danger');
+        logoutItem.title = '退出登录（清除本浏览器的登录态；JWT 无状态，服务端没有会话可销毁）';
+        menu.appendChild(logoutItem);
+
+        host.appendChild(menu);
     }
 
     function mountAllNavs() {
@@ -425,6 +523,252 @@
         for (var i = 0; i < hosts.length; i++) {
             renderNav(hosts[i]);
         }
+    }
+
+    // ==================== 账号弹框（个人信息 / 修改口令） ====================
+
+    /** 当前打开的账号弹框。与登录框各持一个单例 —— 共用会互相顶掉（401 可能在弹框开着时触发登录框）。 */
+    var accountVeil = null;
+
+    function onAccountEscape(event) {
+        if (event.key === 'Escape' || event.keyCode === 27) { closeAccount(); }
+    }
+
+    function closeAccount() {
+        if (!accountVeil) { return; }
+        accountVeil.remove();
+        accountVeil = null;
+        document.removeEventListener('keydown', onAccountEscape);
+    }
+
+    /**
+     * 打开账号弹框（个人信息 / 修改口令共用骨架）：复用登录框的 .auth-veil + .auth-modal 样式，
+     * 只是把卡片内容换成调用方给的节点 —— 于是新增弹框不需要再写一份遮罩与卡片 CSS。
+     */
+    function openAccount(options) {
+        closeAccount();
+        ensureCss();
+
+        var veil = document.createElement('div');
+        veil.className = 'auth-veil';
+        var modal = document.createElement('div');
+        modal.className = 'auth-modal is-account';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+
+        var close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'auth-close';
+        close.setAttribute('aria-label', '关闭');
+        close.innerHTML = '&times;';
+        close.addEventListener('click', closeAccount);
+
+        var title = document.createElement('h1');
+        title.className = 'auth-title';
+        title.textContent = options.title;
+
+        modal.appendChild(close);
+        modal.appendChild(title);
+        if (options.sub) {
+            var sub = document.createElement('p');
+            sub.className = 'auth-sub';
+            sub.textContent = options.sub;
+            modal.appendChild(sub);
+        }
+        modal.appendChild(options.body);
+
+        veil.appendChild(modal);
+        veil.addEventListener('click', function (event) {
+            // 只有点在遮罩空白处才关；卡片内部点击不冒泡到判断
+            if (event.target === veil) { closeAccount(); }
+        });
+        document.addEventListener('keydown', onAccountEscape);
+        document.body.appendChild(veil);
+        accountVeil = veil;
+        return modal;
+    }
+
+    /** 服务端的 LocalDateTime 序列化成 ISO（T 分隔），展示时换成空格并截到秒。 */
+    function formatTime(value) {
+        if (!value) { return '—'; }
+        return String(value).replace('T', ' ').slice(0, 19);
+    }
+
+    /** 信息行（键 + 值）。返回 {row, set}：资料回源刷新后可原地更新，不必重建弹框。 */
+    function infoRow(key) {
+        var row = document.createElement('div');
+        row.className = 'auth-info-row';
+        var k = document.createElement('span');
+        k.className = 'auth-info-key';
+        k.textContent = key;
+        var v = document.createElement('span');
+        v.className = 'auth-info-val';
+        v.textContent = '—';
+        row.appendChild(k);
+        row.appendChild(v);
+        return {
+            row: row,
+            set: function (text) {
+                v.textContent = (text === null || text === undefined || text === '') ? '—' : String(text);
+            }
+        };
+    }
+
+    /** 弹框里的提示行（沿用登录框的 .auth-error；成功态加 .is-ok 转绿）。 */
+    function showAccountMessage(el, message, ok) {
+        el.textContent = message || '';
+        if (ok) {
+            el.classList.add('is-ok');
+        } else {
+            el.classList.remove('is-ok');
+        }
+    }
+
+    /**
+     * 个人信息弹框。
+     * <p>
+     * 先用本地会话快照渲染（点开即出内容），再用 {@code GET /api/auth/me} 回源覆盖 ——
+     * 快照是登录当时的，昵称/角色可能已被管理员改过，不回源就会显示旧值。
+     * 回源失败（离线等）保留快照展示：真正的 401 由 Auth.fetch 统一处理，这里不再插一脚。
+     */
+    function openProfile() {
+        var body = document.createElement('div');
+        var info = document.createElement('div');
+        info.className = 'auth-info';
+
+        var fields = {
+            username: infoRow('登录名'),
+            nickname: infoRow('昵称'),
+            email: infoRow('邮箱'),
+            role: infoRow('角色'),
+            status: infoRow('状态'),
+            lastLoginAt: infoRow('最近登录'),
+            createdAt: infoRow('创建时间')
+        };
+        for (var key in fields) {
+            if (Object.prototype.hasOwnProperty.call(fields, key)) {
+                info.appendChild(fields[key].row);
+            }
+        }
+        body.appendChild(info);
+
+        var hint = document.createElement('p');
+        hint.className = 'auth-hint';
+        hint.textContent = '资料由管理员在「用户管理」中维护，此处仅供查看。';
+        body.appendChild(hint);
+
+        openAccount({ title: '个人信息', sub: '当前登录账号', body: body });
+
+        function fill(user) {
+            if (!user) { return; }
+            fields.username.set(user.username);
+            fields.nickname.set(user.nickname);
+            fields.email.set(user.email);
+            fields.role.set(roleText(user));
+            fields.status.set(user.status === 1 ? '启用' : (user.status === 0 ? '停用' : ''));
+            fields.lastLoginAt.set(formatTime(user.lastLoginAt));
+            fields.createdAt.set(formatTime(user.createdAt));
+        }
+
+        fill(Auth.getUser());
+        Auth.fetch('/api/auth/me').then(function (resp) {
+            return readJson(resp).then(function (payload) {
+                if (!resp.ok || !payload || !payload.data) { return; }
+                fill(payload.data);
+                // 顺手把最新资料写回本地会话，顶栏的展示名与「用户管理」入口随之同步
+                Auth.setSession(Auth.getToken(), payload.data);
+                mountAllNavs();
+            });
+        }).catch(function () {
+            // 拉取失败：保留本地快照展示（401 已由 Auth.fetch 统一处理）
+        });
+    }
+
+    /** 口令字段（label + input），返回 {wrap, input}。 */
+    function passwordField(label, autocomplete) {
+        var wrap = document.createElement('label');
+        wrap.className = 'auth-field';
+        var text = document.createElement('span');
+        text.className = 'auth-label';
+        text.textContent = label;
+        var input = document.createElement('input');
+        input.className = 'auth-input';
+        input.type = 'password';
+        input.autocomplete = autocomplete;
+        input.maxLength = 64;
+        wrap.appendChild(text);
+        wrap.appendChild(input);
+        return { wrap: wrap, input: input };
+    }
+
+    /**
+     * 修改口令弹框：前端只做即时校验（齐全 / 长度 / 两次一致 / 与原口令不同），
+     * 口径与后端 {@code PasswordHasher} 一致（6~64 位），最终仍以服务端判定为准。
+     * <p>
+     * 改密成功后**不自动关闭弹框、也不清本地 token**：口令要留给用户确认一眼；
+     * 且 JWT 是无状态的、服务端没有会话可销毁，改密不影响已签发的 token。
+     */
+    function openChangePassword() {
+        var form = document.createElement('form');
+        form.className = 'auth-form';
+        form.noValidate = true;
+
+        var oldField = passwordField('原口令', 'current-password');
+        var newField = passwordField('新口令', 'new-password');
+        var againField = passwordField('确认新口令', 'new-password');
+        var message = document.createElement('p');
+        message.className = 'auth-error';
+        message.setAttribute('role', 'alert');
+        var submit = document.createElement('button');
+        submit.type = 'submit';
+        submit.className = 'auth-submit';
+        submit.textContent = '确认修改';
+
+        form.appendChild(oldField.wrap);
+        form.appendChild(newField.wrap);
+        form.appendChild(againField.wrap);
+        form.appendChild(message);
+        form.appendChild(submit);
+
+        form.addEventListener('submit', function (event) {
+            event.preventDefault();
+            var oldPwd = oldField.input.value;
+            var newPwd = newField.input.value;
+            var again = againField.input.value;
+            if (!oldPwd || !newPwd || !again) { showAccountMessage(message, '请填写全部三项口令'); return; }
+            if (newPwd.length < 6 || newPwd.length > 64) { showAccountMessage(message, '新口令长度需为 6~64 位'); return; }
+            if (newPwd !== again) { showAccountMessage(message, '两次输入的新口令不一致'); return; }
+            if (newPwd === oldPwd) { showAccountMessage(message, '新口令不能与原口令相同'); return; }
+
+            submit.disabled = true;
+            submit.textContent = '提交中…';
+            showAccountMessage(message, '');
+            Auth.fetch('/api/auth/password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ oldPassword: oldPwd, newPassword: newPwd })
+            }).then(function (resp) {
+                return readJson(resp).then(function (payload) {
+                    if (!resp.ok) {
+                        throw new Error((payload && payload.message) || ('修改失败（HTTP ' + resp.status + '）'));
+                    }
+                });
+            }).then(function () {
+                submit.textContent = '已修改';
+                showAccountMessage(message, '口令已修改。当前登录态保持有效，下次登录请使用新口令。', true);
+            }).catch(function (err) {
+                submit.disabled = false;
+                submit.textContent = '确认修改';
+                showAccountMessage(message, err && err.message ? err.message : '网络异常，请稍后重试');
+            });
+        });
+
+        openAccount({
+            title: '修改口令',
+            sub: '需先验证原口令；其他设备上已登录的会话不受影响。',
+            body: form
+        });
+        oldField.input.focus();
     }
 
     // ==================== 页面级闸门 ====================
@@ -513,7 +857,7 @@
                 openLogin({ closable: true, redirect: target, message: SERVER_ERROR_MESSAGE });
                 return null;
             }
-            // 401：把服务端的原因原样展示（未登录 / 已过期 / 凭证无效 / 缺访问密钥）
+            // 401：把服务端的原因原样展示（未登录 / 已过期 / 凭证无效 / 账号停用）
             return readFailure(resp, EXPIRED_MESSAGE).then(function (failure) {
                 if (isSessionInvalid(failure)) {
                     Auth.clear();
@@ -753,7 +1097,7 @@
                 // 当前会话已经不是它了，不能拿它清掉刚拿到的 token。
                 if (token && token !== Auth.getToken()) { return resp; }
                 return readFailure(resp, EXPIRED_MESSAGE).then(function (failure) {
-                    // 与登录态无关的 401（访问密钥闸门、代理等）：保留本地 token，只把原因说清楚
+                    // 与登录态无关的 401（反向代理/网关等）：保留本地 token，只把原因说清楚
                     if (!isSessionInvalid(failure)) {
                         console.warn('[auth] 401 ' + url + '：reason=' + (failure.reason || '(服务端未提供)')
                             + ' → 与登录态无关，保留本地登录态');

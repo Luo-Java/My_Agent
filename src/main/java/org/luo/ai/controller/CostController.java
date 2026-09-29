@@ -12,7 +12,7 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>
  * GET /api/cost/summary（近 N 天全量成本聚合：按天趋势 + 按用途拆解）。数据来自两张旁路表——
  * agent_trace（回答本身）与 llm_usage（路由/参数抽取/查询改写/视觉/记忆合并等裸调用），
- * 走统一 {@code /api/**} 鉴权（ApiKeyInterceptor）。
+ * 走统一 {@code /api/**} 登录鉴权（JwtAuthInterceptor）。
  */
 @RestController
 @RequestMapping("/api/cost")

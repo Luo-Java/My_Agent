@@ -8,26 +8,11 @@ if (typeof Vue === 'undefined') {
 
 const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick } = Vue;
 
-// ==================== 接口访问密钥（X-Api-Key） ====================
-/** 密钥在浏览器本地的存储键。只存本机、不进页面源码（服务端配置 APP_API_KEY 后才需要填）。 */
-const API_KEY_STORAGE = 'my_agent_api_key';
-
-/** 读取已保存的访问密钥；localStorage 不可用（隐私模式等）时返回空串。 */
-function getApiKey() {
-    try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
-}
-
-/** 统一 API 请求：自动附加 X-Api-Key 头。
- *  所有 /api/** 调用都必须走这里 —— 服务端一旦配置 app.api-key，裸 fetch 会全部 401。
- *  登录态（Authorization: Bearer）与 401 自动跳登录页由 auth.js 统一处理，本函数只负责带访问密钥。
- *  附件图片走 /files/**（不在 ApiKeyInterceptor 的 /api/** 范围内），<img> 直连即可，无需带头。 */
+/** 统一 API 请求：所有 /api/** 调用都必须走这里。
+ *  登录态（Authorization: Bearer）与 401 就地弹登录框由 auth.js 统一处理，本函数只做转发。
+ *  附件图片走 /files/**（不在鉴权拦截范围内），<img> 直连即可。 */
 function apiFetch(url, options) {
-    const opts = Object.assign({}, options || {});
-    const headers = Object.assign({}, opts.headers || {});
-    const key = getApiKey();
-    if (key) headers['X-Api-Key'] = key;
-    opts.headers = headers;
-    return window.Auth ? window.Auth.fetch(url, opts) : window.fetch(url, opts);
+    return window.Auth ? window.Auth.fetch(url, options) : window.fetch(url, options);
 }
 
 
@@ -340,23 +325,8 @@ const app = createApp({
         // 随会话切换同步（规划会话默认勾选），发送时随请求写回会话（刷新后保持）。
         const planMode = ref(false);
 
-        // 顶栏「访问密钥」按钮状态：true = 本浏览器已保存密钥。
-        // 只存布尔值，密钥本身不进 Vue 状态（避免出现在调试面板/组件实例里），读取统一走 getApiKey()。
-        const apiKeySet = ref(!!getApiKey());
-
-        // 顶栏登录用户区：登录态由 auth.js 统一维护，这里只在挂载时快照一次。
-        // token 失效不需要前端感知 —— 任何请求拿到 401 都会由 auth.js 跳回登录页。
-        const authUser = ref(window.Auth ? window.Auth.getUser() : null);
-        const authName = computed(() => (window.Auth ? window.Auth.displayName() : ''));
-        // 只决定「用户管理」入口显不显示；真正的权限闸门是服务端的 @RequireRole
-        const authIsAdmin = computed(() => !!(window.Auth && window.Auth.hasRole('ADMIN')));
-
-        /** 退出登录：JWT 无状态，服务端没有会话可销毁，清掉本地 token 即登出。 */
-        function authLogout() {
-            if (window.Auth) {
-                window.Auth.logout();
-            }
-        }
+        // 顶栏登录用户区（用户名 + 下拉菜单）不在这里 —— 整块由 js/auth.js 渲染到 data-auth-nav
+        // 挂载点上，四页共用同一份实现，本页不再持有任何登录态判断或退出逻辑。
 
         // 输入框「RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
@@ -1555,25 +1525,6 @@ const app = createApp({
                 avgElapsed: count ? fmtElapsed(Math.round(elapsedSum / count)) : '-',
             };
         });
-        /** 顶栏「访问密钥」：写入/清除本浏览器的 X-Api-Key。
-         *  用原生 prompt（无需新增样式）；密钥明文存 localStorage，仅本机可见。 */
-        function editApiKey() {
-            const typed = window.prompt(
-                    '服务端未启用鉴权时无需填写。\n请输入访问密钥（与服务端 app.api-key / APP_API_KEY 一致；'
-                    + '留空并确定 = 清除已保存的密钥）：',
-                    getApiKey());
-            if (typed === null) return;               // 用户取消
-            const key = typed.trim();
-            try {
-                if (key) localStorage.setItem(API_KEY_STORAGE, key);
-                else localStorage.removeItem(API_KEY_STORAGE);
-            } catch (e) {
-                alert('浏览器本地存储不可用（如隐私模式），密钥未能保存');
-                return;
-            }
-            apiKeySet.value = !!key;
-            alert(key ? '已保存访问密钥（仅存于本浏览器，刷新后仍生效）' : '已清除访问密钥');
-        }
 
         async function openTrace() {
             traceModal.open = true;
@@ -2053,10 +2004,6 @@ const app = createApp({
             strategyLabel, strategyDesc, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
             pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
-            // 顶栏「访问密钥」：状态 + 修改入口（所有 /api 请求经 apiFetch 自动带上该密钥）
-            apiKeySet, editApiKey,
-            // 顶栏登录用户区：用户名 / 用户管理入口（仅 ADMIN 可见）/ 退出
-            authUser, authName, authIsAdmin, authLogout,
             // 链路追踪（可观测）：traceModal + 展示辅助函数
             traceModal, traceStats, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore,
             // 成本看板（全量成本口径）：costModal + 加载/关闭 + token 格式化
