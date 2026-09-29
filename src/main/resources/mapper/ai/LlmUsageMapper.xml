@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.ai.mapper.LlmUsageMapper">
+
+    <select id="aggregateDailyByPurpose" resultType="org.luo.ai.mapper.LlmUsageMapper$UsageAgg">
+        SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day,
+               purpose AS purpose,
+               SUM(total_tokens) AS totalTokens,
+               COUNT(*) AS calls
+        FROM llm_usage
+        WHERE created_at &gt;= #{since}
+        GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d'), purpose
+    </select>
+
+</mapper>
