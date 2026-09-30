@@ -11,4 +11,35 @@
         GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d')
     </select>
 
+    <!--
+      带归属过滤的追踪查询：agent_trace 表没有 user_id 列 —— 加列就得把身份一路传进
+      异步落库链路，会破坏「追踪是纯旁路、不影响任何对话逻辑」这条原则。故归属一律由
+      JOIN conversation 判定（conversation.idx_user 支撑）。
+      注意：删除会话不会删除 trace（deleteConversation 只清 chat_message 与 conversation），
+      因此可能存在指向已删会话的孤儿记录。JOIN 天然查不出它们 —— 普通用户不可见，
+      ADMIN 走全量视角（selectList）仍可见，符合「追踪作为旁路留档」的定位。
+    -->
+    <select id="selectOwned" resultType="org.luo.ai.entity.AgentTrace">
+        SELECT t.*
+        FROM agent_trace t
+        JOIN conversation c ON c.id = t.conversation_id
+        <where>
+            c.user_id = #{userId}
+            <if test="conversationId != null and conversationId != ''">
+                AND t.conversation_id = #{conversationId}
+            </if>
+        </where>
+        ORDER BY t.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectOwnedByTraceId" resultType="org.luo.ai.entity.AgentTrace">
+        SELECT t.*
+        FROM agent_trace t
+        JOIN conversation c ON c.id = t.conversation_id
+        WHERE t.trace_id = #{traceId}
+          AND c.user_id = #{userId}
+        LIMIT 1
+    </select>
+
 </mapper>

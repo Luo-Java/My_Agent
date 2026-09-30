@@ -107,9 +107,21 @@
                     <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
                     <button v-if="currentId" class="nav-pill" @click="openTrace"
                             title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
-                    <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话 -->
-                    <button class="nav-pill cost-btn" @click="openCost"
-                            title="查看全量成本看板：按天趋势与按用途拆解（回答 + 路由/参数抽取/查询改写/视觉/记忆合并）">💰 成本</button>
+                    <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话。
+                         ADMIN 专属（后端 CostController 标了 @RequireRole(ADMIN)，接口本身返回 403）——
+                         成本是全站聚合口径、天然跨用户，收敛到管理员；普通账号不渲染该入口。 -->
+                    <button v-if="isAdmin" class="nav-pill cost-btn" @click="openCost"
+                            title="查看全量成本看板：按天趋势与按用途拆解（回答 + 路由/参数抽取/查询改写/任务规划/视觉/记忆合并）">💰 成本</button>
+                    <!-- 提示词回归评测入口：跑 eval-cases.yaml 的固定用例、断言路由与规划决策，
+                         改完 prompts.yaml 后跑一批并与上一批对比，看「新增失败」清单。
+                         ADMIN 专属（后端 EvalController 标了 @RequireRole(ADMIN)）——「跑一批」会发起真实模型调用、
+                         消耗计入成本流水，属「会花钱的运维动作」，与成本看板同一性质；普通账号不渲染该入口。 -->
+                    <button v-if="isAdmin" class="nav-pill" @click="openEval"
+                            title="提示词回归评测：跑固定用例断言路由与规划决策，改完 prompts.yaml 后与上一批对比（仅管理员）">🧪 评测</button>
+                    <!-- 可观测面板入口：跳 /observability.html（独立 ADMIN 页）。与成本/评测同属「跨会话全站聚合」的运营视角，
+                         但关注的是运行质量（成功率/耗时/慢轮）而非成本；逐条看某会话走 🔍 追踪。 -->
+                    <a v-if="isAdmin" class="nav-pill" href="/observability.html"
+                       title="可观测面板：跨会话运行质量（成功率 / 平均耗时 / 按天·按模式·按来源·按智能体 / 慢轮 Top N），仅管理员">📊 可观测</a>
                     <!-- 教务系统入口：跳 /edu.html（与 edu 页顶栏的「前往 AI 对话」互为对称入口） -->
                     <a class="nav-pill" href="/edu.html"
                        title="前往教务管理系统：学生/教师/班级/课程/成绩/课表">🎓 教务系统</a>
@@ -985,7 +997,13 @@
             </div>
             <div class="modal-body">
                 <div class="trace-toolbar">
-                    <span class="field-hint">仅显示当前会话的最近 50 轮；追踪在本轮回复产出后异步落库，刚发出的那一轮可能稍有延迟。</span>
+                    <span class="cost-seg" v-if="traceModal.isAdmin" title="管理员可查看全站追踪；普通账号只能看自己名下会话的记录">
+                        <button class="cost-seg-btn" :class="{ 'cost-seg-on': !traceModal.allConversations }"
+                                @click="setTraceScope(false)">本会话</button>
+                        <button class="cost-seg-btn" :class="{ 'cost-seg-on': traceModal.allConversations }"
+                                @click="setTraceScope(true)">全部会话</button>
+                    </span>
+                    <span class="field-hint">{{ traceScopeHint() }}</span>
                     <button class="btn-ghost btn-sm" @click="openTrace" :disabled="traceModal.loading">
                         {{ traceModal.loading ? '加载中…' : '刷新' }}
                     </button>
@@ -1072,7 +1090,7 @@
             </div>
             <div class="modal-body">
                 <div class="trace-toolbar">
-                    <span class="field-hint">全量成本口径：回答本身（agent_trace）+ 路由 / 参数抽取 / 查询改写 / 视觉识别 / 记忆合并（llm_usage）。</span>
+                    <span class="field-hint">全量成本口径：回答本身（agent_trace）+ 路由 / 参数抽取 / 查询改写 / 任务规划 / 视觉识别 / 记忆合并（llm_usage）。</span>
                     <span class="cost-seg">
                         <button v-for="d in [7, 30, 90]" :key="d" class="cost-seg-btn"
                                 :class="{ 'cost-seg-on': costModal.days === d }"
@@ -1119,6 +1137,103 @@
             <div class="modal-foot">
                 <span class="field-hint">token 为模型用量口径，非计费金额；视觉识别为独立请求、记忆合并为后台异步，均计入「辅助调用」。</span>
                 <button class="btn-primary" @click="closeCost">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== 提示词回归评测弹窗 =====
+         用途：改完 prompts.yaml 后跑一批固定用例（eval-cases.yaml），与上一批对比，看「新增失败」清单。
+         只断言可确定的部分（路由命中哪个 agent、是否不路由、是否回答追问、计划步数与包含的 agent），
+         不判答案质量 —— 判答案质量得让 LLM 当裁判，裁判自身不稳定会让回归结果失去可比性。
+         用例写错（如引用了不存在的 agentCode）单独标为「配置错误」，不计入失败，避免污染提示词质量判断。 -->
+    <div class="modal-mask" v-if="evalModal.open" @click.self="closeEval">
+        <div class="modal modal-trace modal-eval">
+            <div class="modal-head">
+                <span>🧪 提示词回归评测</span>
+                <button class="modal-close" @click="closeEval">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="trace-toolbar">
+                    <span class="cost-seg">
+                        <button v-for="s in evalScenarios" :key="s.value" class="cost-seg-btn"
+                                :class="{ 'cost-seg-on': evalModal.scenario === s.value }"
+                                @click="evalModal.scenario = s.value; loadEvalCases()">{{ s.label }}</button>
+                    </span>
+                    <span class="field-hint">用例 {{ evalModal.caseCount }} 条</span>
+                    <button class="btn-primary btn-sm" @click="runEval" :disabled="evalModal.running">
+                        {{ evalModal.running ? '跑批中…' : '▶ 跑一批' }}
+                    </button>
+                </div>
+                <div v-if="evalModal.error" class="trace-empty">{{ evalModal.error }}</div>
+
+                <!-- 本次跑批结果 -->
+                <div v-if="evalModal.result" class="eval-section">
+                    <div class="trace-block-title">本次结果</div>
+                    <div class="eval-summary">
+                        <span class="eval-stat eval-stat-pass">{{ evalModal.result.passed }} 通过</span>
+                        <span class="eval-stat eval-stat-fail">{{ evalModal.result.failed }} 失败</span>
+                        <span class="eval-stat eval-stat-config" v-if="evalModal.result.configErrors">
+                            {{ evalModal.result.configErrors }} 配置错误</span>
+                        <span class="field-hint">共 {{ evalModal.result.total }} 条，耗时 {{ evalModal.result.costMs }}ms</span>
+                    </div>
+                    <div class="eval-list">
+                        <div v-for="r in evalModal.result.results" :key="r.caseName"
+                             class="eval-item" :class="evalItemClass(r)">
+                            <div class="eval-item-head">
+                                <span class="eval-item-name">{{ r.caseName }}</span>
+                                <span class="eval-item-tag">{{ evalTag(r) }}</span>
+                            </div>
+                            <div class="eval-item-line">
+                                <span class="eval-item-key">实际</span><span>{{ r.actual }}</span>
+                            </div>
+                            <div class="eval-item-line" v-if="r.failure">
+                                <span class="eval-item-key">{{ r.configError ? '原因' : '差异' }}</span>
+                                <span>{{ r.failure }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 最近两批对比：改完提示词最该看的一屏（broken = 这次改坏了） -->
+                <div v-if="evalModal.compare" class="eval-section">
+                    <div class="trace-block-title">最近两批对比</div>
+                    <div class="field-hint eval-diff-head">
+                        基准 {{ evalModal.compare.fromPassed }}/{{ evalModal.compare.fromTotal }}
+                        → 本批 {{ evalModal.compare.toPassed }}/{{ evalModal.compare.toTotal }}
+                    </div>
+                    <div class="eval-diff-row eval-diff-broken" v-if="evalModal.compare.broken.length">
+                        <span class="eval-diff-label">新增失败</span>
+                        <span>{{ evalModal.compare.broken.join('、') }}</span>
+                    </div>
+                    <div class="eval-diff-row eval-diff-fixed" v-if="evalModal.compare.fixed.length">
+                        <span class="eval-diff-label">已修复</span>
+                        <span>{{ evalModal.compare.fixed.join('、') }}</span>
+                    </div>
+                    <div class="eval-diff-row" v-if="evalModal.compare.stillFailed.length">
+                        <span class="eval-diff-label">一直失败</span>
+                        <span>{{ evalModal.compare.stillFailed.join('、') }}</span>
+                    </div>
+                    <div class="eval-diff-row eval-diff-none"
+                         v-if="!evalModal.compare.broken.length && !evalModal.compare.fixed.length && !evalModal.compare.stillFailed.length">
+                        两批结果一致，无变化。
+                    </div>
+                </div>
+
+                <!-- 历史批次：确认批次有没有落上、以及每次的通过率走向 -->
+                <div v-if="evalModal.batches.length" class="eval-section">
+                    <div class="trace-block-title">历史批次（保留最近 20 批）</div>
+                    <div class="eval-batch" v-for="b in evalModal.batches" :key="b.batchId">
+                        <span class="eval-batch-time">{{ fmtTime(b.batchAt) }}</span>
+                        <span class="eval-batch-stat">{{ b.passed }}/{{ b.total }}</span>
+                        <span class="eval-batch-extra" v-if="b.failed">失败 {{ b.failed }}</span>
+                        <span class="eval-batch-extra" v-if="b.configErrors">配置错误 {{ b.configErrors }}</span>
+                        <span class="eval-batch-extra" v-if="b.scenario">{{ b.scenario }}</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <span class="field-hint">评测跑的是真实调用，消耗计入成本看板且会话 ID 标记为 {{ '__eval__' }}，不与真实对话混算。</span>
+                <button class="btn-primary" @click="closeEval">关闭</button>
             </div>
         </div>
     </div>

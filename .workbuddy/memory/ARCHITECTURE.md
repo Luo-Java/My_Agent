@@ -92,6 +92,41 @@
   （2026-09-29）：它与登录流程冲突 —— 启用后连 `POST /api/auth/login` 都会被拒（前端登录请求只带
   `Authorization`，不带 `X-Api-Key`），用户进不来；而 `/api/**` 已由 JWT 全覆盖，机器调用也得先登录。
 
+- **token 内部约定（踩过的坑，逐条都有实测）**
+  - **有效期用自定义 claim `expMs`（毫秒），不用标准 `exp`**：Hutool 对 claims 里 `Date` 的序列化单位属
+    其内部约定，依赖它会出「一签发就过期」的**静默**故障（不抛异常，只是每次校验都判已过期）。
+  - **`app.jwt.expire-minutes` 是 `int`，没绑上就是 0**（原始字段无初始值）⇒ 0 分钟 = 签发即过期，症状是
+    「登录成功后进页面又被要求登录」，且日志里什么都没有。`JwtTokenService` 已收敛为 ≤0 → WARN + 回落 720，
+    构造期 INFO 打出生效 TTL。`JwtProperties` 的 `enabled` 默认 true（配错也拦）、`secret` 默认空。
+    判断鉴权异常**先看这几条默认值**。
+  - **密钥指纹进启动日志**：`登录鉴权已启用：token 有效期 N 分钟，签名密钥 N 字节 / 指纹 xxxxxxxx`
+    （密钥的 SHA-256 前 8 位，只用于跨重启比对，密钥本身不进日志）。看到 `BAD_SIGNATURE` 先比指纹：
+    变了 ⇒ token 由更早密钥签发，重新登录即可；没变 ⇒ 不是密钥问题，查并发验签（下一条）。
+    本机实测（2026-09-22）：未设 `JWT_SECRET`，生效的是 `application.yaml` 里的固定默认值，指纹跨重启不变。
+    注意 `${JWT_SECRET:默认值}` 的默认值在环境变量**被显式设成空串**时**不生效**。
+  - **`JWTSigner` 绝不能共享（2026-09-22 定案的真凶）**：Hutool `HMacJWTSigner` 内含**一个**
+    `javax.crypto.Mac`（非线程安全），而它 `verify()` 是「重新签一遍再比对字符串」⇒ 把 signer 存成
+    字段/单例，并发请求会互相污染 HMAC 计算，**同一份合法 token 会被判 `BAD_SIGNATURE`**（连带 `MALFORMED`）。
+    实测（真实编译产物，Hutool 5.8.38）：16 线程 × 100 共享 signer → `OK=232 / BAD_SIGNATURE=1288 /
+    MALFORMED=80`；共享 signer 并发 `issue()` → 800 次里 600 次「签发即无效」。修法：字段只留密钥 `byte[]`，
+    `issue()`/`verify()` **每次现建** `JWTSignerUtil.hs256(secret)`（改后 1600/1600 通过、签发 800/800 有效）。
+    线上症状是**「登录成功后一进页面点几下就被要求重新登录」**——页面挂载并发发起 5 个接口，总有几个被
+    误判 ⇒ 前端把本来有效的登录态清掉。复现（当前进程实测过）：同一份合法 token 并发打接口，会出现
+    部分 401 `BAD_SIGNATURE`（串行必现 200）—— 见上「串行 curl 永远复现不出并发问题」。
+  - **`BAD_SIGNATURE` 的判读顺序**：先排除「并发验签不可靠」（上条），再谈「token 由另一把密钥签发」。
+    **串行 curl 永远复现不出并发问题** —— 判定服务端是否可靠要看并发分布，不是单次结果。
+  - **401 必须能说清原因**：`JwtTokenService.verify()` 返回 `TokenCheck`（`NO_TOKEN`/`MALFORMED`/
+    `BAD_SIGNATURE`/`MISSING_EXPIRY`/`EXPIRED`/`NO_SUBJECT`），拦截器把它写进响应体 `reason` + 落 WARN，
+    前端用 `resp.clone()` 读 `message` 原样展示。**别再退化成一句笼统的「登录已失效」**——那会让
+    「头没到服务端」和「密钥换过」无法区分。
+  - **手写的 401/403 响应必须与其余接口同形状**：拦截器里**别用 `setCharacterEncoding` + `getWriter`**
+    （Tomcat 会追加 `;charset=UTF-8`，而 Jackson 输出的是 `application/json`）—— 同一 API 两种响应头形状
+    会被误读成「带 charset 的请求才 401」。直接 `getOutputStream().write(utf8Bytes)`。
+  - **角色闸门**：`@RequireRole(SysRoleCode.ADMIN)`（拦截器读 `HandlerMethod` 注解，**不引 AOP**），
+    不通过 403 `ROLE_DENIED`。**权限刻意不入 token**：拦截器每请求回库取状态+角色 ⇒ 改角色/停用立即生效。
+    当前三处：`/api/user/**`、`/api/role/**`、`/api/cost/**`。**至少留一个启用的 ADMIN**：删除/停用/摘角色
+    共用 `assertAdminRemains`，防最后一个管理员把自己锁在管理端外。
+
 ---
 
 ## 二、记忆 / 上下文窗口
@@ -272,11 +307,43 @@
 ### 有界工具循环（2026-09-21）
 Spring AI 2.0 工具调用**天生 do…while 循环**（返回 toolCall 就执行、拼回再调，直到停止），默认**无迭代上限**，模型反复调同一工具会死循环。"工具组合调用"要做的不是实现循环，而是**装刹车**：覆盖 `ToolCallingAdvisor.Builder<?>` bean（默认来自 `ChatClientAutoConfiguration`，`@ConditionalOnMissingBean`），自建 `BoundedToolCallingAdvisor`（ThreadLocal 计数 + 软刹车 `augmentSystemMessage`），配置 `agent.tool-call.*`（`max-iterations=10` / `repeat-threshold=3`）。
 
-### 成本看板（独立 `llm_usage` 流水表，2026-09-21）
-7 处裸 `ChatModel.call()`（视觉 / 记忆合并 / 路由 / 参数抽取 / 改写）生命周期无法都塞进当轮 RoundTrace，故**不硬塞**，新增旁路表 `llm_usage`，5 处裸调用各记一条（purpose=ROUTE/CLARIFY/REWRITE/VISION/MEMORY_MERGE）；`CostService` 聚合 `llm_usage`（全量裸调用）+ `agent_trace`（回答本身）。聚合 SQL 用 `@Select` + `DATE_FORMAT` GROUP BY（项目此前无 @Select 先例）。
+### 成本看板（独立 `llm_usage` 流水表，2026-09-21；2026-09-29 补 PLAN、2026-09-30 限 ADMIN）
+7 处裸 `ChatModel.call()`（视觉 / 记忆合并 / 路由 / 参数抽取 / 改写 / 任务规划）生命周期无法都塞进当轮 RoundTrace，故**不硬塞**，新增旁路表 `llm_usage`，各处裸调用各记一条（purpose=ROUTE/CLARIFY/REWRITE/**PLAN**/VISION/MEMORY_MERGE）；`CostService` 聚合 `llm_usage`（全量裸调用）+ `agent_trace`（回答本身）。聚合 SQL 用 `DATE_FORMAT` GROUP BY（2026-09-29 已由 `@Select` 迁到 XML）。**接口与前端入口都限 ADMIN**：看板是**全站聚合**口径，聚合成一行「今天花了多少 token」后就分不出是谁的 ⇒ 按归属收敛技术上做不到，按人拆分又会暴露他人用量对比。
 
 ### 提示词外置约定（2026-09-01）
 提示词集中外置到 `prompts.yaml`（`agent.prompt.*`），动态变量用 `{占位符}` 模板、**运行时替换**（不用 String.format，规避 % 与 MessageFormat 大括号转义冲突）；yaml 里写**字面 JSON 花括号必须转义 `\{ \}`**（ST4 把 `{...}` 当表达式，否则抛 'true' came as a complete surprise），中文尖括号 `<...>` 在 `{ }` 分隔符下安全。改提示词改 yaml 即可、无需重编译。
 
 ### ChatMemory 装配唯一性（2026-09-12，坑勿踩）
 `DbChatMemory` 仅靠 `ChatMemoryConfig` 的 `@Bean @ConditionalOnMissingBean(ChatMemory.class)` 注册（类上无 stereotype 注解）；**别在任何别处再定义 `@Bean ChatMemory`**（两个用户配置类顺序不确定 → `NoUniqueBeanDefinitionException`）。Spring AI 自带 `MessageWindowChatMemory` 自动配置因条件不成立被跳过，但其 `InMemoryChatMemoryRepository` 成孤儿 bean（无害，但注入 `ChatMemoryRepository` 会意外拿到内存版）。
+
+---
+
+## 十、教务（edu）分层与接口约定
+
+- 每表 `XxxController` + `XxxService extends IService<T>` / `XxxServiceImpl extends ServiceImpl<M,T>`，**不自拷贝 MP 基类**；**接口风格统一为命令式**（无 RESTful 分支）：`POST /{表}/page`（body = `XxxDTO`，筛选走 body）、`GET /{表}/list`（下拉，只回 `OptionVO{id,label}`）、`GET /{表}/{id}`、`POST /save`、`PUT /update`（id 在 body）、`DELETE /delete/{id}`。
+- 分页口径唯一在 `BaseBO`（缺省 10、上限 100）：**有 join 的表** → `XxxDTO`/`XxxVO` + `selectXxxPage` 写 `mapper/edu/*.xml`；**无外键的 subject/semester/period** → `LambdaQueryWrapper`，不写 XML。
+- 写规则收在各自 Impl，不散到 Controller：`requireUnique(e, selfId)`（新增传 null、编辑排除自身）、删除前 `count()` 其他表做引用校验、冲突与不存在分别抛 `CONFLICT`/`NOT_FOUND`。
+- 跨表只读聚合走 `EduQueryService`（`/api/edu/score-detail` 等**顶层**路径，禁改嵌套）与 `EduMetaService.dashboard()`；**`/api/edu/dict` 已删**，选项一律各表自取。
+- 4 个关联查询**都是分页接口**（口径只在 `BaseBO`，别在 controller 再声明一份 `MAX_SIZE`），统一回 `PageResult`；筛选不传即不过滤，SQL 全是可选 `<if>`。各配 `XxxDTO extends BaseBO`（`ScoreDetailDTO`/`ScoreStatsDTO`/`TimetableDTO`/`ScheduleDTO`），Controller 用 `@ModelAttribute` 收参、**方法体只转发**，Mapper 收 `@Param("dto")` 返 `List<XxxVO>`，**查询行一律类型化投影、不许回 `Map`**（`ScoreDetailVO`/`ScoreStatsVO`/`TimetableVO`/`ScheduleVO`，XML `resultType` 写全类名），分页对象由 `dto.toPage()` 出。
+- **edu 层注入一律 `@Resource` 字段注入**（别用构造器注入）；**统一返回** `RestResult{code,message,data}` + `PageResult{records,total,page,size,pages}`，异常由 `GlobalExceptionHandler` 同形状返回，**改返回体必须同步前端解包**（edu.js 取 `.data`）。
+- **mapper 的显式 SQL 一律落 XML**（路径 `resources/mapper/<pkg>/XxxMapper.xml`，namespace=接口全类名），禁止 `@Select`/`@Update` 等注解；纯 `BaseMapper` / `LambdaQueryWrapper` 的 mapper 不需要 XML 文件（2026-09-29 已把 `AgentTraceMapper`/`LlmUsageMapper` 的 `@Select` 迁到 XML）。Mapper 返 `List` 必须配 `PageResult.of(ipage, list)`（插件只回填 total/pages，**不回填 records**）；方法名别用 `selectPage`（撞 MP `BaseMapper.selectPage`）。
+- **`resultType` 指向 record 时的两类硬约束（2026-09-30 由 `aggregateOverview` 先后踩出，两次都只在运行期炸）**：
+
+  **A 类 · 列数与列序**：MyBatis 对「有参构造、无默认构造」的类型走**构造器自动映射**（`DefaultResultSetHandler#createResultObject` → `createByConstructorSignature`），本项目未开 `mybatis-plus.configuration.arg-name-based-constructor-auto-mapping`（`MybatisConfiguration` 只默认改 `mapUnderscoreToCamelCase`），故走**列序映射** `applyColumnOrderBasedConstructorAutomapping`：
+  ① **构造器参数个数必须 == 结果集列数**，多一个直接 `ExecutorException`（3.5.19 源码 L787 显式 `parameterTypes.length > rsw.getClassNames().size()` 抛错）——**编译期无感、运行期 500**；
+  ② **顺序必须与 SELECT 列序一致**（按位置映射，列名只用于挑 typeHandler；开按名映射时才会校验 `@Param`/`-parameters` 参数名，缺列同样抛）；
+  ③ 因此**派生指标不入 SELECT**：做成 record 上的方法 + `@JsonProperty("x")` 显式命名（实测 Jackson 3 `tools.jackson` 会把它序列化进 JSON，非分量方法即使叫 `getXxx` 也认）。备选是 bean 投影（按 setter 映射、不看个数，见 `EvalBatchSummary`）。
+
+  **B 类 · 聚合值不得为 NULL**：record 的分量是 primitive（`long`），而反射构造接不住 null ⇒
+  `IllegalArgumentException: Error instantiating class ... with invalid types (long,long,...) or values (0,null,0,0,0)`。
+  SQL 聚合又恰好在**零行**时返回 NULL（`COUNT(*)` 例外；`SUM/AVG/MAX/MIN` 全是 NULL），两头一夹就炸。写法：
+  计数用 `COUNT(CASE WHEN ... THEN 1 END)`（COUNT 恒非 NULL，不需要 COALESCE）；求和/均值用 `COALESCE(SUM(...), 0)` / `COALESCE(AVG(...), 0)`。
+  ⚠ 它只在「窗口内一行都没有」时触发 —— 有数据的窗口永远测不出来：2026-09-30 实测默认近 30 天正常，点「近 7 天」直接 500，
+  且同一句里只有 `errors` 那一列漏包了 COALESCE（其余列当时包过，才没跟着一起炸）。
+  接收方是包装类时不炸：`AnswerAgg`/`UsageAgg` 的 `totalTokens` 是 `Long`，`ScoreStatsVO` 的均/最高/最低分是 `BigDecimal`
+  （成绩统计的 NULL 表达「这组没有成绩」，包成 0 反而变成「平均分 0 分」，是错的）。所以判据是「**接收方能不能接住 null**」，
+  不是「写法好不好看」——一刀切禁止裸聚合会把有语义的 NULL 也一起抹平。
+
+  自检脚本：`python .workbuddy/tools/check_record_projection_columns.py`（A 类：比对顶层列数与 record 分量数）、
+  `python .workbuddy/tools/check_mapper_null_aggregates.py`（B 类：裸聚合 + primitive 接收判为高风险，自带 `--self-test`）。
+  **改 mapper 或改投影类型后两个都跑一遍**。

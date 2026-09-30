@@ -65,8 +65,17 @@ public class AgentRoundHandler implements RoundHandler {
         // 与另两段互不依赖，提前并发能压掉整整一个往返的延迟（见 ChatComposer#prefetchRetrievalQuery）。
         // 未开 RAG 返回 null、零额外调用；本轮若走追问分支则结果作废（刻意接受的轻微浪费）。
         CompletableFuture<String> prefetchedQuery = composer.prefetchRetrievalQuery(conversationId, message, conv);
+        if (prefetchedQuery != null) {
+            // 改写是异步预取，这里只播「已启动」；真正落地要等 resolveQuery join（在 buildRequest 内），
+            // 不在此回显结果——改写产物是「检索问题」，用户能感知的是「要不要检索 / 命中什么」，不是中间问句。
+            progress.accept("🔎 正在改写检索问句…");
+        }
         // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
         boolean explicitBinding = AgentBindSource.EXPLICIT.equals(conv.getAgentBindSource());
+        // 路由判定是前置链里最重的一段 LLM 往返（普通会话未绑定时每次都要跑），先给反馈，避免「发送后 2~3 秒空白」。
+        if (conv != null && conv.getAgentId() == null) {
+            progress.accept("🧭 正在判断走哪个智能体…");
+        }
         Agent agent = determineAgent(conv, message);
 
         // 话题切换预检：仅当会话处于「追问绑定(CLARIFY)」时。携带「待回答的追问」重新审视本轮消息的真实意图，
@@ -98,6 +107,11 @@ public class AgentRoundHandler implements RoundHandler {
             progress.accept("🤖 已交由智能体「" + agent.getName() + "」处理");
         }
 
+        // 参数抽取/追问判断也是 LLM 往返（带 paramSchema 的智能体才会跑），先给反馈。只有确实进入该环节才播，
+        // 避免普通智能体/闲聊也弹一条「正在抽取参数」误导用户。
+        if (agent != null && agent.getParamSchema() != null && !agent.getParamSchema().isBlank()) {
+            progress.accept("📝 正在识别所需参数…");
+        }
         ParamFillingService.ClarifyDecision decision = paramFillingService.decideClarify(conversationId, message, agent);
         if (decision.getQuestion() != null) {
             // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮回答能复用同一 agent。

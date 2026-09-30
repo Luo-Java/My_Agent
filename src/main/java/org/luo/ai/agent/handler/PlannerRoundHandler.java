@@ -14,6 +14,7 @@ import org.luo.ai.service.TaskService;
 import org.luo.ai.chat.ChatComposer;
 import org.luo.ai.agent.PlannerService;
 import org.luo.ai.agent.PlannerService.PlanStep;
+import org.luo.ai.properties.PlannerProperties;
 import org.luo.ai.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -43,6 +44,10 @@ import org.luo.ai.service.KbSearchService;
  * <b>跨轮任务状态持久化</b>：一轮规划落库为一条 {@code task} + 若干 {@code task_step}，每步执行完即增量提交
  * 状态与产出（{@link TaskService}），服务重启 / 中断后可由 {@link #resumeTask} 显式续跑剩余步骤（不重新规划）。
  * 单会话单 RUNNING 任务，开新规划前自动结旧（见 {@link TaskService#cancelRunning}）。
+ * <p>
+ * <b>前驱产出有配额上限</b>：步骤间产物传递经 {@link #truncateUpstream} 按 {@link PlannerProperties} 的配额截断，
+ * 超额保留前段 + 显式省略标注 + WARN。配额只作用于「注入下一步的输入」，不影响 {@code task_step.output} 落库
+ * 与最终回复——用户看到的始终是完整产出。
  */
 @Slf4j
 @Service
@@ -59,18 +64,22 @@ public class PlannerRoundHandler implements RoundHandler {
     private final TaskService taskService;
     /** 规划步骤并行执行线程池（无依赖步骤同层并发调 LLM）。 */
     private final Executor stepExecutor;
+    /** 步骤间产物传递配额（见 {@link PlannerProperties}）：防前驱产出无界累积击穿模型上下文。 */
+    private final PlannerProperties plannerProperties;
 
     public PlannerRoundHandler(PlannerService plannerService,
                                AgentService agentService,
                                ChatComposer composer,
                                ChatMemory chatMemory,
                                TaskService taskService,
+                               PlannerProperties plannerProperties,
                                @Qualifier("plannerStepExecutor") Executor stepExecutor) {
         this.plannerService = plannerService;
         this.agentService = agentService;
         this.composer = composer;
         this.chatMemory = chatMemory;
         this.taskService = taskService;
+        this.plannerProperties = plannerProperties;
         this.stepExecutor = stepExecutor;
     }
 
@@ -429,11 +438,15 @@ public class PlannerRoundHandler implements RoundHandler {
         }
         if (taskId != null && s.stepId() != null) taskService.markStepRunning(s.stepId());
         try {
-            // 长期记忆对所有步骤注入；已确认参数只在首层（idx==0）注入；汇总步（最后一步）追加近期窗口历史。
+            // 上下文分三档注入：首层吃「已确认参数」，汇总步（最后一步）追加「近期窗口历史」，中间步骤默认
+            // 「隔离长期记忆」。中间步的活是「拿前驱产物做自己那一段」，会话级 core_facts / summary 对它
+            // 多半是噪音——摘要里可能是别的话题的内容，反而把这一步带偏（开关见 agent.planner.isolate-middle-steps）。
+            // RAG 资料不参与隔离：每步 query 不同、按各自需要检索，与「会话记忆」不是一回事。
+            boolean isolateMemory = !isLastStep && idx != 0 && plannerProperties.isolateMiddleStepsOn();
             KbSearchService.KbContext kb = composer.buildKbContext(composer.ragOn(conv), s.agent(), userInput);
             String system = composer.applyRealtimeRule(composer.buildSystemPrompt(s.agent())
                     + kb.text()
-                    + composer.buildLongTermMemoryText(conv)
+                    + (isolateMemory ? "" : composer.buildLongTermMemoryText(conv))
                     + (idx == 0 && paramBlock != null ? paramBlock : "")
                     + (isLastStep && !historyContext.isBlank() ? historyContext : ""));
             ChatClient.ChatClientRequestSpec spec = composer.internalChatClient()
@@ -462,7 +475,16 @@ public class PlannerRoundHandler implements RoundHandler {
         }
     }
 
-    /** 构造单步输入：无依赖 → 原始目标（+附件）；有依赖 → 各前驱输出按序拼接，前驱为空则回落原始目标说明。 */
+    /**
+     * 构造单步输入：无依赖 → 原始目标（+附件）；有依赖 → 各前驱产出按序拼接，前驱为空则回落原始目标说明。
+     * <p>
+     * <b>前驱产出按配额截断</b>（见 {@link PlannerProperties#perUpstreamChars}）：每个前驱最多注入配额内的字符，
+     * 超额部分省略并追加显式标注 + WARN。改造前这里是全量拼接、无任何上限，多步长产出会随「步骤数 × 单步长度」
+     * 无界累积、最终击穿模型上下文（静默失败：模型丢内容但不报错）。
+     * <p>
+     * 每段前驱产出都带来源标注：多前驱拼接后，模型要能分清「哪段来自哪一步」，省略标注才不会被误读成
+     * 上一步的内容。
+     */
     private String buildStepInput(StepSpec s, String[] outputs, String firstInput, String material, int n) {
         List<Integer> deps = validDeps(s, n);
         if (deps.isEmpty()) {
@@ -472,20 +494,37 @@ public class PlannerRoundHandler implements RoundHandler {
             }
             return base;
         }
+        int quota = plannerProperties.perUpstreamChars(deps.size());
         StringBuilder sb = new StringBuilder();
         boolean any = false;
         for (int d : deps) {
             String depOut = outputs[d];
-            if (depOut != null && !depOut.isBlank()) {
-                sb.append(depOut).append("\n\n");
-                any = true;
-            }
+            if (depOut == null || depOut.isBlank()) continue;
+            sb.append("[步骤 ").append(d + 1).append(" 的产出]\n")
+                    .append(truncateUpstream(depOut, quota))
+                    .append("\n\n");
+            any = true;
         }
         if (!any) {
             // 前驱全部失败/空：不能把空串当产物，回落原始目标并显式说明
             sb.append("（前置步骤未产出可用结果，请基于原始目标作答）\n").append(firstInput);
         }
         return sb.toString().strip();
+    }
+
+    /**
+     * 按配额截断单段上游产出：未超配额原样返回；超出则保留前段 + 追加省略标注并落 WARN。
+     * <p>
+     * 保留<b>前段</b>而非尾段：LLM 产出通常是「结论在前、展开在后」，前段信息密度更高。
+     * 截断一律留下标注与日志——静默截断会让「模型答偏」变成查不出原因的谜。
+     */
+    private String truncateUpstream(String text, int quota) {
+        if (text.length() <= quota) return text;
+        int omitted = text.length() - quota;
+        log.warn("规划步骤产出超配额已截断：原长 {} 字符 → {} 字符（省略 {} 字符，配额见 agent.planner.*）",
+                text.length(), quota, omitted);
+        return text.substring(0, quota)
+                + "\n…（该步骤产出过长已截断，后续省略 " + omitted + " 字符；不要基于被省略的内容作答）";
     }
 
     /** 通用助手兜底回答（无智能体绑定、不挂载工具）：用于规划回退或目标无关时。附件材料仅当轮注入 system；RAG 引用随结果带回。 */

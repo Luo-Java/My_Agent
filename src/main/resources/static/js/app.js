@@ -328,6 +328,13 @@ const app = createApp({
         // 顶栏登录用户区（用户名 + 下拉菜单）不在这里 —— 整块由 js/auth.js 渲染到 data-auth-nav
         // 挂载点上，四页共用同一份实现，本页不再持有任何登录态判断或退出逻辑。
 
+        // 但「按角色显隐的顶栏入口」必须由本页自己持有：💰 成本看板是 ADMIN 专属
+        // （后端 CostController 标了 @RequireRole(ADMIN)），普通账号不该看到一个点了就 403 的按钮。
+        // 在 setup 里取一次存进 ref —— Auth.getUser() 读的是 localStorage，不是响应式的，
+        // 模板里直接写 Auth.hasRole('ADMIN') 只会求值一次且不会随登录态变化重算。
+        // 取不到（Auth 未加载 / 本地无 user）一律当非管理员：UI 侧失败关闭，真正的闸门在后端。
+        const isAdmin = ref(!!(window.Auth && window.Auth.hasRole && window.Auth.hasRole('ADMIN')));
+
         // 输入框「RAG」开关（会话级 RAG 开关）：false=不使用 RAG；true=每轮自动检索
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
         const ragEnabled = ref(false);
@@ -1505,7 +1512,13 @@ const app = createApp({
         // 每轮对话在回复产出后由后端异步落库到 agent_trace，这里只读展示：
         // 回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「调了哪些工具、花了多少 token、耗时多久」。
         // items：追踪列表（按时间倒序）；expanded：按索引记录哪几条展开了明细。
-        const traceModal = reactive({ open: false, loading: false, items: [], expanded: {}, error: '' });
+        // 可见性由后端按「会话归属」判定：普通用户只看得到自己名下会话的记录，ADMIN 走全量视角（可切到「全部会话」）。
+        // isAdmin 必须在打开时从 Auth 取一次存进 reactive —— Auth.getUser() 不是响应式的，
+        // 模板里直接调函数读它，登录态后到也永远不会触发重渲染，切换入口就不出来了。
+        const traceModal = reactive({
+            open: false, loading: false, items: [], expanded: {}, error: '',
+            isAdmin: false, allConversations: false,
+        });
         /** 追踪列表的聚合统计（看板视角）：轮次 / token 合计 / 平均耗时 / 工具调用数 / 错误轮。纯客户端聚合，不改后端。 */
         const traceStats = computed(() => {
             const list = traceModal.items || [];
@@ -1532,20 +1545,46 @@ const app = createApp({
             traceModal.items = [];
             traceModal.expanded = {};
             traceModal.error = '';
+            // 角色在这里定一次：弹窗只有点开才渲染，此时 Auth 早已就绪（页面未解锁时点不到按钮）。
+            traceModal.isAdmin = !!(window.Auth && window.Auth.hasRole && window.Auth.hasRole('ADMIN'));
             try {
-                const q = currentId.value ? ('?conversationId=' + encodeURIComponent(currentId.value)) : '';
+                // 范围：默认限定当前会话。仅 ADMIN 勾了「全部会话」时不带 conversationId ——
+                // 后端据此按角色返回「本人的全部」或「全站全部」，前端不承担归属判定。
+                const scopeAll = traceModal.isAdmin && traceModal.allConversations;
+                const q = (!scopeAll && currentId.value)
+                    ? ('?conversationId=' + encodeURIComponent(currentId.value)) : '';
                 const resp = await apiFetch('/api/trace' + q);
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const list = await resp.json();
                 traceModal.items = Array.isArray(list) ? list : [];
                 if (!traceModal.items.length) {
-                    traceModal.error = '本会话暂无追踪记录（追踪在本轮回复产出后异步落库，可稍后重试）';
+                    traceModal.error = traceScopeEmptyText();
                 }
             } catch (e) {
                 traceModal.error = '加载失败：' + e.message;
             } finally {
                 traceModal.loading = false;
             }
+        }
+        /** 切换追踪范围（仅 ADMIN 可见入口）：切完立即按新范围重查，避免出现「按钮亮了但列表还是旧的」。 */
+        function setTraceScope(all) {
+            if (traceModal.allConversations === all) return;
+            traceModal.allConversations = all;
+            openTrace();
+        }
+        /** 工具栏说明文案：把当前实际生效的可见性范围讲清楚，别让人以为「本会话」永远是对的。 */
+        function traceScopeHint() {
+            if (traceModal.isAdmin && traceModal.allConversations) {
+                return '管理员视图：显示全站所有会话的最近 50 轮（含已删除会话遗留的记录）。';
+            }
+            return '仅显示当前会话的最近 50 轮；追踪在本轮回复产出后异步落库，刚发出的那一轮可能稍有延迟。';
+        }
+        /** 空列表提示：按范围给不同措辞 —— 「本会话没有」和「全站都没有」是两回事。 */
+        function traceScopeEmptyText() {
+            if (traceModal.isAdmin && traceModal.allConversations) {
+                return '暂无追踪记录（追踪在本轮回复产出后异步落库，可稍后重试）';
+            }
+            return '本会话暂无追踪记录（追踪在本轮回复产出后异步落库，可稍后重试）';
         }
         function toggleTrace(i) {
             traceModal.expanded[i] = !traceModal.expanded[i];
@@ -1574,6 +1613,122 @@ const app = createApp({
         // 与「追踪」弹窗（会话级、只算回答成本）不同：这里跨会话聚合 agent_trace（回答本身）与
         // llm_usage（路由/参数抽取/查询改写/视觉/记忆合并等裸调用），做按天趋势 + 按用途拆解。
         const costModal = reactive({ open: false, loading: false, days: 30, data: null, error: '' });
+
+        // ---- 提示词回归评测（改完 prompts.yaml 跑一批固定用例，与上一批对比看「新增失败」）----
+        // 场景切换只影响「跑哪些用例」；每个场景各跑一批、批次独立落库，对比时也各比各的（混场景对比没意义）。
+        // ADMIN 专属（后端 EvalController 标了 @RequireRole(ADMIN)）：「跑一批」是真实模型调用、消耗计入成本流水，
+        // 与成本看板同为「会花钱的运维动作」，顶栏入口按同一角色显隐（见 chat.html 的 v-if="isAdmin"）。
+        const evalScenarios = [
+            { value: '', label: '全部' },
+            { value: 'ROUTE', label: '路由' },
+            { value: 'PLAN', label: '规划' }
+        ];
+        const evalModal = reactive({
+            open: false, scenario: '', caseCount: 0,
+            running: false, error: '', result: null, batches: [], compare: null
+        });
+
+        /** 打开评测弹窗：先读用例集把条数显示出来（点「跑一批」前就该知道会发起多少次模型调用）。 */
+        async function openEval() {
+            evalModal.open = true;
+            evalModal.result = null;
+            evalModal.error = '';
+            await loadEvalCases();
+            await loadEvalBatches();
+        }
+
+        function closeEval() {
+            evalModal.open = false;
+            evalModal.result = null;
+            evalModal.compare = null;
+        }
+
+        /** 只读用例集（不跑批），仅取条数。 */
+        async function loadEvalCases() {
+            try {
+                const resp = await apiFetch('/api/eval/cases' + evalScenarioQuery());
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                evalModal.caseCount = (await resp.json()).length;
+            } catch (e) {
+                evalModal.caseCount = 0;
+            }
+        }
+
+        /** 跑一批。后端同步返回（单批上限 50 条、单条超时 60s），最长可能等数十秒，故按钮期间置忙。 */
+        async function runEval() {
+            evalModal.running = true;
+            evalModal.error = '';
+            try {
+                const resp = await apiFetch('/api/eval/run' + evalScenarioQuery(), { method: 'POST' });
+                // 403 说清楚原因：这是角色不够，不是跑批本身出错。入口已按角色隐藏，
+                // 走到这里多半是「同一浏览器换了小号登录」或角色被管理员摘掉后的残留状态。
+                if (resp.status === 403) throw new Error('评测仅管理员可用（当前账号无 ADMIN 角色）');
+                if (!resp.ok) throw new Error(await evalErrorText(resp));
+                evalModal.result = await resp.json();
+                await loadEvalBatches();
+            } catch (e) {
+                evalModal.error = '跑批失败：' + e.message;
+            } finally {
+                evalModal.running = false;
+            }
+        }
+
+        /** 拉历史批次；有 ≥2 批时顺带算出最近两批的对比。 */
+        async function loadEvalBatches() {
+            try {
+                const resp = await apiFetch('/api/eval/batches');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                evalModal.batches = await resp.json();
+            } catch (e) {
+                evalModal.batches = [];
+            }
+            await loadEvalCompare();
+        }
+
+        /**
+         * 对比最近两批：batches 按批次时间倒序，故 [1] 是基准、[0] 是新批。
+         * <p>不足两批、或某批的用例全是配置错误（后端 404）时不做对比 —— 这是正常情况，不是错误，
+         * 不弹提示（提示了反而让人以为哪里坏了）。
+         */
+        async function loadEvalCompare() {
+            evalModal.compare = null;
+            if (evalModal.batches.length < 2) return;
+            const from = evalModal.batches[1].batchId;
+            const to = evalModal.batches[0].batchId;
+            try {
+                const resp = await apiFetch('/api/eval/compare?from=' + encodeURIComponent(from)
+                    + '&to=' + encodeURIComponent(to));
+                if (!resp.ok) return;
+                evalModal.compare = await resp.json();
+            } catch (e) {
+                evalModal.compare = null;
+            }
+        }
+
+        /** 场景过滤的查询串（空场景 = 全部，不传参数）。 */
+        function evalScenarioQuery() {
+            return evalModal.scenario ? ('?scenario=' + encodeURIComponent(evalModal.scenario)) : '';
+        }
+
+        /** 读后端错误体的 message（统一响应形状 {code,message,data}），读不到则退回 HTTP 状态码。 */
+        async function evalErrorText(resp) {
+            try {
+                const j = await resp.json();
+                if (j && j.message) return j.message;
+            } catch (e) { /* 非 JSON 响应，退回状态码 */ }
+            return 'HTTP ' + resp.status;
+        }
+
+        /** 用例结果的三态样式：配置错误（用例自己写错了）与失败（提示词改坏了）必须能一眼分开。 */
+        function evalItemClass(r) {
+            if (r.configError) return 'eval-config';
+            return r.passed ? 'eval-pass' : 'eval-fail';
+        }
+
+        function evalTag(r) {
+            if (r.configError) return '配置错误';
+            return r.passed ? '通过' : '失败';
+        }
         /** 两个图表实例引用（关闭弹窗时 dispose，避免复用残留）。 */
         let costTrendChart = null, costPurposeChart = null;
 
@@ -1592,6 +1747,9 @@ const app = createApp({
             costModal.error = '';
             try {
                 const resp = await apiFetch('/api/cost/summary?days=' + costModal.days);
+                // 403 说清楚原因：这是角色不够，不是网络或服务端故障。顶栏入口已按角色隐藏，
+                // 走到这里多半是「同一浏览器换了小号登录」或角色被管理员摘掉后的残留状态。
+                if (resp.status === 403) throw new Error('该看板仅管理员可见（当前账号无 ADMIN 角色）');
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const data = await resp.json();
                 costModal.data = data;
@@ -2004,10 +2162,15 @@ const app = createApp({
             strategyLabel, strategyDesc, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
             pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
-            // 链路追踪（可观测）：traceModal + 展示辅助函数
+            // 链路追踪（可观测）：traceModal + 展示辅助函数 + ADMIN 的范围切换
             traceModal, traceStats, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore,
-            // 成本看板（全量成本口径）：costModal + 加载/关闭 + token 格式化
-            costModal, openCost, closeCost, loadCost, fmtTokens
+            setTraceScope, traceScopeHint,
+            // 成本看板（全量成本口径，仅 ADMIN）：costModal + 加载/关闭 + token 格式化
+            costModal, openCost, closeCost, loadCost, fmtTokens,
+            // 页面级角色视点：顶栏按角色显隐的入口都读它（当前仅 💰 成本）
+            isAdmin,
+            // 提示词回归评测：evalModal + 跑批/用例数/批次对比
+            evalScenarios, evalModal, openEval, closeEval, loadEvalCases, runEval, evalItemClass, evalTag
         };
     }
 });

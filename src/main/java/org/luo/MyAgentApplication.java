@@ -1,6 +1,8 @@
 package org.luo;
 
+import org.luo.ai.properties.EvalProperties;
 import org.luo.ai.properties.MemoryProperties;
+import org.luo.ai.properties.PlannerProperties;
 import org.luo.ai.properties.PromptProperties;
 import org.luo.ai.properties.RagProperties;
 import org.luo.ai.properties.ToolCallProperties;
@@ -14,7 +16,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 @SpringBootApplication
 @MapperScan({"org.luo.ai.mapper", "org.luo.edu.mapper", "org.luo.system.mapper"})
 @EnableConfigurationProperties({PromptProperties.class, VisionProperties.class, RagProperties.class,
-        MemoryProperties.class, ToolCallProperties.class, JwtProperties.class})
+        MemoryProperties.class, ToolCallProperties.class, PlannerProperties.class, EvalProperties.class,
+        JwtProperties.class})
 public class MyAgentApplication {
 
     public static void main(String[] args) {

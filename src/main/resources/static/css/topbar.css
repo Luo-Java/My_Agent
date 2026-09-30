@@ -1,0 +1,43 @@
+/* ══ 顶栏胶囊入口（chat / edu / user 三页共用）══
+ *
+ * 装的是顶栏右侧的「跳转到另一个系统」入口：对话页的「追踪 / 成本 / 教务系统」、
+ * 教务页的「AI 对话」、用户管理页的「教务系统」。**样式只此一处** ——
+ * 改这里即三页同时换肤，不必再去 edu.css / user.css 各改一遍。
+ *
+ * 为什么单独一个文件而不是放进某一页的 css：三页各自只引自己的页面样式
+ * （style.css / edu.css / user.css），谁都不引对方的。抽成共用文件后三页显式
+ * <link> 引入，样式是静态依赖、不靠 JS 动态注入（动态注入会出现「首屏按钮先无样式再补上」的一帧闪烁）。
+ *
+ * 色板依赖：--border / --surface / --text / --primary / --primary-text / --primary-soft。
+ * 这三个页面样式文件里这些变量的取值完全一致，所以三页观感无差异。
+ * 靠右对齐不在这里负责：chat 页由父容器 .header-actions 的 margin-left:auto 整体推到最右，
+ * 本类**不带 margin**，否则会与容器的 gap 叠加。
+ */
+
+.nav-pill {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+
+.nav-pill:hover {
+    border-color: var(--primary);
+    color: var(--primary-text);
+    background: var(--primary-soft);
+}
+
+/* 入口是 <a> 时：去掉下划线，并用 inline-flex 居中 —— 让 <a> 与 <button> 两版盒模型一致 */
+a.nav-pill {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+}

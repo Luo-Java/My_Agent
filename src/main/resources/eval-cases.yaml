@@ -1,0 +1,127 @@
+# 提示词回归用例集
+#
+# 用途：改完 prompts.yaml 之后，跑一批固定用例，看决策行为有没有变差。用法见 README「提示词回归评测」。
+#
+# 设计原则
+#   1. 只断言【可确定的部分】——路由到哪个 agent、是否不路由、是否判定为回答追问、计划步数、
+#      计划里包含哪些 agent。不断言「答案写得好不好」：判答案质量得让 LLM 当裁判，而裁判本身不稳定，
+#      同一次改动前后可能给出相反判断，回归结果就失去可比性。
+#   2. 期望值必须忠于 prompts.yaml 里写明的规则（见各条注释的【规则 N】），而不是凭感觉写。
+#      「以为应该这样」和「提示词其实要求那样」是两回事，这种用例跑出来的失败是假失败。
+#   3. 断言别卡太死。模型有自然波动，过严的期望（如精确步数）会持续假失败，用的人很快就学会无视它 ——
+#      那还不如不写。宁可少断言一条，也不要留一条永远红的。
+#
+# expect 支持的键（全部可选，可同时写多条 = 全部通过才算通过）
+#   ROUTE 场景：agentCode / noRoute / continuation
+#   PLAN  场景：planEmpty / minSteps / maxSteps / containsAgents / firstAgent
+#
+# 注意：用例里引用的 agentCode 必须真实存在于 agent 表。编码不存在时该用例会被标成【配置错误】
+# 而不是【失败】——「用例写错」和「prompt 改坏」必须分得开，否则每次跑都红、却不知道该怪谁。
+# 当前编码取自项目内 agent_code.md：A001=翻译官 / A002=天气查询 / A003=java代码助手 / A004=教育数据智能分析。
+
+cases:
+
+  # ==================================================================
+  # 智能路由（agent.prompt.router-system）
+  # ==================================================================
+
+  # 【规则2】一般闲聊、寒暄不路由
+  - name: 闲聊不应触发路由
+    scenario: ROUTE
+    input: "你好呀"
+    expect:
+      noRoute: true
+
+  # 【规则1/3】没有对应智能体可胜任 → 不路由
+  - name: 无对口的通用知识问答不应触发路由
+    scenario: ROUTE
+    input: "什么是递归？"
+    expect:
+      noRoute: true
+
+  # 【规则1】意图与职责高度匹配 → 路由到天气智能体
+  - name: 天气查询应路由到天气智能体
+    scenario: ROUTE
+    input: "深圳明天天气怎么样"
+    expect:
+      agentCode: A002
+
+  # 【规则1】翻译请求 → 翻译官
+  - name: 翻译请求应路由到翻译官
+    scenario: ROUTE
+    input: "把这段话翻译成英文：今天的会议推迟到下午三点。"
+    expect:
+      agentCode: A001
+
+  # 【规则1】编程问题 → java 代码助手
+  - name: 编程问题应路由到代码助手
+    scenario: ROUTE
+    input: "帮我看看 Java 里 HashMap 和 Hashtable 有什么区别"
+    expect:
+      agentCode: A003
+
+  # 【规则1】教育数据分析 → 数据分析智能体
+  - name: 成绩分析应路由到教育数据分析智能体
+    scenario: ROUTE
+    input: "帮我统计一下3年级2班这次期中考试各科的平均分"
+    expect:
+      agentCode: A004
+
+  # 【continue 分支】用户在回答追问 → 判定为继续当前任务，而不是开启新话题。
+  # 这是最容易退化的一条：把「北京」这种短回答误判成新话题，追问链就断了。
+  - name: 回答追问时不应误判为新话题
+    scenario: ROUTE
+    input: "北京"
+    pendingQuestion: "请问你想查哪个城市的天气？"
+    expect:
+      continuation: true
+
+  # 【规则4】短消息承接上一轮话题 → 仍路由到同一智能体（不能因信息不全当普通对话）。
+  # 这条走的是 recentContext，本用例集不提供会话历史（评测无会话），故仅断言「不因短就放弃」——
+  # 即至少路由到天气智能体。若在无上下文场景下模型判定信息不足而追问，会被判失败，属预期内的严格用例。
+  - name: 短消息承接天气话题仍应路由
+    scenario: ROUTE
+    input: "那北京呢"
+    expect:
+      agentCode: A002
+
+  # ==================================================================
+  # 动态规划（agent.prompt.planner-system）
+  # ==================================================================
+
+  # 【规则5】与任何智能体都不相关的闲聊 → 空计划，由通用助手直接回答
+  - name: 闲聊不应触发多智能体编排
+    scenario: PLAN
+    input: "你好呀，随便聊聊"
+    expect:
+      planEmpty: true
+
+  # 【规则2】单智能体即可独立完成 → 只规划 1 步
+  - name: 单领域简单任务应只规划一步
+    scenario: PLAN
+    input: "把 hello world 翻译成中文"
+    expect:
+      minSteps: 1
+      maxSteps: 1
+
+  # 【规则3】多智能体串联 → 多步
+  - name: 跨领域任务应拆成多步
+    scenario: PLAN
+    input: "先把这段英文翻译成中文，再解释其中用到的 Java 设计模式：The singleton pattern ensures a class has only one instance."
+    expect:
+      minSteps: 2
+
+  # 【规则3】数据分析任务需用上分析智能体（可视化由它自带的画图工具完成，不必额外步骤）
+  - name: 成绩分析类目标应包含教育数据分析智能体
+    scenario: PLAN
+    input: "统计3年级2班各科平均分，并把结果画成柱状图"
+    expect:
+      containsAgents: [A004]
+
+  # 【规则7】多步时最后一步是汇总步 —— 用它反推「第一步不是汇总步」：首步应落在具体的执行体上。
+  # 断言首步为数据分析智能体：这个目标的第一步只能是查数据，不该由别的 agent 打头。
+  - name: 数据分析目标的首步应为分析智能体
+    scenario: PLAN
+    input: "找出3年级2班这次期中考试不及格的学生名单"
+    expect:
+      firstAgent: A004

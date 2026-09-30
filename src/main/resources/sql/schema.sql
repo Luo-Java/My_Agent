@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
     model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
     prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
     completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
@@ -144,6 +144,29 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     INDEX idx_usage_conv (conversation_id, created_at),
     INDEX idx_usage_created (created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';
+
+-- 提示词回归评测结果表：一次跑批的每个用例一行，按 batch_id 分组。
+-- 目的与 agent_trace 不同：trace 记「一轮真实对话」的过程，本表记「固定用例集在某一版提示词下的判定结果」，
+-- 让「改完 prompts.yaml 到底变好还是变差」有据可依 —— 改前跑一批、改后跑一批，对比看 broken 清单
+-- （GET /api/eval/compare）。只保留最近 20 个批次（EvalService 跑批后自动清理）：它的价值在
+-- 「和上一次比」，不需要长期归档。
+CREATE TABLE IF NOT EXISTS eval_result (
+    id           BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    batch_id     VARCHAR(32)   NOT NULL                COMMENT '批次ID：同一次跑批的所有用例共用，跨批次对比按它取数',
+    scenario     VARCHAR(16)   NOT NULL                COMMENT '用例场景：ROUTE=智能路由 / PLAN=动态规划',
+    case_name    VARCHAR(128)  NOT NULL                COMMENT '用例名（来自 eval-cases.yaml）；批次间以它对齐身份，改名会被视作一增一删',
+    input        VARCHAR(500)  NOT NULL                COMMENT '用例输入',
+    expected     VARCHAR(500)  DEFAULT NULL            COMMENT '期望值摘要（用例 expect 的文本化）',
+    actual       VARCHAR(500)  DEFAULT NULL            COMMENT '实际值摘要（被测组件真实产出的决策）',
+    passed       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '是否通过',
+    config_error TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '用例自身配置错误（如引用了不存在的 agentCode）：计入本列而非失败，避免「用例写错」污染提示词质量判断',
+    failure      VARCHAR(1000) DEFAULT NULL            COMMENT '失败原因（逐条断言的差异说明）',
+    detail       TEXT          DEFAULT NULL            COMMENT '被测组件的完整原始输出，排查用',
+    cost_ms      INT           NOT NULL DEFAULT 0      COMMENT '该用例耗时（毫秒）',
+    created_at   DATETIME                              COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_eval_batch (batch_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词回归评测结果表：一次跑批每个用例一行，按 batch_id 分组';
 
 -- 规划任务表：一轮规划 = 一条 task + N 条 task_step，落库支撑断点续跑。
 -- 状态机：RUNNING → DONE/FAILED/CANCELLED；单会话单 RUNNING（开新规划任务前自动结旧）。
@@ -220,13 +243,13 @@ CREATE TABLE IF NOT EXISTS task_step (
 
 -- 新增「裸 LLM 调用成本流水」表（全量成本口径）：schema.sql 已含建表语句，这里同样保留一份，
 -- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
--- 与 agent_trace 互补：agent_trace 只记「正式回答+工具循环」token；本表记路由/参数抽取/查询改写/视觉/记忆合并等
+-- 与 agent_trace 互补：agent_trace 只记「正式回答+工具循环」token；本表记路由/参数抽取/查询改写/任务规划/视觉/记忆合并等
 -- 裸 ChatModel.call() 的 token，成本看板据此做全量聚合与按用途（purpose）拆解。
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
     model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
     prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
     completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
@@ -237,3 +260,23 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     INDEX idx_usage_conv (conversation_id, created_at),
     INDEX idx_usage_created (created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';
+
+-- 提示词回归评测结果表（新表，IF NOT EXISTS 幂等）。用于「改完 prompts.yaml 跑一批固定用例、与上一批对比」。
+-- 只保留最近 20 个批次（EvalService 跑批后自动清理），无需归档。
+CREATE TABLE IF NOT EXISTS eval_result (
+    id           BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    batch_id     VARCHAR(32)   NOT NULL                COMMENT '批次ID：同一次跑批的所有用例共用，跨批次对比按它取数',
+    scenario     VARCHAR(16)   NOT NULL                COMMENT '用例场景：ROUTE=智能路由 / PLAN=动态规划',
+    case_name    VARCHAR(128)  NOT NULL                COMMENT '用例名（来自 eval-cases.yaml）；批次间以它对齐身份，改名会被视作一增一删',
+    input        VARCHAR(500)  NOT NULL                COMMENT '用例输入',
+    expected     VARCHAR(500)  DEFAULT NULL            COMMENT '期望值摘要（用例 expect 的文本化）',
+    actual       VARCHAR(500)  DEFAULT NULL            COMMENT '实际值摘要（被测组件真实产出的决策）',
+    passed       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '是否通过',
+    config_error TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '用例自身配置错误（如引用了不存在的 agentCode）：计入本列而非失败，避免「用例写错」污染提示词质量判断',
+    failure      VARCHAR(1000) DEFAULT NULL            COMMENT '失败原因（逐条断言的差异说明）',
+    detail       TEXT          DEFAULT NULL            COMMENT '被测组件的完整原始输出，排查用',
+    cost_ms      INT           NOT NULL DEFAULT 0      COMMENT '该用例耗时（毫秒）',
+    created_at   DATETIME                              COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_eval_batch (batch_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词回归评测结果表：一次跑批每个用例一行，按 batch_id 分组';

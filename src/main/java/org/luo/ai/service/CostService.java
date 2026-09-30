@@ -41,6 +41,7 @@ public class CostService {
             "ROUTE", "智能路由",
             "CLARIFY", "参数抽取",
             "REWRITE", "查询改写",
+            "PLAN", "任务规划",
             "VISION", "视觉识别",
             "MEMORY_MERGE", "记忆合并");
 

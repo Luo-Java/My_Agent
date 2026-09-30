@@ -74,6 +74,20 @@ agent:
     min-keep-messages: 2      # 至少保留的最近消息条数，防历史窗口塌缩变空(0=关闭)
     max-message-chars: 4000   # 单条消息进上下文前的字符上限，超出截断(0=不截断)
 
+  # 规划步骤间产物传递(PlannerProperties)：给「前驱产出拼进下一步」装上限，防多步长产出无界累积击穿上下文
+  # 实际配额 = min(upstream-max-chars, upstream-total-chars / 前驱个数)；两个都必须为正(不支持关闭)
+  # 截断会保留前段并追加省略标注 + WARN，不静默；只影响注入下一步的输入，不影响落库与最终回复
+  planner:
+    upstream-max-chars: 4000     # 单个前驱产出注入下一步的字符上限
+    upstream-total-chars: 12000  # 全部前驱产出合计上限，按前驱个数均分
+    isolate-middle-steps: true   # 中间步骤(非首层非末步)不注入长期记忆(core_facts/summary)，避免被别的话题的摘要带偏
+
+  # 提示词回归评测(EvalProperties)：跑固定用例集断言路由/规划决策，改完 prompts.yaml 跑一批并和上一批对比
+  # 用例集位置用 Spring Resource 语法；想免重编译调试可改成 file:./eval-cases.yaml
+  eval:
+    cases-file: classpath:eval-cases.yaml
+    timeout-seconds: 60         # 单用例超时，超时记该条失败而不拖垮整批(被测调用自身没有 per-request 超时)
+
   # 工具循环控制(ToolCallProperties)：给 Spring AI 默认无限工具循环装刹车，防死循环/重复调用拖垮 token
   tool-call:
     max-iterations: 10        # 模型往返轮数硬顶，覆盖「查表→查数→画图」这类合理长链，只兜底真死循环

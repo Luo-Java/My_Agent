@@ -17,9 +17,10 @@
 - **参数追问补全**：智能体用 `paramSchema`（JSON 数组）声明参数；缺失必填项时自动追问（上限 3 轮），参数齐全才正式回答。跟进任务会继承上一轮已明确的参数（如「今天」→ 日期=今天）。追问状态**无显式存储**，每轮从历史重放推导，天然跨重启一致。
 - **动态规划（Planner）**：会话级 🧭 开关开启后，由 LLM 运行时把用户目标拆成多智能体步骤并**按依赖并行**执行；执行过程实时展示、不写入记忆。规划模式与绑定智能体互斥。**任务状态持久化**：每轮规划落库 `task`/`task_step`，服务重启/中断后可点「继续执行」显式续跑剩余步骤（不重新规划）。
 - **双层记忆**：短期窗口（`chat_message` 原文，受 token 预算与条数下限约束）+ 长期滚动摘要（`conversation.summary` / `core_facts`）；超窗历史异步压缩合并，**先推回复、后处理记忆**。
-- **流式输出**：SSE 推送 `token`（正文，进记忆）、`progress`（执行过程，不进记忆）、`citations`（引用来源）、`ping`（心跳）、`error` 等事件，前端逐字渲染。
-- **链路追踪**：每轮对话的路由来源、规划步骤、改写后检索问句、RAG 命中、工具调用（参数/结果/token/耗时）异步落库 `agent_trace`；页面 🔍 追踪弹窗可查看本会话最近 50 轮。
-- **成本看板**：全量成本口径——除「回答本身」（`agent_trace`）外，路由判定/参数抽取/查询改写/视觉识别/记忆合并这些裸 `ChatModel` 调用也各自记入 `llm_usage`（按用途 `purpose` 拆解）；页面 💰 成本弹窗按天趋势 + 按用途聚合展示（近 7/30/90 天）。
+- **流式输出**：SSE 推送 `token`（正文，进记忆）、`progress`（执行过程，不进记忆）、`citations`（引用来源）、`ping`（心跳）、`error` 等事件，前端逐字渲染。**前置链也有实时反馈**：发送后到首个 token 之间，路由判定 / 参数抽取 / 检索问句改写各环节都会先推一条 `progress`，不再是一片空白干等。
+- **链路追踪**：每轮对话的路由来源、规划步骤、改写后检索问句、RAG 命中、工具调用（参数/结果/token/耗时）异步落库 `agent_trace`；页面 🔍 追踪弹窗可查看本会话最近 50 轮，**只显示自己名下会话的记录**（管理员可切到「全部会话」看全站）。
+- **可观测面板（仅 ADMIN）**：跨会话聚合 `agent_trace` 回答「整体运行得怎么样」——成功率 / 平均耗时 / 平均 token、按天·按形态·按处理方来源·按智能体拆解、以及最慢的 N 轮（定位瓶颈）。独立页 `/observability.html`，与成本看板（讲「花了多少钱」）互补：本面板讲「跑得多快、成不成」。接口与入口都限 ADMIN（跨会话全站聚合口径）。
+- **成本看板（仅 ADMIN）**：全量成本口径——除「回答本身」（`agent_trace`）外，路由判定/参数抽取/查询改写/任务规划/视觉识别/记忆合并这些裸 `ChatModel` 调用也各自记入 `llm_usage`（按用途 `purpose` 拆解）；页面 💰 成本弹窗按天趋势 + 按用途聚合展示（近 7/30/90 天）。接口与入口都限 ADMIN（全站聚合口径，按人拆分无意义）。
 
 ### 知识库与多模态
 
@@ -37,6 +38,14 @@
 - **安全护栏**：SQL 工具仅允许只读 `SELECT`/`WITH`，白名单表名（student/class/teacher/subject/course/score）、拒绝多语句与可执行注释、结果行数上限。
 - **MCP 远端工具**：官方 `spring-ai-starter-mcp-client` 接入的 MCP server 工具经 `McpToolSource` 收进**同一个能力池**（前端分组显示为 `MCP`），与本地工具一样按 `tools_json` 装配。默认**不声明任何 server**，即「不接入」——启动行为与未引入 MCP 时一致。
   接一个 server：在 `application-local.yaml` 写 `spring.ai.mcp.client.stdio.connections.<名>`，`command` 用可执行文件绝对路径、`args` 首项为 server 入口、其后为允许读写的沙箱根目录（**不要用 `npx`**，Windows 上是批处理包装、且依赖 PATH 与网络）。工具名以 server 返回为准，看 `GET /api/agent/tools` 的 `MCP` 分组。
+
+### 提示词回归评测
+
+- **改提示词前后各跑一批**：`prompts.yaml` 里 11 个模板（路由判定、参数抽取、查询改写、规划、汇总…）都是 LLM 行为契约，改一个词可能悄悄修好 A、弄坏 B。评测把这层「跑批 + 断言」补齐 —— 用例集声明「什么输入应得什么结果」，跑批走真实链路，逐条给通过 / 失败 / 配置错误。
+- **三态不混算**：**失败** = 提示词质量问题；**配置错误** = 用例自己写错（例如断言引用了不存在的智能体编码）—— 单列一档，否则用例维护失误会被误读成「模型变笨了」。
+- **批次对比看 broken**：每批落库，`/api/eval/compare` 直接给出 `fixed`（上批挂→本批过）与 `broken`（**上批过→本批挂**）。改完提示词先看 `broken` 有没有变长，比看总通过率更能定位回归。
+- **零侵入**：不碰对话链路 —— 评测复用现成的路由 / 规划能力，只是换个入口调用并断言结果。用例集是 `classpath:eval-cases.yaml`，加用例不改代码。
+- **仅 ADMIN**：`/api/eval/**` 整类带 `@RequireRole(ADMIN)` —— 「跑一批」发起的是**真实模型调用**（13 条用例 = 13 次 LLM 请求），消耗计入 `llm_usage` 成本流水，与成本看板同一性质。只读的 `/cases`、`/batches`、`/compare` 本可单独放宽，但它们只服务于「跑批」这一件事，没有独立使用场景，故整类收敛；前端顶栏入口按同一角色显隐。
 
 ## 技术栈
 
@@ -115,6 +124,8 @@ spring:
       client: {enabled: true, name: my-agent, version: 1.0.0, type: sync, request-timeout: 15s}
 agent:
   memory: {recent-tokens: 4000, min-keep-messages: 2, max-message-chars: 4000}
+  planner: {upstream-max-chars: 4000, upstream-total-chars: 12000, isolate-middle-steps: true}   # 前驱产出注入下一步的配额（防无界累积）+ 中间步骤隔离长期记忆
+  eval:   {cases-file: classpath:eval-cases.yaml, timeout-seconds: 60}   # 提示词回归评测：用例集位置 + 单条超时
   rag:    {rerank-enabled: true, recall-k: 20, top-k: 3, rerank-min-score: 0.20,
            min-score: 0.25, recall-min-score: 0.10, fallback-max-chunks: 2000,
            query-rewrite-enabled: true, query-rewrite-history-size: 6}
@@ -155,7 +166,7 @@ server:
   - **签名密钥**：`JWT_SECRET` 必须是 ≥32 字节的固定值。留空或过短时每次启动都会换随机密钥，表现是「一重启所有人都要重新登录」。生成：`openssl rand -hex 32`。注意 `${JWT_SECRET:默认值}` 里**显式设成空串**的环境变量会覆盖默认值，等同于「未配置」。
   - **有效期**：`app.jwt.expire-minutes` 必须是正数。该字段是 `int`，配置没绑上时默认 0，而 0 分钟意味着 token **一签发就过期** —— 表现是「登录成功后进入页面又让登录」，且不抛任何异常。启动时会打 WARN 并回落到默认 720 分钟。
   - **初始账号**：`sys_user` 表为空时启动自动创建 `admin`（口令取 `app.jwt.bootstrap-password`，默认 `admin123`），请在 `/user.html` 立即修改；表非空时该引导不再触发。
-  - **权限模型**：`/api/user/**` 与 `/api/role/**` 需 `ADMIN` 角色（`@RequireRole`），其余接口只要求已登录。
+  - **权限模型**：需 `ADMIN` 角色的接口用 `@RequireRole(SysRoleCode.ADMIN)` 声明（注解紧贴接口/控制器，不存在一份与代码脱节的路径清单），不通过返回 403 `ROLE_DENIED`。当前共五处：`/api/user/**`、`/api/role/**`（用户与角色管理）、`/api/cost/**`（成本看板）、`/api/eval/**`（提示词评测）与 `/api/observability/**`（可观测面板）。后三者同属**运营视角**——成本看板与可观测面板都是跨会话全站聚合口径（按人拆分无意义），评测「跑一批」会发起真实模型调用、消耗计入成本流水，都是「会花钱/看全局的运维动作」，不该交给任意登录用户。其余接口只要求已登录。
   - **改口令不会踢掉已签发的 token**：token 是无状态的，需要强制下线请先停用该账号（停用状态每次请求都会校验）。
 - **附件安全**：`/files/**` 是免鉴权的同源静态映射，落盘文件名后缀经**白名单化**（图片/文档类保留，其余一律 `.bin`=octet-stream 只下载不渲染），杜绝上传 `.html`/`.svg` 后同源执行脚本。
 - **密钥泄露处理**：若密钥曾以明文提交进仓库，改配置只是止血 —— **必须到服务商控制台轮换/吊销旧 Key**（历史提交里的旧值依然可用）。
@@ -257,11 +268,14 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 智能路由 | 裸 ChatModel 三态 JSON 决策（`{"route":true,"agentCode":"..."}` / `{"route":false}` / `{"route":false,"continue":true}`），Hutool 解析 |
 | 参数追问 | `paramSchema` 声明参数；LLM 从有界历史抽取已确认取值；缺失必填生成 `🔎 还需补充信息`，上限 3 次；**状态每轮重放推导，不落库** |
 | 记忆体系 | 窗口 = 原文预算 + **条数下限**（防单条超预算导致窗口塌缩）+ 单条截断；`DbChatMemory` 与 `MemoryMergeService` 共用同一 `MemoryProperties` 口径 |
+| 步骤间产物传递 | 前驱产出注入下一步输入时按配额截断（`min(upstream-max-chars, upstream-total-chars / 前驱个数)`），超额保留前段 + 显式省略标注 + WARN；只作用于**注入**，不影响 `task_step.output` 落库与最终回复 |
+| 子智能体上下文隔离 | 规划步骤的 system 分三档拼装：**首层**吃「已确认参数」、**末层（汇总步）**追加近期窗口历史、**中间步骤**默认不注入会话长期记忆（`conversation.summary` / `core_facts`）。中间步的活是「拿前驱产物做自己那一段」，会话级摘要往往是别的话题、反而把这一步带偏；开关 `agent.planner.isolate-middle-steps`（**RAG 资料不参与隔离**——每步 query 不同、按各自需要检索，与「会话记忆」不是一回事） |
+| 提示词回归评测 | `prompts.yaml` 改动靠手感——评测把「跑批 + 断言」这层壳补上：`eval-cases.yaml` 声明用例（场景 `ROUTE` / `PLAN` + 期望 JSON），`EvalService` 并发跑真实链路并逐条判定，结果落 `eval_result`。三态分开：**通过** / **失败**（提示词质量问题）/ **配置错误**（用例本身写错，如引用了不存在的智能体——单列一档，不污染质量判断）。批次间可比：`/api/eval/compare` 输出 `fixed`（上一批失败、本批通过）与 `broken`（**上一批通过、本批失败**——改提示词最该先看的一屏） |
 | 对话附件三通道 | ① 纯提问 `message` → 走记忆/路由，写 `chat_message.content`；② 解析文本 `material` → 注入**当轮** system，仅当轮可见；③ 展示元数据 `attachments_json`（不含正文）→ 仅供历史回看 |
 | RAG 引用溯源 | `KbCitation` 与资料块**同趟产出**，出口三处同一份 JSON：落库 `chat_message.citations_json`、SSE `citations` 事件、`agent_trace.citations_json` |
 | 流式策略 | Spring AI 2.0.0 的 `stream()` 在工具调用场景会崩（见「已知缺陷」），统一 `call()` 拿完整答案后按自适应分片模拟流式（总时长封顶 ≈2s） |
 | 并发预取 | 前置链（路由/参数抽取/查询改写）由专用线程池并行，显著缩短首字节时延；预取只加速、不承担正确性，异常/超时一律回退用户原话 |
-| 纯旁路追踪 | `agent_trace` 删掉后对话照常运行；写入在回复产出后异步、失败只记日志 |
+| 纯旁路追踪 | `agent_trace` 删掉后对话照常运行；写入在回复产出后异步、失败只记日志。**查询按会话归属过滤**（`JOIN conversation` 判定，ADMIN 走全量视角）—— 归属刻意不写进表：加 `user_id` 列就得把身份一路传进异步落库链路，会破坏这条「旁路」原则 |
 | SSE 兜底 | 有限超时（默认 300s）+ 独立心跳调度器（默认 15s，专用线程池，不与打字机抢 Reactor 线程） |
 | 工具注册 | 两类来源统一进 `ToolRegistry`：注解式（`ToolProvider` + `@Tool` 反射）与动态式（`ToolCallbackSource`，如 MCP 远端工具、运行时才知道有哪些）；同名时注解式优先并告警 |
 
@@ -363,14 +377,55 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/trace?conversationId=` | 某会话最近若干轮追踪 |
-| GET | `/api/trace/{traceId}` | 单轮追踪详情 |
+| GET | `/api/trace?conversationId=&limit=` | 追踪列表（时间倒序，默认 50 条、上限 200）。**只回当前登录用户名下会话的记录**；不传 `conversationId` 表示「不限会话」，但**不是**「不限用户」 |
+| GET | `/api/trace/{traceId}` | 单轮追踪详情；不存在**或不属于当前用户**一律 404（二者不可区分，防拿 traceId 探测他人记录） |
 
-### 成本看板
+> **可见性**：`ADMIN` 不受归属限制 —— 它走全量视角（可看所有人的追踪，含已删除会话遗留的记录），前端追踪弹窗会相应多出「本会话 / 全部会话」切换。
+> 归属判定在 SQL 层由 `JOIN conversation` 完成（`agent_trace` **没有** `user_id` 列 —— 加列就得把身份一路传进异步落库链路，会破坏「追踪是纯旁路、不影响对话逻辑」这条原则）。
+> 附带效果：**删除会话不会删除 trace**，因此存在指向已删会话的孤儿记录；JOIN 天然查不出它们，普通用户不可见、ADMIN 仍可见，符合「追踪作为旁路留档」的定位。
+> 指定 `conversationId` 且非 ADMIN 时，会先校验会话归属，不是自己的直接 404 —— 这样「会话不是你的」与「这个会话还没产生追踪」不会混为一谈。
+
+### 成本看板（仅 ADMIN）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/cost/summary?days=` | 近 N 天（默认 30、上限 90）全量成本聚合：回答本身 + 裸调用按用途拆解 |
+
+> **仅 ADMIN 可访问**（`CostController` 标 `@RequireRole(ADMIN)`，非管理员 403 `ROLE_DENIED`）。
+> 为什么是管理员专属而不是「每人看自己的」：这张看板的口径是**全站聚合**，聚合成一行「今天花了多少 token」后就分不出是谁的，
+> 按归属收敛在技术上就做不到；而「按人拆分」会暴露他人用量对比，产品上也没有这个诉求 —— 成本属运营视角数据。
+> 前端顶栏「💰 成本」入口按同一角色显隐，普通账号看不到入口（不是点了才 403）。
+
+### 可观测面板（仅 ADMIN）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/observability/summary?days=` | 近 N 天（默认 7、上限 90）运行质量聚合：总览（轮次/成功率/平均耗时/token）+ 按天·按形态·按来源·按智能体 + 慢轮 Top N |
+
+> **仅 ADMIN 可访问**（`ObservabilityController` 标 `@RequireRole(ADMIN)`）。与成本看板同一收敛逻辑：跨会话全站聚合，
+> 逐条看某会话的链路细节走「🔍 追踪」（已按归属隔离），全站质量看这里。独立页 `/observability.html`，
+> 顶栏「📊 可观测」入口按同一角色显隐。
+> 指标口径：成功率 = 1 − `error` 轮占比；耗时取 `elapsed_ms` 平均（本轮从进编排到产出回复的**总耗时**，
+> 不细分路由/改写/参数抽取的分段耗时 —— 那需要加列，暂不做）。
+
+### 提示词回归评测（仅 ADMIN）
+
+> 改 `prompts.yaml` 前后各跑一批，看「上一批通过、本批失败」清单（`broken`）有没有变长。
+> 跑批走**真实链路**（真实模型调用），消耗计入成本看板，会话 ID 固定标记为 `__eval__`，不与真实对话混算。
+> **整类需 `ADMIN` 角色**：跑批会花钱，属运营视角动作；前端顶栏「🧪 评测」入口按同一角色显隐。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/eval/cases?scenario=` | 列出用例集（`scenario` 可筛 `ROUTE` / `PLAN`，不传即全部） |
+| POST | `/api/eval/run?scenario=` | 跑一批：并发执行 + 单条超时（默认 60s），返回 `{batchId, total, passed, failed, configErrors, costMs, results[]}` |
+| GET | `/api/eval/batches` | 历史批次摘要（近 20 批，更旧的自动清理） |
+| GET | `/api/eval/batches/{batchId}` | 某批次的逐条结果 |
+| GET | `/api/eval/compare?from=&to=` | 两批对比：`fixed` / `broken` / `stillFailed` / `onlyFrom` / `onlyTo` |
+
+> 用例集文件默认 `classpath:eval-cases.yaml`（`agent.eval.cases-file` 可改）。用例格式：
+> `name`（用例名）、`scenario`（`ROUTE` / `PLAN`）、`input`（用户输入）、`pendingQuestion`（可选，模拟上一轮追问）、
+> `expect`（断言 JSON）。**断言只写可确定的部分**——路由类断言 `{"noRoute":true}` 或 `{"agentCode":"A002"}`，
+> 规划类断言 `{"containsAgents":["A001"]}`，别断言模型措辞（那是在测模型，不是在测提示词）。
 
 ## 数据库表
 
@@ -383,9 +438,10 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | `kb_chunk` | id, kb_id, content, source, embedding, created_at | 知识块；`embedding` 为向量 JSON 文本（MySQL 源） |
 | `kb_file` | id, kb_id, file_name, file_type, chunk_strategy, chunk_overlap, size_bytes, chunk_count, raw_text | 以文件为管理单元；`raw_text` 支持不重传重新分片 |
 | `agent_trace` | trace_id, conversation_id, mode, route_source, agent_code, user_message, retrieval_query, plan_json, tool_calls, kb_hit_count, citations_json, prompt_tokens, completion_tokens, total_tokens, elapsed_ms, status | 纯旁路可观测表，删掉不影响对话 |
-| `llm_usage` | trace_id, conversation_id, purpose, model, prompt_tokens, completion_tokens, total_tokens, created_at | 裸 LLM 调用成本流水（全量成本口径）：路由/参数抽取/查询改写/视觉/记忆合并各记一条，按用途拆解 |
+| `llm_usage` | trace_id, conversation_id, purpose, model, prompt_tokens, completion_tokens, total_tokens, created_at | 裸 LLM 调用成本流水（全量成本口径）：路由/参数抽取/查询改写/计划生成/视觉/记忆合并各记一条，按用途拆解 |
 | `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING |
 | `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败 |
+| `eval_result` | id, batch_id, case_name, scenario, input, expected, actual, passed, config_error, failure, detail, cost_ms, created_at | 提示词回归评测逐条结果；`batch_id` 分组一批，`config_error=1` 为「用例本身写错」单列一档；只保留最近 20 批，更旧的跑完即清 |
 | `sys_user` | id, username, password, nickname, email, status, last_login_at, created_at, updated_at | 登录账号；`password` 为 BCrypt 哈希（自带盐），`status=0` 停用后已签发 token 立即失效 |
 | `sys_role` | id, code, name, description | 角色；`code` 是授权判定依据（`@RequireRole` 比的是它），不可修改 |
 | `sys_user_role` | id, user_id, role_id, created_at | 用户-角色多对多授权，权限取并集；无外键约束，删除用户时由服务层清理 |
@@ -406,12 +462,14 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 ## 前端界面
 
-- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）；右侧动作区**整体靠最右**，依次为 🔍 追踪（无会话时不显示）、💰 成本、🎓 教务系统（跳 `/edu.html`，与 edu 页的「前往 AI 对话」互为对称入口）、以及**登录用户区**。靠右由容器 `.header-actions` 统一负责（`margin-left:auto` + `gap`），各按钮不自带 `margin-left` —— 否则「追踪」这类条件渲染的按钮一缺席，整组就会塌回标题旁边。
+- **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）；右侧动作区**整体靠最右**，依次为 🔍 追踪（无会话时不显示）、💰 成本（仅 ADMIN）、🧪 评测（仅 ADMIN）、📊 可观测（仅 ADMIN，跳 `/observability.html`）、🎓 教务系统（跳 `/edu.html`，与 edu 页的「前往 AI 对话」互为对称入口）、以及**登录用户区**。靠右由容器 `.header-actions` 统一负责（`margin-left:auto` + `gap`），各按钮不自带 `margin-left` —— 否则「追踪」这类条件渲染的按钮一缺席，整组就会塌回标题旁边。按角色显隐的入口读页面级 `isAdmin`（setup 时从 `Auth.hasRole('ADMIN')` 取一次存进 `ref`）—— `Auth.getUser()` 读 localStorage、不是响应式的，模板里直接调它只会求值一次。
 - **登录用户区（四页统一，只有一个用户名）**：顶栏不再出现裸露的「退出」按钮 —— 点击用户名展开下拉：**个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录**。四页（index / chat / edu / user）都是 `js/auth.js` 渲染到 `data-auth-nav` 挂载点的**同一份实现**，页面自身不含登录逻辑；细节见「登录」一节。
 - **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）。
 - **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
-- **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。
-- **成本看板弹窗**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。
+- **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。**可见范围**：默认只显示当前登录用户名下会话的记录（后端按会话归属过滤，非本人记录按不存在处理）；**ADMIN 额外有一个「本会话 / 全部会话」切换**，可查看全站追踪。工具栏文案会随范围实时变化，空态也按范围给不同措辞——「本会话没有」和「全站都没有」是两回事。
+- **成本看板弹窗（💰 成本，仅 ADMIN）**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。入口按 ADMIN 角色显隐（后端 `@RequireRole(ADMIN)`，普通账号连入口都不渲染）。
+- **评测弹窗（🧪 评测，仅 ADMIN 可见）**：场景切换（全部 / 路由 / 规划）、用例条数、▶ 跑一批 → 三态统计（通过 / 失败 / 配置错误，逐条左边框绿 / 红 / 琥珀区分）+「最近两批对比」（`已修复` / `新增失败`，后者红底加粗，是改提示词后最先要看的一行）+ 历史批次列表。跑批走真实调用、计入成本看板。
+- **可观测面板（📊 可观测，独立页 `/observability.html`，仅 ADMIN）**：六张总览卡（轮次 / 成功率 / 平均耗时 / 平均 token / 总 token / 活跃天数）+ 按天趋势表 + 三个分布块（按形态 / 按处理方来源 / 按智能体，横向占比条）+「最慢的 N 轮」明细表（红/绿徽标区分失败/正常，`user_message` 截断展示）。近 7/30/90 天切换。非 ADMIN 打开只显示「仅管理员可用」提示，数据也不请求。
 - **教务系统**（`/edu.html`，独立入口）：10 张业务表（科目/老师/班级/学生/学期/课程/节次/排课/考试/成绩）的增删改查 + 4 个关联查询看板（学生成绩明细、成绩统计、班级课表、考试日程），复用深色色板，与 AI 对话页分离。单表页与关联查询页共用同一套顶部搜索条（文本输入 + 外键/枚举下拉 + 查询/重置，按 `tableMeta.search` / `queryMeta.search` 声明渲染）、序号列、右下分页（首页/上一页/下一页/尾页/跳页[/每页条数]）；新增与删除走自绘弹窗。
 
 - **登录**：登录界面全站只有一份 —— 结构在 `js/auth.js`（`Auth.openLogin()`），样式在 `css/auth.css`（`auth-` 前缀变量与类名，与各页样式互不污染）。

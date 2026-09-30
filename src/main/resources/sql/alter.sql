@@ -54,3 +54,7 @@ ALTER TABLE conversation ADD COLUMN user_id BIGINT DEFAULT NULL COMMENT '所属�
 
 -- 会话列表按 user_id 过滤，补索引（索引已存在时被忽略）
 ALTER TABLE conversation ADD INDEX idx_user (user_id);
+
+-- 成本流水新增「任务规划」用途（PlannerService.plan 此前没有采集成本，属全量成本口径的漏项）。
+-- MODIFY 是幂等的：重复执行只更新列注释，不改类型，不丢数据。
+ALTER TABLE llm_usage MODIFY COLUMN purpose VARCHAR(24) NOT NULL COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并';

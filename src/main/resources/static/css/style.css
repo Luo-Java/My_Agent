@@ -2859,3 +2859,66 @@ button {
    用户名 + 下拉菜单由 js/auth.js 渲染到 `data-auth-nav` 挂载点，样式在 css/auth.css
    （.auth-nav / .auth-user-trigger / .auth-menu），与页面主题无关。
    这里原有 chat 页一套 .auth-box / .auth-user / .auth-entry，随挂载点统一而删除。 */
+
+/* ══ 提示词回归评测弹窗 ══
+   三态必须一眼分开：通过（绿）/ 失败（红）/ 配置错误（黄）。
+   配置错误是「用例自己写错了」，与「提示词改坏了」是两回事，故刻意不与失败同色 ——
+   同色会让人把每次跑都必然出现的那几条误读成「这次又改坏了」。 */
+.modal-eval { max-width: 860px; }
+
+.eval-section { margin-top: 18px; }
+
+.eval-summary {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 8px 0 10px;
+}
+
+.eval-stat {
+    padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; color: var(--text-soft);
+    border: 0.5px solid var(--border);
+}
+.eval-stat-pass { color: var(--online); border-color: rgba(52, 211, 153, .4); }
+.eval-stat-fail { color: var(--danger); border-color: rgba(248, 113, 113, .4); }
+.eval-stat-config { color: #fbbf24; border-color: rgba(251, 191, 36, .4); }
+
+/* 逐条结果：左侧色条标状态；长列表独立滚动，不把弹窗撑高 */
+.eval-list {
+    display: flex; flex-direction: column; gap: 6px;
+    max-height: 320px; overflow-y: auto;
+}
+.eval-item {
+    border: 0.5px solid var(--border);
+    border-left: 3px solid var(--border-strong);
+    border-radius: 6px; padding: 8px 10px;
+}
+.eval-item.eval-pass { border-left-color: var(--online); }
+.eval-item.eval-fail { border-left-color: var(--danger); }
+.eval-item.eval-config { border-left-color: #fbbf24; }
+
+.eval-item-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.eval-item-name { font-size: 13px; color: var(--text); }
+.eval-item-tag { font-size: 11px; color: var(--text-soft); flex: none; }
+.eval-item-line { display: flex; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--text-soft); }
+.eval-item-key { flex: none; opacity: .7; }
+
+/* 批次对比：broken 那一行红底 —— 改完提示词最该看的就是它 */
+.eval-diff-head { margin: 8px 0; }
+.eval-diff-row {
+    display: flex; gap: 8px;
+    padding: 6px 10px; margin-bottom: 6px;
+    border-radius: 6px; font-size: 12px;
+}
+.eval-diff-label { flex: none; opacity: .8; }
+.eval-diff-broken { background: rgba(248, 113, 113, .12); color: #fca5a5; }
+.eval-diff-fixed { background: rgba(52, 211, 153, .12); color: #6ee7b7; }
+.eval-diff-none { color: var(--text-soft); }
+
+.eval-batch {
+    display: flex; gap: 12px; align-items: center;
+    padding: 5px 0; font-size: 12px;
+    border-bottom: 0.5px solid var(--border);
+}
+.eval-batch-time { color: var(--text-soft); flex: none; }
+.eval-batch-stat { color: var(--text); }
+.eval-batch-extra { color: var(--text-soft); }

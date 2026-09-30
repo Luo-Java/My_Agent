@@ -6,6 +6,8 @@ import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.properties.PromptProperties;
 import org.luo.ai.entity.Agent;
+import org.luo.ai.trace.LlmUsageService;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -33,13 +35,17 @@ public class PlannerService {
     private final AgentService agentService;
     private final ChatComposer composer;
     private final PromptProperties promptProperties;
+    /** 裸调用成本采集（全量成本口径，旁路异步，失败不影响规划）。 */
+    private final LlmUsageService llmUsageService;
 
     public PlannerService(AgentService agentService,
                           ChatComposer composer,
-                          PromptProperties promptProperties) {
+                          PromptProperties promptProperties,
+                          LlmUsageService llmUsageService) {
         this.agentService = agentService;
         this.composer = composer;
         this.promptProperties = promptProperties;
+        this.llmUsageService = llmUsageService;
     }
 
     /**
@@ -74,11 +80,18 @@ public class PlannerService {
             String list = agentService.buildAgentListText(agents);
             String system = PromptProperties.render(promptProperties.plannerSystem(),
                     Map.of("agentList", list));
-            String reply = composer.internalChatClient().prompt()
+            ChatResponse response = composer.internalChatClient().prompt()
                     .system(system)
                     .user("用户目标：\n" + userGoal)
                     .call()
-                    .content();
+                    .chatResponse();
+            // 规划是一次真实的模型往返，此前没进成本流水（全量成本口径的漏项）。conversationId 传 null：
+            // 本方法拿不到会话上下文，与 VISION 同处理；评测跑批的消耗另由 EvalService 打 __eval__ 标记识别。
+            llmUsageService.recordAsync("PLAN", null, null, response);
+            if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+                return List.of();
+            }
+            String reply = response.getResult().getOutput().getText();
             if (reply == null || reply.isBlank()) return List.of();
             return parsePlan(stripFences(reply));
         } catch (Exception e) {

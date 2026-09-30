@@ -1,0 +1,147 @@
+/* 可观测面板页（/observability.html）专用样式 —— 与 user.css / edu.css 相互独立，仅本页引入。
+   色板与 edu.css / user.css 保持一致（同为深色板，换肤需同步）。
+   字号约束：全部整数 px，正文 13px 起；次要文字用 --text-soft（深底可读下限，勿再调暗）。 */
+
+:root {
+    color-scheme: dark;
+    --primary: #3b82f6;
+    --primary-text: #7cb0ff;
+    --primary-soft: rgba(59, 130, 246, .16);
+    --cyan: #22d3ee;
+    --danger: #f87171;
+    --success: #34d399;
+    --warn: #fbbf24;
+
+    --bg: #05080f;
+    --panel: #0b1220;
+    --surface: rgba(255, 255, 255, .04);
+
+    --border: rgba(110, 160, 255, .14);
+    --border-strong: rgba(110, 160, 255, .30);
+
+    --text: #e8eefc;
+    --text-soft: #93a6c8;
+}
+
+* { box-sizing: border-box; }
+
+[v-cloak] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI",
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    color: var(--text);
+    background:
+        radial-gradient(900px 560px at 50% -14%, rgba(59, 130, 246, .16), transparent 62%),
+        var(--bg);
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ===== 顶栏 ===== */
+.ob-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 13px 20px;
+    background: linear-gradient(180deg, rgba(17, 27, 48, .92), rgba(11, 18, 32, .78));
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 1px 0 rgba(34, 211, 238, .10) inset, 0 10px 24px rgba(0, 0, 0, .28);
+}
+.ob-topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ob-topbar-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.ob-title { font-size: 16px; font-weight: 600; }
+.ob-link {
+    font-size: 13px;
+    color: var(--primary-text);
+    text-decoration: none;
+}
+.ob-link:hover { text-decoration: underline; }
+
+/* ===== 布局 ===== */
+.ob-layout {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* 顶部工具行：窗口切换 + 刷新 */
+.ob-toolbar { display: flex; align-items: center; gap: 10px; }
+.ob-seg { display: inline-flex; gap: 2px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.ob-seg-btn {
+    padding: 5px 12px; font-size: 13px; color: var(--text-soft);
+    background: transparent; border: none; border-radius: 6px; cursor: pointer;
+}
+.ob-seg-btn:hover { color: var(--text); }
+.ob-seg-btn.ob-seg-on { background: var(--primary-soft); color: var(--primary-text); font-weight: 600; }
+.ob-refresh {
+    padding: 6px 14px; font-size: 13px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.ob-refresh:hover { border-color: var(--border-strong); }
+.ob-hint { font-size: 12px; color: var(--text-soft); margin-left: auto; }
+
+/* ===== 总览指标卡 ===== */
+.ob-overview { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+.ob-card {
+    background: linear-gradient(180deg, rgba(17, 27, 48, .60), rgba(11, 18, 32, .50));
+    border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+}
+.ob-card-num { font-size: 26px; font-weight: 700; line-height: 1.2; }
+.ob-card-label { font-size: 12px; color: var(--text-soft); margin-top: 4px; }
+.ob-card.is-success .ob-card-num { color: var(--success); }
+.ob-card.is-danger .ob-card-num { color: var(--danger); }
+.ob-card.is-primary .ob-card-num { color: var(--primary-text); }
+.ob-card.is-cyan .ob-card-num { color: var(--cyan); }
+
+/* ===== 面板区块 ===== */
+.ob-panel {
+    background: linear-gradient(180deg, rgba(17, 27, 48, .60), rgba(11, 18, 32, .50));
+    border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+}
+.ob-panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.ob-panel-title { font-size: 14px; font-weight: 600; }
+.ob-panel-sub { font-size: 12px; color: var(--text-soft); }
+
+.ob-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* ===== 分布条 ===== */
+.ob-dist-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.ob-dist-row:last-child { border-bottom: none; }
+.ob-dist-name { width: 110px; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ob-dist-bar-wrap { flex: 1; height: 8px; background: var(--surface); border-radius: 4px; overflow: hidden; }
+.ob-dist-bar { height: 100%; background: var(--primary); border-radius: 4px; transition: width .3s; }
+.ob-dist-meta { font-size: 12px; color: var(--text-soft); width: 120px; text-align: right; white-space: nowrap; }
+
+/* ===== 慢轮明细表 ===== */
+.ob-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ob-table th {
+    text-align: left; padding: 8px 10px; color: var(--text-soft); font-weight: 500;
+    border-bottom: 1px solid var(--border-strong); white-space: nowrap;
+}
+.ob-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ob-table tr:last-child td { border-bottom: none; }
+.ob-monospace { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12px; color: var(--text-soft); }
+.ob-elapsed { color: var(--warn); font-weight: 600; white-space: nowrap; }
+.ob-badge {
+    display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+    background: var(--surface); color: var(--text-soft); white-space: nowrap;
+}
+.ob-badge.is-ok { color: var(--success); background: rgba(52, 211, 153, .12); }
+.ob-badge.is-error { color: var(--danger); background: rgba(248, 113, 113, .14); }
+.ob-user-msg { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+
+/* ===== 空态 / 加载 ===== */
+.ob-empty { text-align: center; color: var(--text-soft); padding: 40px 0; font-size: 13px; }
+.ob-error { color: var(--danger); text-align: center; padding: 24px 0; font-size: 13px; }
+
+@media (max-width: 900px) {
+    .ob-overview { grid-template-columns: repeat(3, 1fr); }
+    .ob-grid-2 { grid-template-columns: 1fr; }
+}

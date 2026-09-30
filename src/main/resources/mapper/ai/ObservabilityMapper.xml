@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.ai.mapper.ObservabilityMapper">
+
+    <!-- 可观测面板聚合查询：只读、跨会话全站统计（仅 ADMIN 视角）。各查询行一律类型化投影到
+         ObservabilitySummary 的嵌套 record，字段名与 SQL 别名一致。
+
+         ⚠ 两条硬约束 —— 都只在运行时炸，编译期完全无感，改这里的 SQL 前后各过一遍：
+
+         1) 构造器分量个数 = 结果集列数、且顺序一致。本项目未开 argNameBasedConstructorAutoMapping
+            （走列序映射），参数多于列数会抛 ExecutorException
+            （「takes 'N' arguments, but there are only 'M' columns」）。
+            派生指标（如 successRate）一律做成 record 上的方法，不靠 SQL 凑列。
+
+         2) 聚合值不得为 NULL。record 的分量是 primitive long，接不住 null —— 会抛
+            IllegalArgumentException（「Error instantiating class ... with invalid types (long,...)
+            or values (0,null,0,0,0)」）。而 SQL 聚合函数在「零行」时恰恰返回 NULL：
+            COUNT(*) 恒有值，SUM/AVG/MAX/MIN 全是 NULL。于是：
+              计数 → COUNT(CASE WHEN ... THEN 1 END)   （COUNT 恒非 NULL，不需要 COALESCE）
+              求和/均值 → COALESCE(SUM(...), 0) / COALESCE(AVG(...), 0)
+            ⚠ 这个坑只在「窗口内一行都没有」时触发 —— 有数据的窗口永远测不出来。
+            2026-09-30 实测：默认近 30 天有数据正常，点「近 7 天」窗口内无数据 ⇒ 500，
+            且只有 errors 这一列漏包了 COALESCE，其余列当时包过才没一起炸。 -->
+
+    <!-- 只查 5 列：successRate 不入列，由 Overview#successRate() 从 rounds/errors 派生（见 DTO 注释）。 -->
+    <select id="aggregateOverview" resultType="org.luo.ai.dto.ObservabilitySummary$Overview">
+        SELECT COUNT(*) AS rounds,
+               COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors,
+               COALESCE(AVG(elapsed_ms), 0) AS avgElapsedMs,
+               COALESCE(AVG(total_tokens), 0) AS avgTokens,
+               COALESCE(SUM(total_tokens), 0) AS totalTokens
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+    </select>
+
+    <select id="aggregateDaily" resultType="org.luo.ai.dto.ObservabilitySummary$DailyBucket">
+        SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day,
+               COUNT(*) AS rounds,
+               COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors,
+               COALESCE(AVG(elapsed_ms), 0) AS avgElapsedMs,
+               COALESCE(AVG(total_tokens), 0) AS avgTokens
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+        GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d')
+        ORDER BY day ASC
+    </select>
+
+    <select id="aggregateByMode" resultType="org.luo.ai.dto.ObservabilitySummary$ModeBucket">
+        SELECT COALESCE(mode, '未知') AS mode,
+               COUNT(*) AS rounds,
+               COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors,
+               COALESCE(AVG(elapsed_ms), 0) AS avgElapsedMs,
+               COALESCE(AVG(total_tokens), 0) AS avgTokens
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+        GROUP BY mode
+        ORDER BY rounds DESC
+    </select>
+
+    <select id="aggregateByRouteSource" resultType="org.luo.ai.dto.ObservabilitySummary$RouteBucket">
+        SELECT COALESCE(route_source, '未知') AS routeSource,
+               COUNT(*) AS rounds,
+               COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors,
+               COALESCE(AVG(elapsed_ms), 0) AS avgElapsedMs
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+        GROUP BY route_source
+        ORDER BY rounds DESC
+    </select>
+
+    <select id="aggregateByAgent" resultType="org.luo.ai.dto.ObservabilitySummary$AgentBucket">
+        SELECT COALESCE(agent_code, '通用助手') AS agentCode,
+               COUNT(*) AS rounds,
+               COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors,
+               COALESCE(AVG(elapsed_ms), 0) AS avgElapsedMs,
+               COALESCE(AVG(total_tokens), 0) AS avgTokens
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+        GROUP BY agent_code
+        ORDER BY rounds DESC
+    </select>
+
+    <!-- 慢轮 Top N：只取窗口内、耗时降序；user_message 已由落库侧截断到 1000 字，这里再截一层防超长。 -->
+    <select id="selectSlowest" resultType="org.luo.ai.dto.ObservabilitySummary$SlowRound">
+        SELECT trace_id AS traceId,
+               conversation_id AS conversationId,
+               mode AS mode,
+               route_source AS routeSource,
+               agent_code AS agentCode,
+               COALESCE(elapsed_ms, 0) AS elapsedMs,
+               COALESCE(total_tokens, 0) AS totalTokens,
+               status AS status,
+               LEFT(user_message, 80) AS userMessage
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+        ORDER BY elapsed_ms DESC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

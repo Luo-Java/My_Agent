@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.ai.mapper.EvalResultMapper">
+
+    <!-- 批次摘要：一次跑批的所有用例共用 batch_id，这里按它聚合出「总数 / 通过 / 失败 / 配置错误」。
+         ORDER BY 用 batchAt 别名（即 MIN(created_at)）——batch_id 是无时序含义的随机 UUID，不能拿来排序。 -->
+    <select id="selectBatchSummaries" resultType="org.luo.ai.dto.EvalBatchSummary">
+        SELECT batch_id                                                       AS batchId,
+               MIN(created_at)                                                AS batchAt,
+               COUNT(*)                                                       AS total,
+               SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END)                    AS passed,
+               SUM(CASE WHEN passed = 0 AND config_error = 0 THEN 1 ELSE 0 END) AS failed,
+               SUM(CASE WHEN config_error = 1 THEN 1 ELSE 0 END)              AS configErrors,
+               CASE WHEN COUNT(DISTINCT scenario) = 1 THEN MIN(scenario) ELSE NULL END AS scenario
+        FROM eval_result
+        GROUP BY batch_id
+        ORDER BY batchAt DESC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 保留窗口：只留最近 N 个批次。
+         必须套一层派生表——MySQL 不允许在 DELETE 的子查询里直接引用被删的表（1093），派生表使其物化。 -->
+    <delete id="deleteBatchesBeyond">
+        DELETE FROM eval_result
+        WHERE batch_id NOT IN (
+            SELECT batch_id FROM (
+                SELECT batch_id FROM eval_result GROUP BY batch_id ORDER BY MAX(created_at) DESC LIMIT #{keep}
+            ) AS keep_batches
+        )
+    </delete>
+
+</mapper>

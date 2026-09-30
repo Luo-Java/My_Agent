@@ -39,7 +39,7 @@ public class LlmUsageService {
     /**
      * 异步记录一次裸调用的成本。调用方在拿到 {@link ChatResponse} 之后调用，本方法立即返回。
      *
-     * @param purpose        用途（ROUTE/CLARIFY/REWRITE/VISION/MEMORY_MERGE）
+     * @param purpose        用途（ROUTE/CLARIFY/REWRITE/PLAN/VISION/MEMORY_MERGE）
      * @param conversationId 所属会话（可空，如视觉识别独立请求）
      * @param traceId        本轮追踪 ID（可空，如视觉识别早于 trace 建立）
      * @param model          实际模型名（可空，未显式指定时取默认）

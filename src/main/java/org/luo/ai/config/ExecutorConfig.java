@@ -114,6 +114,24 @@ public class ExecutorConfig {
     }
 
     /**
+     * 提示词回归评测专用线程池。跑批是「一批 N 条用例一次性并发调 LLM」的突发任务，可能持续几十秒，
+     * 与对话主链路必须隔离 —— 共用池会挤占真实对话的执行线程。核心 4 / 最大 8 / 队列 128
+     * （大于单批用例数上限 50，故不会触发拒绝）；用不等待关闭，跑批中途停机不影响用户。
+     */
+    @Bean("evalExecutor")
+    public Executor evalExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(4);
+        ex.setMaxPoolSize(8);
+        ex.setQueueCapacity(128);
+        ex.setKeepAliveSeconds(60);
+        ex.setThreadNamePrefix("eval-");
+        ex.setWaitForTasksToCompleteOnShutdown(false);
+        ex.initialize();
+        return ex;
+    }
+
+    /**
      * SSE 心跳专用调度器。原先心跳跑在 Reactor {@code Schedulers.parallel()} 上，与「打字机」的
      * {@code delayElements} 及 Reactor 内部操作共用同一批线程；而心跳要调 {@code SseEmitter.send()}，
      * 对慢客户端这是<b>阻塞</b>调用——只要几个连接卡在发送上，parallel 就被占满、把全站心跳一起拖死。

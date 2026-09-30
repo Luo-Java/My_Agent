@@ -15,10 +15,12 @@ import java.util.List;
 import java.util.concurrent.Executor;
 
 /**
- * 链路追踪服务：把 {@link RoundTrace} 收集到的一轮事实落库，并提供查询。三条不可破的原则：
+ * 链路追踪服务：把 {@link RoundTrace} 收集到的一轮事实落库，并提供查询。四条不可破的原则：
  * ① <b>异步</b>——落库走 {@code traceExecutor}，在回复产出之后执行，绝不挡在用户看到答案之前；
  * ② <b>旁路</b>——不参与任何对话逻辑，业务代码从不读 agent_trace，删掉整张表对话照常运行；
- * ③ <b>不抛错</b>——从提交任务到 INSERT 全链路 try/catch，失败只记日志（队列满时宁可丢追踪）。
+ * ③ <b>不抛错</b>——从提交任务到 INSERT 全链路 try/catch，失败只记日志（队列满时宁可丢追踪）；
+ * ④ <b>归属边界</b>——查询一律以「会话归属」为可见性边界（管理员的全量视角是唯一的例外），
+ * 非本人记录按「不存在」处理。归属判定不写进表、不改写入链路，见 {@code AgentTraceMapper.xml}。
  */
 @Slf4j
 @Service
@@ -102,22 +104,40 @@ public class TraceService {
     /**
      * 查询追踪记录，按时间倒序。
      *
-     * @param conversationId 会话 ID；为空则查全部会话（调试用）
+     * @param conversationId 会话过滤；null/空表示「不限会话」
      * @param limit          条数；null/≤0 用默认 50，超过 {@value #MAX_LIMIT} 截断到上限
+     * @param userId         调用者用户ID，由调用方在 HTTP 线程从登录态取出后传下来
+     * @param allUsers       {@code true}=管理员全量视角（不限归属）；{@code false}=只回 {@code userId} 名下会话的记录
      */
-    public List<AgentTrace> list(String conversationId, Integer limit) {
-        QueryWrapper<AgentTrace> qw = new QueryWrapper<>();
-        if (conversationId != null && !conversationId.isBlank()) {
-            qw.eq("conversation_id", conversationId);
+    public List<AgentTrace> list(String conversationId, Integer limit, Long userId, boolean allUsers) {
+        int size = clamp(limit);
+        if (allUsers) {
+            QueryWrapper<AgentTrace> qw = new QueryWrapper<>();
+            if (conversationId != null && !conversationId.isBlank()) {
+                qw.eq("conversation_id", conversationId);
+            }
+            qw.orderByDesc("id").last("LIMIT " + size);   // 受控 int 参数，无注入风险
+            return mapper.selectList(qw);
         }
-        qw.orderByDesc("id").last("LIMIT " + clamp(limit));   // 受控 int 参数，无注入风险
-        return mapper.selectList(qw);
+        // 非全量视角一律带归属条件。注意 userId 为 null 时 SQL 的 `c.user_id = NULL` 恒不成立，
+        // 结果自然为空 —— 即「无法证明归属就不可见」，不需要额外防御分支。
+        return mapper.selectOwned(conversationId, userId, size);
     }
 
-    /** 按 traceId 查单条；不存在返回 null。 */
-    public AgentTrace get(String traceId) {
+    /**
+     * 按 traceId 查单条。
+     *
+     * @param userId   调用者用户ID
+     * @param allUsers {@code true}=管理员全量视角；{@code false}=仅限 {@code userId} 名下会话的记录
+     * @return 不存在<b>或不属于该用户</b>时返回 null —— 两者都由调用方统一转 404，
+     *         不区分「没有这条」与「不是你的」，避免用 traceId 探测他人记录是否存在
+     */
+    public AgentTrace get(String traceId, Long userId, boolean allUsers) {
         if (traceId == null || traceId.isBlank()) return null;
-        return mapper.selectOne(new QueryWrapper<AgentTrace>().eq("trace_id", traceId).last("LIMIT 1"));
+        if (allUsers) {
+            return mapper.selectOne(new QueryWrapper<AgentTrace>().eq("trace_id", traceId).last("LIMIT 1"));
+        }
+        return mapper.selectOwnedByTraceId(traceId, userId);
     }
 
     /** limit 兜底与上限截断。 */
