@@ -4,8 +4,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.dto.StreamEvent;
 import org.luo.ai.entity.Conversation;
+import org.luo.ai.entity.TaskTemplate;
 import org.luo.ai.agent.handler.AgentRoundHandler;
 import org.luo.ai.agent.handler.PlannerRoundHandler;
+import org.luo.ai.agent.handler.ReviewRoundHandler;
 import org.luo.ai.agent.handler.RoundHandler;
 import org.luo.ai.agent.handler.RoundResult;
 import org.luo.ai.trace.RoundTrace;
@@ -25,12 +27,19 @@ import org.luo.ai.memory.DbChatMemory;
 
 /**
  * 对话编排服务（门面）：一轮对话统一走 {@link #runRound}，按会话形态选 {@link RoundHandler} 策略
- * （{@link AgentRoundHandler} / {@link PlannerRoundHandler}）执行，产出 {@link RoundResult} 后统一输出收尾。
+ * （{@link AgentRoundHandler} / {@link PlannerRoundHandler} / {@link ReviewRoundHandler}）执行，
+ * 产出 {@link RoundResult} 后统一输出收尾。
  * 请求组装、摘要合并、持久化、追踪分别委托 {@link ChatComposer} / {@link MemoryMergeService} /
  * {@link ConversationService} / {@link TraceService}，本类只做编排。
  * <p>
  * <b>收尾顺序（勿乱）</b>：推回复 → 推引用 → 落库附件/引用 → 异步落库追踪 → 异步合并记忆。
  * 一切旁路数据都排在用户看到答案<b>之后</b>。
+ * <p>
+ * <b>输出侧内容安全</b>：所有出口正文都过一遍 {@link ContentSafetyService#checkOutput}（护栏关闭时零开销）。
+ * 命中即<b>替换为提示文案</b>并落 WARN，不静默放行、也不假装回答成功。
+ * <b>已知边界</b>：替换只作用于本轮推送与展示；普通对话的助手消息由记忆 Advisor 在模型返回时即写入
+ * {@code chat_message}，故<b>库里保留的仍是模型原始输出</b>。要让落库内容也同步替换，需把护栏下沉到
+ * Advisor 层改写 response —— 那会牵动 token/工具元数据的重建，本版本刻意不做，此处如实标注。
  */
 @Slf4j
 @Service
@@ -40,6 +49,8 @@ public class ChatService {
     private static final String MODE_AGENT = "agent";
     /** 本轮形态：规划模式。 */
     private static final String MODE_PLANNER = "planner";
+    /** 本轮形态：并行评审（多候选作答 + 裁决综合）。 */
+    private static final String MODE_REVIEW = "review";
 
     /** 「打字机」帧间隔（毫秒），与 {@code stream} 的 {@code delayElements} 共用。 */
     private static final long TYPING_FRAME_MS = 15;
@@ -54,18 +65,25 @@ public class ChatService {
     private final MemoryMergeService memoryMergeService;
     private final AgentRoundHandler agentRoundHandler;
     private final PlannerRoundHandler plannerRoundHandler;
+    private final ReviewRoundHandler reviewRoundHandler;
     private final TraceService traceService;
+    /** 内容安全护栏（输出侧）：所有出口正文在推送/返回前过一遍；护栏关闭时完全短路。 */
+    private final ContentSafetyService safetyService;
 
     public ChatService(ConversationService conversationService,
                        MemoryMergeService memoryMergeService,
                        AgentRoundHandler agentRoundHandler,
                        PlannerRoundHandler plannerRoundHandler,
-                       TraceService traceService) {
+                       ReviewRoundHandler reviewRoundHandler,
+                       TraceService traceService,
+                       ContentSafetyService safetyService) {
         this.conversationService = conversationService;
         this.memoryMergeService = memoryMergeService;
         this.agentRoundHandler = agentRoundHandler;
         this.plannerRoundHandler = plannerRoundHandler;
+        this.reviewRoundHandler = reviewRoundHandler;
         this.traceService = traceService;
+        this.safetyService = safetyService;
     }
 
     /**
@@ -98,7 +116,7 @@ public class ChatService {
                 out.citations().size());
         afterReply(conversationId, message);
         traceService.saveAsync(trace);
-        return out.reply();
+        return screen(out.reply());
     }
 
     /**
@@ -141,6 +159,32 @@ public class ChatService {
                 .delayElements(Duration.ofMillis(TYPING_FRAME_MS));
     }
 
+    /**
+     * 局部重规划未完成任务：只重排「第一个未成功步骤及其之后」的一段，已完成步骤与其产出保持不动。
+     * <p>
+     * 与 {@link #resume} 不同，这里<b>不执行</b>任何步骤——只改库并返回新计划，等用户确认后再走续跑通路。
+     * 因此是同步接口（一次模型往返），不必开 SSE；也正因如此它不写会话记忆。
+     *
+     * @return 重排后的计划 JSON + 变更说明；无可重排内容或模型未产出可用步骤时返回 null
+     */
+    public PlannerRoundHandler.ReplanOutcome replan(String conversationId) {
+        log.info("局部重规划：会话={}", conversationId);
+        return plannerRoundHandler.replanTask(conversationId);
+    }
+
+    /**
+     * 套用规划模板：按模板的步骤骨架在当前会话落库一个新任务（<b>不执行</b>），返回计划 JSON 供前端渲染卡片。
+     * <p>
+     * 同步接口、<b>没有任何模型调用</b>—— 这正是模板存在的意义（省掉一次规划往返）。落库后由用户点
+     * 「执行计划」触发 {@link #resume}，与「先看计划」「局部重规划」共用同一条执行通路。
+     *
+     * @param tpl 模板（归属校验由 controller 完成，本方法只负责落库）
+     */
+    public PlannerRoundHandler.ApplyOutcome applyTemplate(String conversationId, TaskTemplate tpl, String goal) {
+        log.info("套用规划模板：会话={}，模板={}（{}）", conversationId, tpl.getId(), tpl.getName());
+        return plannerRoundHandler.applyTemplate(conversationId, tpl, goal);
+    }
+
     /** 续跑执行体（跑在弹性线程上），结果经 sink 推送。 */
     private void doResume(String conversationId, FluxSink<StreamEvent> sink, Long userId) {
         log.info("续跑任务：会话={}", conversationId);
@@ -159,7 +203,15 @@ public class ChatService {
             }
             trace.citations(out.citations());
             // 续跑是「任务」的专属操作，不改变会话形态；回复推送后补写引用与收尾
-            emitChunks(sink, out.reply());
+            // 审批关卡暂停：先推 approval 事件（渲染审批卡片），再推暂停说明正文
+            if (out.hasApproval()) {
+                sink.next(StreamEvent.approval(out.approvalJson()));
+            }
+            // 跨会话召回：属于「本轮用了什么素材」，排在正文之前（与 citations 的「答案角标」性质不同）
+            if (out.hasRecall()) {
+                sink.next(StreamEvent.recall(out.recallJson()));
+            }
+            emitChunks(sink, screen(out.reply()));
             String citationsJson = KbCitation.toJson(out.citations());
             if (!citationsJson.isEmpty()) {
                 sink.next(StreamEvent.citations(citationsJson));
@@ -197,9 +249,26 @@ public class ChatService {
             throw e;
         }
         if (out.clarified()) {
-            sink.next(StreamEvent.token(out.reply()));
+            sink.next(StreamEvent.token(screen(out.reply())));
         } else {
-            emitChunks(sink, out.reply());
+            // 规划暂停（「先看计划」）：先推 plan 事件让前端把卡片渲染出来，再推正文（计划清单文本）。
+            // 顺序不能反——卡片要挂在气泡上方，正文先到会让用户先看到一段没有交互入口的清单。
+            if (out.hasPlan()) {
+                sink.next(StreamEvent.plan(out.planJson()));
+            }
+            // 执行到审批关卡暂停：同理，先推 approval 事件把审批卡片渲染出来，再推暂停说明正文
+            if (out.hasApproval()) {
+                sink.next(StreamEvent.approval(out.approvalJson()));
+            }
+            // 并行评审候选：必须早于正文——候选是「结论怎么来的」，正文是结论，反了会先看到一个没有出处的答案
+            if (out.hasReview()) {
+                sink.next(StreamEvent.review(out.reviewJson()));
+            }
+            // 跨会话召回：本轮用到的历史素材，同样排在正文之前
+            if (out.hasRecall()) {
+                sink.next(StreamEvent.recall(out.recallJson()));
+            }
+            emitChunks(sink, screen(out.reply()));
         }
         // 引用：正文推完后单独发一次，前端渲染 [n] 角标与来源列表
         String citationsJson = KbCitation.toJson(out.citations());
@@ -263,7 +332,8 @@ public class ChatService {
             conv.setPlanner(planner);
         }
         RoundHandler handler = selectHandler(conv, planner);
-        trace.mode(handler == plannerRoundHandler ? MODE_PLANNER : MODE_AGENT);
+        trace.mode(handler == plannerRoundHandler ? MODE_PLANNER
+                : (handler == reviewRoundHandler ? MODE_REVIEW : MODE_AGENT));
         RoundResult r = handler.handle(conv, conversationId, message, material, progress, trace);
         // 规划策略返回回退信号（fallback，reply 为 null）：转普通对话策略兜底
         if (r == null || r.isFallback()) {
@@ -278,11 +348,31 @@ public class ChatService {
         return r;
     }
 
-    /** 选择本轮策略：请求级 planner 优先，否则回退会话默认形态。 */
+    /**
+     * 选择本轮策略：请求级 planner 优先，否则回退会话默认形态。
+     * <p>
+     * <b>评审与规划互斥</b>：两者都是「编排形态」（一个决定怎么拆、一个决定谁来答），同时开语义会打架。
+     * 故评审只在「本轮非规划」时才生效（请求显式带 {@code planner=true} 时规划优先）；开关层面另有强制
+     * 互斥（见 {@code ConversationService#updateReviewEnabled}），此处是第二道防御。
+     */
     private RoundHandler selectHandler(Conversation conv, Boolean planner) {
         boolean plan = (planner != null) ? planner
                 : (conv != null && Boolean.TRUE.equals(conv.getPlanner()));
-        return plan ? plannerRoundHandler : agentRoundHandler;
+        if (plan) return plannerRoundHandler;
+        if (conv != null && Boolean.TRUE.equals(conv.getReviewEnabled())) return reviewRoundHandler;
+        return agentRoundHandler;
+    }
+
+    /**
+     * 输出侧内容安全：命中规则即替换为提示文案（护栏关闭时零开销直接返回）。
+     * <p>
+     * 只改「推给用户看的那一份」，<b>不改库</b>——普通对话的助手消息由记忆 Advisor 在模型返回时就已落库，
+     * 本方法跑在它之后。这个边界写在类注释里，不是遗漏。
+     */
+    private String screen(String reply) {
+        if (reply == null || reply.isEmpty() || !safetyService.enabled()) return reply;
+        String blocked = safetyService.checkOutput(reply);
+        return blocked == null ? reply : blocked;
     }
 
     /**

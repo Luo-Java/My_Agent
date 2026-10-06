@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 工具注册表：启动时把两类工具统一预解析为 {@link ToolCallback}[]，并建「工具名 → 回调」索引，
@@ -21,6 +22,10 @@ import java.util.Map;
  *   <li><b>动态式</b>：{@link ToolCallbackSource} 实现类，直接产出回调（远端工具运行时才知道有哪些）。</li>
  * </ul>
  * 两类都只需 {@code @Component} + 实现接口，本类与业务代码均无需改动。
+ * <p>
+ * 此外还有<b>第三类「动态工具」</b>：实例依赖调用方上下文、无法在构造期注册（如 {@link SubAgentTool}
+ * 的候选清单随库变化），本类只为它登记元信息供前端勾选（见 {@link #DYNAMIC_TOOL_NAMES}），
+ * 实例由调用方每轮现构，且需在白名单里显式声明才挂载（见 {@link #dynamicToolRequested}）。
  * <p>
  * <b>工具名</b>取 {@code ToolDefinition.name()}（{@code @Tool} 未指定 name 时即方法名），是 {@code agent.tools_json}
  * 白名单的匹配依据；同名工具保留先注册者（注解式优先）并告警，改动 {@code @Tool} 方法名会使既有白名单失配。
@@ -41,6 +46,14 @@ public class ToolRegistry {
 
     /** 空工具集：智能体显式声明「不使用任何工具」（tools_json = "[]"）时返回。 */
     private static final ToolCallback[] EMPTY = new ToolCallback[0];
+
+    /**
+     * 动态工具名：实例依赖<b>调用方</b>上下文（如「可转交给谁」随库变化），无法在构造期注册实例，
+     * 只能登记元信息（{@link #availableTools}）供前端勾选，实例由调用方每轮现场构造。
+     * <p>
+     * 出现在 {@code tools_json} 白名单里时，{@link #resolve} 静默跳过而不告警——它不是「配错了的名字」。
+     */
+    private static final Set<String> DYNAMIC_TOOL_NAMES = Set.of(SubAgentTool.TOOL_NAME);
 
     /** 工具元信息；{@code group} 为来源（ToolProvider 类名或 ToolCallbackSource 分组名），前端按此分组展示。 */
     public record ToolInfo(String name, String description, String group) {}
@@ -63,6 +76,10 @@ public class ToolRegistry {
         }
         this.toolCallbacks = all.toArray(ToolCallback[]::new);
         this.byName = index;
+        // 动态工具只登记「元信息」供前端勾选，不登记实例：它的候选清单依赖调用方智能体，只能每轮现构。
+        if (!index.containsKey(SubAgentTool.TOOL_NAME)) {
+            infos.add(SubAgentTool.toolInfo());
+        }
         this.availableTools = List.copyOf(infos);
         log.info("工具注册完成：{} 个注解式 Bean + {} 个动态来源，共 {} 个 ToolCallback：{}",
                 toolProviders.size(), sources.size(), this.toolCallbacks.length, index.keySet());
@@ -104,10 +121,28 @@ public class ToolRegistry {
             ToolCallback cb = byName.get(n);
             if (cb != null) {
                 picked.add(cb);
-            } else {
+            } else if (!DYNAMIC_TOOL_NAMES.contains(n)) {
                 log.warn("工具装配：未知工具名 {}（已忽略）；可选工具={}", n, byName.keySet());
             }
         }
         return picked.toArray(ToolCallback[]::new);
+    }
+
+    /**
+     * 该装配声明是否<b>显式</b>要求某个动态工具（如 {@code call_agent}）。
+     * <p>
+     * <b>只认白名单</b>：{@code null}/空白（=挂全量）一律返回 false。动态工具是策略性能力，不该随「全量」
+     * 默认下发给所有智能体——详见 {@link SubAgentTool} 类注释。配置非法时同样返回 false（宁可少挂，不误挂）。
+     */
+    public boolean dynamicToolRequested(String toolsJson, String toolName) {
+        if (toolsJson == null || toolsJson.isBlank() || toolName == null) return false;
+        try {
+            for (Object o : JSONUtil.parseArray(toolsJson)) {
+                if (o != null && toolName.equals(String.valueOf(o).trim())) return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
     }
 }

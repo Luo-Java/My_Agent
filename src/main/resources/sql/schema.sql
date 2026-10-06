@@ -7,14 +7,18 @@ CREATE TABLE IF NOT EXISTS conversation (
     planner        TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否规划模式会话：1=动态规划器（运行时由 LLM 规划多智能体步骤），0=普通/智能体会话',
     agent_bind_source VARCHAR(16) DEFAULT NULL          COMMENT '智能体绑定来源：EXPLICIT=用户显式选择（保持粘住），CLARIFY=追问流程临时绑定（允许话题切换时解绑）；空=未绑定',
     rag_enabled  TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '会话级 RAG 开关：1=每轮对话自动检索资料库（通用知识库 + 路由到智能体时其专属库）并把命中内容注入上下文；0=不使用 RAG（仅靠模型自身知识）',
+    planner_confirm TINYINT(1) NOT NULL DEFAULT 0      COMMENT '规划模式「先看计划」开关：1=规划只产出计划并暂停，用户确认后才执行（计划作为待执行任务落库）；0=规划后直接执行（默认）',
+    review_enabled TINYINT(1)  NOT NULL DEFAULT 0      COMMENT '并行评审开关：1=本轮由多个候选智能体并行作答、再由裁决者综合成最终回答（候选与最终答案同推，候选不落记忆）；0=普通单智能体回答（默认）。与 planner 互斥：两者都是「编排形态」，不允许同时开',
+    cross_session  TINYINT(1)  NOT NULL DEFAULT 0      COMMENT '跨会话搜索开关：1=每轮先用 LLM 抽取检索关键词，在本用户「其他会话」的历史消息里做关键词召回并注入上下文；0=不检索（默认）。只查本人会话，天然排除当前会话',
     created_at DATETIME                                 COMMENT '会话创建时间',
     updated_at DATETIME                                 COMMENT '最后更新时间，用于会话列表倒序排序',
     summary           TEXT        DEFAULT NULL               COMMENT '较早对话的滚动摘要（长期记忆），超出最近窗口的历史由LLM压缩写入',
     summarized_count  INT         DEFAULT 0                  COMMENT '已被摘要覆盖的最旧消息条数（按时间正序索引）',
     core_facts        TEXT        DEFAULT NULL               COMMENT '用户核心信息（长期关键事实：姓名/身份/偏好/待办等），随摘要一起由LLM提取更新',
     PRIMARY KEY (id),
-    -- 会话列表按「当前用户」过滤，走此索引；会话按 user_id 隔离，用户之间互不可见
-    INDEX idx_user (user_id),
+    -- 会话列表查询是「WHERE user_id = ? ORDER BY updated_at DESC」：复合索引让过滤与排序一趟走完（免 filesort）。
+    -- 单列 (user_id) 是本索引的最左前缀，无需再单独建（存量库若已有 idx_user 可择机删除，见 alter.sql）。
+    INDEX idx_user_updated (user_id, updated_at),
     INDEX idx_agent (agent_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '会话表：记录一次完整的多轮对话';
 
@@ -104,8 +108,8 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '追踪记录ID',
     trace_id          VARCHAR(64)  NOT NULL                COMMENT '本轮唯一追踪ID（UUID，同一轮内所有阶段共用一个）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID，关联 conversation.id',
-    mode              VARCHAR(16)  DEFAULT NULL            COMMENT '本轮形态：agent=普通/智能体对话，planner=规划模式',
-    route_source      VARCHAR(24)  DEFAULT NULL            COMMENT '处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排',
+    mode              VARCHAR(16)  DEFAULT NULL            COMMENT '本轮形态：agent=普通/智能体对话，planner=规划模式，review=并行评审（多候选作答 + 裁决综合）',
+    route_source      VARCHAR(24)  DEFAULT NULL            COMMENT '处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审',
     agent_code        VARCHAR(64)  DEFAULT NULL            COMMENT '本轮实际处理/路由到的智能体编码（规划模式为最终步骤的智能体）',
     user_message      VARCHAR(1000) DEFAULT NULL           COMMENT '用户本轮输入（截断）',
     retrieval_query   VARCHAR(1000) DEFAULT NULL           COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）',
@@ -133,7 +137,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交',
     model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
     prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
     completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
@@ -186,6 +190,8 @@ CREATE TABLE IF NOT EXISTS task (
 
 -- 规划任务步骤表：任务的一步 = 一个智能体 + 指令 + 依赖前驱。
 -- 状态机：PENDING → RUNNING → DONE/SKIPPED/FAILED；FAILED 续跑时重试一次，累计失败 >= 2 判确定性失败（不再重试）。
+-- 审批关卡：approval_required=1 的步骤执行前必须先批准（approved=1），否则整条流水线在此暂停、剩余步骤保持 PENDING
+-- （task 仍 RUNNING，用户批准后走续跑通路继续）。审批是「执行前的闸门」而非状态，故不塞进 status 状态机。
 CREATE TABLE IF NOT EXISTS task_step (
     id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     task_id        VARCHAR(64)  NOT NULL                COMMENT '所属任务ID，关联 task.id',
@@ -195,6 +201,8 @@ CREATE TABLE IF NOT EXISTS task_step (
     depends_on     VARCHAR(500) DEFAULT '[]'            COMMENT '依赖的前序步骤下标（JSON数组，如 [0,1]；空表=无依赖）',
     status         VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT '步骤状态：PENDING/RUNNING/DONE/SKIPPED/FAILED',
     retry_count    INT          NOT NULL DEFAULT 0      COMMENT '重试次数（0=未重试；续跑对 FAILED 重试一次，累计>=2 判确定性失败）',
+    approval_required TINYINT(1) NOT NULL DEFAULT 0     COMMENT '该步执行前是否需要用户审批：1=执行到此步先暂停等待批准（计划阶段可改），0=直接执行',
+    approved       TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '审批是否已通过：1=已批准可执行；0=未批准。仅当 approval_required=1 时有约束意义',
     output         LONGTEXT     DEFAULT NULL            COMMENT '本步产出文本（成功时写入；失败/空为 NULL）',
     error          VARCHAR(1000) DEFAULT NULL           COMMENT '失败原因（FAILED 时）',
     citations_json TEXT         DEFAULT NULL            COMMENT '本步 RAG 引用（与 chat_message.citations_json 同构）',
@@ -231,6 +239,8 @@ CREATE TABLE IF NOT EXISTS task_step (
     depends_on     VARCHAR(500) DEFAULT '[]'            COMMENT '依赖的前序步骤下标（JSON数组，如 [0,1]；空表=无依赖）',
     status         VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT '步骤状态：PENDING/RUNNING/DONE/SKIPPED/FAILED',
     retry_count    INT          NOT NULL DEFAULT 0      COMMENT '重试次数（0=未重试；续跑对 FAILED 重试一次，累计>=2 判确定性失败）',
+    approval_required TINYINT(1) NOT NULL DEFAULT 0     COMMENT '该步执行前是否需要用户审批：1=执行到此步先暂停等待批准（计划阶段可改），0=直接执行',
+    approved       TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '审批是否已通过：1=已批准可执行；0=未批准。仅当 approval_required=1 时有约束意义',
     output         LONGTEXT     DEFAULT NULL            COMMENT '本步产出文本（成功时写入；失败/空为 NULL）',
     error          VARCHAR(1000) DEFAULT NULL           COMMENT '失败原因（FAILED 时）',
     citations_json TEXT         DEFAULT NULL            COMMENT '本步 RAG 引用（与 chat_message.citations_json 同构）',
@@ -239,6 +249,26 @@ CREATE TABLE IF NOT EXISTS task_step (
     PRIMARY KEY (id),
     INDEX idx_step_task (task_id, step_index)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务步骤表：任务每一步的产出与状态落库（断点续跑的最小粒度）';
+
+-- 「规划模板」表：把一次跑顺的多智能体规划**步骤骨架**沉淀成可复用资产，同类目标下次直接套用，
+-- 省掉一次规划模型往返（此前 task/task_step 只服务断点续跑，跑成功的序列从没被复用）。
+-- 步骤存**快照 JSON** 而非引用 task_step，两个原因：① task_step 带 status/output/retry_count 等运行态列，
+-- 模板不该背着它们；② 局部重规划（TaskService.replanTail）会删改甚至重排 task_step 行，引用式模板会被连带破坏。
+-- 按 user_id 隔离，与 conversation 同口径（越权一律 404，与「不存在」不可区分）。
+CREATE TABLE IF NOT EXISTS task_template (
+    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    user_id        BIGINT       NOT NULL                COMMENT '创建者用户ID，关联 sys_user.id；模板按用户隔离，仅本人可见',
+    name           VARCHAR(100) NOT NULL                COMMENT '模板名称（用户填写，如「周报生成」）',
+    description    VARCHAR(500) DEFAULT NULL            COMMENT '备注：适用场景、套用时该填什么目标',
+    steps_json     TEXT         NOT NULL                COMMENT '步骤骨架 JSON 数组：[{agentCode,instruction,dependsOn:[0基下标]}]；刻意不含智能体展示名（改名不该让模板失效），展示时现查',
+    source_task_id VARCHAR(64)  DEFAULT NULL            COMMENT '来源任务ID（从哪次规划存下来的，仅供追溯；源任务被删不影响模板）',
+    use_count      INT          NOT NULL DEFAULT 0      COMMENT '被套用次数（统计用，帮用户判断哪个模板值得留）',
+    created_at     DATETIME                             COMMENT '创建时间',
+    updated_at     DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    -- 列表查询是「WHERE user_id = ? ORDER BY created_at DESC」，复合索引让过滤与排序一趟走完（免 filesort）
+    INDEX idx_tpl_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划模板表：把跑顺的规划步骤骨架沉淀为可复用资产';
 
 
 -- 新增「裸 LLM 调用成本流水」表（全量成本口径）：schema.sql 已含建表语句，这里同样保留一份，
@@ -249,7 +279,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交',
     model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
     prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
     completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
@@ -280,3 +310,25 @@ CREATE TABLE IF NOT EXISTS eval_result (
     PRIMARY KEY (id),
     INDEX idx_eval_batch (batch_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词回归评测结果表：一次跑批每个用例一行，按 batch_id 分组';
+
+
+-- ---------------------------------------------------------------------------
+-- 新增「规划模板」表（功能扩展，非补列）：存量库执行这一段即可拿到该表。
+-- 与 schema.sql 里的同名建表语句一致；CREATE TABLE IF NOT EXISTS 幂等，重复执行不报错。
+-- ---------------------------------------------------------------------------
+-- 用途：把一次跑顺的多智能体规划「步骤骨架」存成模板，同类目标下次直接套用（省一次规划模型往返）。
+-- 步骤存**快照 JSON** 而不引用 task_step：那张表带 status/output/retry_count 等运行态列，
+-- 且局部重规划（TaskService.replanTail）会删改甚至重排它的行，引用式模板会被连带破坏。
+CREATE TABLE IF NOT EXISTS task_template (
+    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    user_id        BIGINT       NOT NULL                COMMENT '创建者用户ID，关联 sys_user.id；模板按用户隔离，仅本人可见',
+    name           VARCHAR(100) NOT NULL                COMMENT '模板名称（用户填写，如「周报生成」）',
+    description    VARCHAR(500) DEFAULT NULL            COMMENT '备注：适用场景、套用时该填什么目标',
+    steps_json     TEXT         NOT NULL                COMMENT '步骤骨架 JSON 数组：[{agentCode,instruction,dependsOn:[0基下标]}]；刻意不含智能体展示名（改名不该让模板失效），展示时现查',
+    source_task_id VARCHAR(64)  DEFAULT NULL            COMMENT '来源任务ID（从哪次规划存下来的，仅供追溯；源任务被删不影响模板）',
+    use_count      INT          NOT NULL DEFAULT 0      COMMENT '被套用次数（统计用，帮用户判断哪个模板值得留）',
+    created_at     DATETIME                             COMMENT '创建时间',
+    updated_at     DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    INDEX idx_tpl_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划模板表：把跑顺的规划步骤骨架沉淀为可复用资产';

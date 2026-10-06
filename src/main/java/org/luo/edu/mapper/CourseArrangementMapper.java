@@ -19,8 +19,13 @@ public interface CourseArrangementMapper extends BaseMapper<CourseArrangement> {
     /** 排课分页（join 出可读名，SQL 见 XML）。筛选条件由 dto 携带。 */
     List<CourseArrangementVO> selectCourseArrangementPage(Page<CourseArrangementVO> page, @Param("dto") CourseArrangementDTO dto);
 
-    /** 下拉选项：id + 可读文案（SQL 里 concat 拼好）。 */
-    List<OptionVO> selectOptions();
+    /**
+     * 下拉选项：id + 可读文案（SQL 里 concat 拼好）。
+     * <p>
+     * 首参固定为分页对象：XML 里没有 LIMIT，由 {@code PaginationInnerInterceptor} 注入，
+     * 调用方用 {@code new Page<>(1, 上限, false)} 把「无界查询」变成有界（false = 不额外跑 count）。
+     */
+    List<OptionVO> selectOptions(Page<OptionVO> page);
 
     /** 班级课表分页（跨表 join 出可读名称与节次区间）。筛选条件由 dto 携带。 */
     List<TimetableVO> selectTimetable(Page<TimetableVO> page, @Param("dto") TimetableDTO dto);

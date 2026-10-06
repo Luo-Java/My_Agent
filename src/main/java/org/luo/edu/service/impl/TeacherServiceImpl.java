@@ -12,6 +12,7 @@ import org.luo.edu.entity.Clazz;
 import org.luo.edu.entity.Course;
 import org.luo.edu.entity.Teacher;
 import org.luo.edu.mapper.TeacherMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.ClazzService;
 import org.luo.edu.service.CourseService;
 import org.luo.edu.service.TeacherService;
@@ -29,6 +30,9 @@ import java.util.List;
 public class TeacherServiceImpl extends ServiceImpl<TeacherMapper, Teacher> implements TeacherService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private ClazzService clazzService;
 
     @Resource
@@ -42,7 +46,10 @@ public class TeacherServiceImpl extends ServiceImpl<TeacherMapper, Teacher> impl
 
     @Override
     public List<OptionVO> options() {
-        return list(new LambdaQueryWrapper<Teacher>().orderByAsc(Teacher::getId)).stream()
+        // 下拉选项装上限：靠分页插件注入 LIMIT（false = 不额外跑 count），避免无界全表装载
+        List<Teacher> rows = page(new Page<>(1, eduProperties.probeLimit(), false),
+                new LambdaQueryWrapper<Teacher>().orderByAsc(Teacher::getId)).getRecords();
+        return eduProperties.trim(rows, "teacher").stream()
                 .map(x -> new OptionVO(x.getId().longValue(), x.getName()))
                 .toList();
     }

@@ -1,5 +1,8 @@
 package org.luo.ai.controller;
 
+import org.luo.ai.dto.AgentImportRequest;
+import org.luo.ai.dto.AgentImportResult;
+import org.luo.ai.dto.AgentPortable;
 import org.luo.ai.dto.GeneratePromptRequest;
 import org.luo.ai.dto.GeneratePromptResponse;
 import org.luo.ai.dto.UpsertAgentRequest;
@@ -95,5 +98,30 @@ public class AgentController {
     public GeneratePromptResponse generatePrompt(@RequestBody GeneratePromptRequest req) {
         String prompt = promptService.generateAgentPrompt(req.name(), req.description());
         return new GeneratePromptResponse(prompt);
+    }
+
+    // ===== 导入 / 导出：把智能体当「资产」搬进搬出 =====
+
+    /**
+     * 导出全部智能体为可移植 JSON（剥掉本地自增 id 与时间戳）。
+     * <p>
+     * 包内<b>不含</b>智能体的专属知识库及其文件——那属于知识库模块、体积也可能很大，换环境时需另行重建。
+     * 这里保证人设、参数清单、工具装配、模型参数完整带走。
+     * <p>
+     * 路径 {@code /export} 是字面量，优先于 {@code /{id}} 匹配（同 {@code /tools}、{@code /by-code}），二者不冲突。
+     */
+    @GetMapping("/export")
+    public List<AgentPortable> export() {
+        return agentService.exportPortable();
+    }
+
+    /**
+     * 导入智能体（按 {@code agentCode} 匹配既有记录；{@code onConflict} = {@code skip} 跳过 / {@code overwrite} 覆盖）。
+     * 逐条独立处理：单条数据不合法只计入返回结果的 {@code errors}，不影响其余条目。
+     */
+    @PostMapping("/import")
+    public AgentImportResult importAgents(@RequestBody(required = false) AgentImportRequest req) {
+        return agentService.importPortable(req == null ? null : req.agents(),
+                req == null ? null : req.onConflict());
     }
 }

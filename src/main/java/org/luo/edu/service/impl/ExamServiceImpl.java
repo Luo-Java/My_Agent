@@ -11,6 +11,7 @@ import org.luo.edu.dto.ExamDTO;
 import org.luo.edu.entity.Exam;
 import org.luo.edu.entity.Score;
 import org.luo.edu.mapper.ExamMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.ExamService;
 import org.luo.edu.service.ScoreService;
 import org.luo.edu.vo.ExamVO;
@@ -27,6 +28,9 @@ import java.util.List;
 public class ExamServiceImpl extends ServiceImpl<ExamMapper, Exam> implements ExamService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private ScoreService scoreService;
 
     @Override
@@ -37,7 +41,9 @@ public class ExamServiceImpl extends ServiceImpl<ExamMapper, Exam> implements Ex
 
     @Override
     public List<OptionVO> options() {
-        return baseMapper.selectOptions();
+        // 下拉选项装上限：XML 里没有 LIMIT，靠分页插件注入（false = 不额外跑 count）
+        List<OptionVO> rows = baseMapper.selectOptions(new Page<>(1, eduProperties.probeLimit(), false));
+        return eduProperties.trim(rows, "exam");
     }
 
     @Override

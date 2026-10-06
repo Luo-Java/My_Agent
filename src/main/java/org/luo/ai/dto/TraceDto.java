@@ -12,7 +12,7 @@ import java.util.List;
  * 「回答成本」而非「本轮全部成本」，用作横向对比足够，别当账单。
  *
  * @param mode           agent=普通/智能体对话，planner=规划模式
- * @param routeSource    BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排
+ * @param routeSource    BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审
  * @param retrievalQuery 本轮实际用于检索的问题（多轮改写产物）；null=未改写
  * @param toolCalls      工具调用明细（无调用为空表）
  * @param citations      RAG 引用来源（无引用为空表）

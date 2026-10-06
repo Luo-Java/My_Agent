@@ -48,7 +48,7 @@ function modeLabel(mode) {
 
 /** 处理方来源 → 中文标签。 */
 function routeLabel(src) {
-    const map = { BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排' };
+    const map = { BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排', REVIEW: '并行评审' };
     return map[src] || (src || '未知');
 }
 

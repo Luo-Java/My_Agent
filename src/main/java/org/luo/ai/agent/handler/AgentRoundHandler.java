@@ -133,8 +133,9 @@ public class AgentRoundHandler implements RoundHandler {
         if (reply == null) reply = "";
         // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
         if (!explicitBinding) conversationService.unbindAgent(conversationId);
-        // 带上本轮 RAG 引用：由 ChatService 落库到本轮 assistant 消息（前端渲染角标用）
-        return RoundResult.answer(reply, composed.citations());
+        // 带上本轮 RAG 引用（由 ChatService 落库到本轮 assistant 消息、前端渲染角标）与跨会话召回
+        // （仅推 SSE recall 事件供展示，不落库）。召回为空时 withRecall 原样返回，不影响其余字段。
+        return RoundResult.answer(reply, composed.citations()).withRecall(composed.recallJson());
     }
 
     /** 判断本次请求应绑定的智能体：显式绑定优先；未绑定的普通会话走智能路由；二者皆无则返回 null（普通对话）。 */

@@ -11,6 +11,7 @@ import org.luo.edu.dto.StudentDTO;
 import org.luo.edu.entity.Score;
 import org.luo.edu.entity.Student;
 import org.luo.edu.mapper.StudentMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.ScoreService;
 import org.luo.edu.service.StudentService;
 import org.luo.edu.vo.OptionVO;
@@ -27,6 +28,9 @@ import java.util.List;
 public class StudentServiceImpl extends ServiceImpl<StudentMapper, Student> implements StudentService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private ScoreService scoreService;
 
     @Override
@@ -37,7 +41,10 @@ public class StudentServiceImpl extends ServiceImpl<StudentMapper, Student> impl
 
     @Override
     public List<OptionVO> options() {
-        return list(new LambdaQueryWrapper<Student>().orderByAsc(Student::getId)).stream()
+        // 下拉选项装上限：靠分页插件注入 LIMIT（false = 不额外跑 count），避免无界全表装载
+        List<Student> rows = page(new Page<>(1, eduProperties.probeLimit(), false),
+                new LambdaQueryWrapper<Student>().orderByAsc(Student::getId)).getRecords();
+        return eduProperties.trim(rows, "student").stream()
                 .map(x -> new OptionVO(x.getId().longValue(), x.getName()))
                 .toList();
     }

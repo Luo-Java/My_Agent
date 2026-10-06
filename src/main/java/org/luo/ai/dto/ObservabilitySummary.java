@@ -59,7 +59,7 @@ public record ObservabilitySummary(Overview overview,
     public record ModeBucket(String mode, long rounds, long errors, long avgElapsedMs, long avgTokens) {
     }
 
-    /** 单来源桶：BOUND / ROUTE / NONE / PLAN。 */
+    /** 单来源桶：BOUND / ROUTE / NONE / PLAN / REVIEW。 */
     public record RouteBucket(String routeSource, long rounds, long errors, long avgElapsedMs) {
     }
 

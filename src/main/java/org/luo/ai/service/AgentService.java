@@ -3,6 +3,8 @@ package org.luo.ai.service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import lombok.extern.slf4j.Slf4j;
+import org.luo.ai.dto.AgentImportResult;
+import org.luo.ai.dto.AgentPortable;
 import org.luo.ai.dto.UpsertAgentRequest;
 import org.luo.ai.entity.Agent;
 import org.luo.ai.entity.Conversation;
@@ -26,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import org.luo.ai.agent.AgentRouter;
 import org.luo.ai.agent.PlannerService;
@@ -159,6 +162,110 @@ public class AgentService {
         return agentMapper.selectOne(new QueryWrapper<Agent>()
                 .eq("agent_code", code.trim())
                 .last("LIMIT 1"));
+    }
+
+    /** 导出全部智能体为可移植定义（剥掉本地自增 id 与时间戳），供备份 / 换环境迁移 / 分享。 */
+    public List<AgentPortable> exportPortable() {
+        return listAgents().stream().map(AgentPortable::of).toList();
+    }
+
+    /**
+     * 导入智能体（按 {@code agentCode} 匹配既有记录）。
+     * <p>
+     * <b>逐条容错</b>：某条不合规只记进 {@code errors} 并继续下一条 —— 导入是批量写入，不该因为包里
+     * 混进一条脏数据，让前面已经写进去的部分白做（它们确实已落库，整批回滚只会更糟）。
+     * <p>
+     * 冲突策略：
+     * <ul>
+     *   <li>{@code skip}（默认）—— 同编码已存在则跳过，包内定义不生效；</li>
+     *   <li>{@code overwrite} —— 用包内定义覆盖<b>内容列</b>，保留本地 {@code id} 与 {@code created_at}。
+     *       id 不能换：它被 {@code conversation.agent_id} 引用，换掉会让既有会话集体失绑。</li>
+     * </ul>
+     * 编码为空的条目按名称自动生成编码（{@link #genAgentCode}），因此这类条目每次导入都会新建一条。
+     *
+     * @param items      可移植定义列表；null / 空 = 无事发生
+     * @param onConflict 冲突策略；除 {@code overwrite} 外一律按 {@code skip} 处理
+     */
+    @Transactional
+    public AgentImportResult importPortable(List<AgentPortable> items, String onConflict) {
+        if (items == null || items.isEmpty()) {
+            return new AgentImportResult(0, 0, 0, 0, List.of());
+        }
+        boolean overwrite = "overwrite".equalsIgnoreCase(onConflict == null ? "" : onConflict.trim());
+        int created = 0, updated = 0, skipped = 0;
+        List<String> errors = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            AgentPortable p = items.get(i);
+            String label = (p == null || p.agentCode() == null || p.agentCode().isBlank())
+                    ? ("第 " + (i + 1) + " 条" + (p != null && p.name() != null ? "（" + p.name() + "）" : ""))
+                    : p.agentCode();
+            try {
+                if (p == null) {
+                    errors.add(label + "：条目为空");
+                    continue;
+                }
+                if (p.description() == null || p.description().isBlank()) {
+                    errors.add(label + "：缺少必填的「描述」");
+                    continue;
+                }
+                if (p.systemPrompt() == null || p.systemPrompt().isBlank()) {
+                    errors.add(label + "：缺少必填的「系统提示词」");
+                    continue;
+                }
+                Agent exist = (p.agentCode() == null || p.agentCode().isBlank()) ? null : getByCode(p.agentCode());
+                if (exist != null && !overwrite) {
+                    skipped++;
+                    continue;
+                }
+                if (exist != null) {
+                    applyPortable(exist, p);
+                    exist.setUpdatedAt(LocalDateTime.now());
+                    agentMapper.updateById(exist);
+                    updated++;
+                } else {
+                    Agent a = new Agent();
+                    applyPortable(a, p);
+                    if (a.getAgentCode() == null || a.getAgentCode().isBlank()) {
+                        a.setAgentCode(genAgentCode(a.getName()));   // 编码为空：按名称生成并自动避让
+                    }
+                    LocalDateTime now = LocalDateTime.now();
+                    a.setCreatedAt(now);
+                    a.setUpdatedAt(now);
+                    agentMapper.insert(a);
+                    created++;
+                }
+            } catch (Exception e) {
+                log.warn("导入智能体失败：{}", label, e);
+                errors.add(label + "：" + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+            }
+        }
+        log.info("导入智能体完成：共 {} 条，新建 {}，覆盖 {}，跳过 {}，失败 {}",
+                items.size(), created, updated, skipped, errors.size());
+        syncPromptFile();
+        return new AgentImportResult(items.size(), created, updated, skipped, errors);
+    }
+
+    /** 可移植定义 → 实体内容列（不动 id / 时间戳，由调用方决定）。必填项已在校验阶段保证非空。 */
+    private void applyPortable(Agent a, AgentPortable p) {
+        String name = (p.name() == null || p.name().isBlank())
+                ? (p.agentCode() == null || p.agentCode().isBlank() ? "未命名智能体" : p.agentCode())
+                : p.name().trim();
+        a.setName(name);
+        if (p.agentCode() != null && !p.agentCode().isBlank()) a.setAgentCode(p.agentCode().trim());
+        a.setIcon(trimToNull(p.icon()));
+        a.setDescription(p.description().trim());
+        a.setSystemPrompt(p.systemPrompt());
+        a.setParamSchema(trimToNull(p.paramSchema()));
+        // toolsJson 的 null 有意义（= 挂全部工具），不能被「空值跳过」吃掉；空串与 null 同义，一并归一
+        a.setToolsJson(trimToNull(p.toolsJson()));
+        a.setModel(trimToNull(p.model()));
+        a.setTemperature(p.temperature());
+        a.setAvatarColor(trimToNull(p.avatarColor()));
+    }
+
+    /** 空白 → null（库内语义上「没写」与「写了空串」等价，统一成 null 少一种状态）。 */
+    private static String trimToNull(String s) {
+        return (s == null || s.isBlank()) ? null : s.trim();
     }
 
     /** 生成智能体清单文本（每行 {@code "- 名称 (编码)：描述"}），供智能路由与动态规划共用同一格式。 */

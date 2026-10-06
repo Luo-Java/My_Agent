@@ -3,12 +3,14 @@ package org.luo.edu.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import jakarta.annotation.Resource;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.common.result.PageResult;
 import org.luo.edu.dto.CourseArrangementDTO;
 import org.luo.edu.entity.CourseArrangement;
 import org.luo.edu.mapper.CourseArrangementMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.CourseArrangementService;
 import org.luo.edu.vo.CourseArrangementVO;
 import org.luo.edu.vo.OptionVO;
@@ -23,6 +25,9 @@ import java.util.List;
 @Service
 public class CourseArrangementServiceImpl extends ServiceImpl<CourseArrangementMapper, CourseArrangement> implements CourseArrangementService {
 
+    @Resource
+    private EduProperties eduProperties;
+
     @Override
     public PageResult<CourseArrangementVO> page(CourseArrangementDTO dto) {
         Page<CourseArrangementVO> p = dto.toPage();
@@ -31,7 +36,9 @@ public class CourseArrangementServiceImpl extends ServiceImpl<CourseArrangementM
 
     @Override
     public List<OptionVO> options() {
-        return baseMapper.selectOptions();
+        // 下拉选项装上限：XML 里没有 LIMIT，靠分页插件注入（false = 不额外跑 count）
+        List<OptionVO> rows = baseMapper.selectOptions(new Page<>(1, eduProperties.probeLimit(), false));
+        return eduProperties.trim(rows, "course_arrangement");
     }
 
     @Override

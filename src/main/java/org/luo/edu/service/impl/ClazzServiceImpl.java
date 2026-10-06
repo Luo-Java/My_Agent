@@ -13,6 +13,7 @@ import org.luo.edu.entity.Course;
 import org.luo.edu.entity.Exam;
 import org.luo.edu.entity.Student;
 import org.luo.edu.mapper.ClazzMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.ClazzService;
 import org.luo.edu.service.CourseService;
 import org.luo.edu.service.ExamService;
@@ -31,6 +32,9 @@ import java.util.List;
 public class ClazzServiceImpl extends ServiceImpl<ClazzMapper, Clazz> implements ClazzService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private StudentService studentService;
 
     @Resource
@@ -47,7 +51,10 @@ public class ClazzServiceImpl extends ServiceImpl<ClazzMapper, Clazz> implements
 
     @Override
     public List<OptionVO> options() {
-        return list(new LambdaQueryWrapper<Clazz>().orderByAsc(Clazz::getId)).stream()
+        // 下拉选项装上限：靠分页插件注入 LIMIT（false = 不额外跑 count），避免无界全表装载
+        List<Clazz> rows = page(new Page<>(1, eduProperties.probeLimit(), false),
+                new LambdaQueryWrapper<Clazz>().orderByAsc(Clazz::getId)).getRecords();
+        return eduProperties.trim(rows, "clazz").stream()
                 .map(x -> new OptionVO(x.getId().longValue(), x.getName()))
                 .toList();
     }

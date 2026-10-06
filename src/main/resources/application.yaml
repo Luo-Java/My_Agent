@@ -88,6 +88,58 @@ agent:
     cases-file: classpath:eval-cases.yaml
     timeout-seconds: 60         # 单用例超时，超时记该条失败而不拖垮整批(被测调用自身没有 per-request 超时)
 
+  # 教务模块(EduProperties)：各 /api/edu/**/list 下拉选项接口的返回上限。
+  # 这些接口语义是「返回全部可选项」，原本 SQL 层没有上界 —— score 的 selectOptions 要 join 5 张表
+  # 再 concat 拼文案，在 5 万行数据下全量装载既慢又占内存。超出上限时截断并留 WARN（不静默）。
+  edu:
+    options-max-rows: 500
+
+  # 成本配额(QuotaProperties)：给单个用户的「当日 token 消耗」装上界，防一个账号把额度烧光。
+  # 默认关闭 —— 关着时闸门完全短路(不查库、不判断)，行为与不配这一节完全一致。
+  # 口径：agent_trace(回答+工具循环) + llm_usage(路由/抽取/改写/规划/视觉/记忆合并等裸调用)，
+  #      用户归属靠 JOIN conversation 判定(两表都没有 user_id)，因此「无会话的调用」不计入任何人的配额。
+  # 超限表现：入口直接拒绝并说明「已用多少/上限多少/何时重置」，不静默降级(不换成小模型、不悄悄截断历史)。
+  # 已知边界：检查在每轮开始前，单轮用量无法预知故可能小幅超出；/api/eval/** 跑批不在闸门覆盖内。
+  quota:
+    enabled: false             # 是否启用配额闸门
+    daily-tokens: 2000000      # 每用户每自然日 token 上限(默认 200 万，约合 400~1000 轮普通对话)
+    warn-ratio: 0.9            # 预警比例：达到即在流里播一条提示，但不拦截
+    exempt-admins: true        # 豁免 ADMIN(否则管理员把额度用满后无法再通过界面调回配额)
+
+  # 内容安全护栏(SafetyProperties)：对话链路的输入/输出侧基础护栏，按正则规则命中拦截。
+  # 默认关闭 —— 关着时两侧完全短路(不编译规则、不扫文本)，行为与不配这一节完全一致。
+  # 与「提示词里写安全要求」的区别：那是提示词行为工程(模型不照做就不生效)，这里是平台侧可确定执行的判定。
+  # 拦截口径(不静默降级)：输入命中→明确拒绝(同步 422 / 流式 error 事件，本轮零模型调用)；
+  #                       输出命中→明确替换为 blocked-message 并落 WARN(不假装成功、不悄悄改内容)。
+  # 已知边界：正则只是字面/模式匹配，不是语义审核，换个说法即可绕过；要语义级审核需接专门的内容审核服务。
+  # 规则只写进配置、命中日志不落用户原文(避免被拦内容二次留存进日志)。
+  safety:
+    enabled: false             # 是否启用护栏
+    max-input-chars: 0         # 单条用户输入字符上限(0=不限)；超限按输入侧拦截同一口径处理
+    blocked-message: 该内容不符合使用规范，已被安全策略拦截
+    input-patterns: []         # 输入侧正则规则(任一命中即拒绝)。示例：["(?i)\\brm\\s+-rf\\s+/"]
+    output-patterns: []        # 输出侧正则规则(任一命中即替换正文)。示例：["(?i)sk-[a-zA-Z0-9]{20,}"]
+
+  # 并行评审(ReviewProperties)：会话开「⚖ 评审」后，本轮由多个候选智能体并行作答、再由裁决者综合成最终答案。
+  # 候选由 LLM 按「谁最适合回答这个问题」从智能体库里选；会话若已绑定智能体则固定占一个候选位。
+  # 不足 2 个候选时明确播报原因并回退普通对话 —— 不静默降级成单模型回答。
+  # 成本约为 (候选数 + 1) 次普通对话；候选答案只走 SSE 展示、不进会话记忆(进记忆的只有综合结论)。
+  review:
+    candidates: 3              # 候选数量(含被绑定的智能体)
+    max-candidates: 5          # 候选数量硬上限(每个候选都是一次真实模型调用)
+    timeout-seconds: 90        # 单候选作答等待上限；超时按弃权处理并记 WARN，不拖垮整轮
+
+  # 跨会话搜索(CrossSessionProperties)：会话开「🔎 跨会话」后，在本人其他会话的历史消息里做关键词召回并注入。
+  # 为什么是关键词而非向量：会话消息逐轮写入，走向量检索等于每条消息多一次 embedding 调用 + 一套副本维护链路，
+  # 且会与知识库块(kb_chunk)的向量空间互相干扰；代价是召回质量受限于提词质量与字面匹配(明确接受的边界)。
+  # 归属隔离靠 JOIN conversation(user_id)，并强制排除当前会话(当前会话已在记忆窗口里)。
+  cross-session:
+    enabled: true              # 能力总开关(真正的启用条件是「本开关开 且 会话开关开」)
+    recall-limit: 50           # SQL 层候选条数上限(先粗拉再在 Java 侧定型，避免大表无界扫描)
+    top-k: 3                   # 最终注入上下文的条数
+    max-keywords: 5            # 从当前问题抽取的关键词个数上限
+    snippet-chars: 300         # 单条召回内容注入与展示的截断长度
+
   # 工具循环控制(ToolCallProperties)：给 Spring AI 默认无限工具循环装刹车，防死循环/重复调用拖垮 token
   tool-call:
     max-iterations: 10        # 模型往返轮数硬顶，覆盖「查表→查数→画图」这类合理长链，只兜底真死循环
@@ -136,9 +188,12 @@ chroma:
 app:
   jwt:
     enabled: true            # 强制登录；置 false 则 /api/** 不再校验 token（回到引入用户系统前的行为）
-    # 签名密钥不进仓库：用环境变量 JWT_SECRET 注入（如 openssl rand -hex 32）。
-    # 留空或不足 32 字节时启动生成随机密钥并打 WARN —— 仅够本地开发，重启后所有已签发 token 失效。
-    secret: ${JWT_SECRET:457a37ff516ef1cd2100ea1573063358ab578395b7515b252c14eaa71bbd0d74}
+    # 签名密钥**在这里不写值**。原因：写一个内置默认值 = 把签名密钥随源码一起分发，
+    # 拿到源码的人可以离线伪造任意账号（含 ADMIN）的 token，且从日志上看不出异常。
+    # 来源二选一：环境变量 JWT_SECRET（openssl rand -hex 32），或 application-local.yaml（已 gitignore）的 app.jwt.secret。
+    # 两处都没配（或不足 32 字节）时 JwtTokenService 生成随机密钥并打 WARN —— 仅够本地开发，重启后已签发 token 全失效。
+    # 注意：**不要在这里留空占位符**（secret: ""）—— 空串会覆盖 application-local.yaml 里的值，等于把密钥改没。
+    # 要用环境变量注入就写 secret: ${JWT_SECRET}（占位符解析不到会启动失败，比静默回落到随机密钥更早暴露）。
     expire-minutes: 720      # token 有效期（分钟）
     issuer: my-agent
     bootstrap-admin: true    # 启动时若 sys_user 表为空则创建初始管理员（否则首次无法登录）

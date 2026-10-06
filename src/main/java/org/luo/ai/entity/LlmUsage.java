@@ -32,7 +32,7 @@ public class LlmUsage {
     /** 所属会话 ID（可空：如生成智能体人设这类无会话的调用）。 */
     private String conversationId;
 
-    /** 调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / VISION=视觉识别 / MEMORY_MERGE=记忆合并。 */
+    /** 调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交 / RECALL=跨会话召回提词 / REVIEW=并行评审。 */
     private String purpose;
 
     /** 实际使用的模型名（可空：未显式指定时取默认模型）。 */

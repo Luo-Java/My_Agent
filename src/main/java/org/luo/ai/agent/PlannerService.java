@@ -100,6 +100,67 @@ public class PlannerService {
         }
     }
 
+    /**
+     * 局部重规划：只重排「第一个未完成步骤及其之后」的一段，已成功完成的上游步骤保持不动。
+     * <p>
+     * 与 {@link #plan(String)} 的区别在输入：这里额外告知「哪些步骤已经完成、产出了什么」以及
+     * 「即将被替换的那几步本来长什么样、上次为什么失败」。交付给模型的口径与首次规划一致（同样是
+     * {@code {steps:[{agentCode,instruction,dependsOn}]}}），所以解析、过滤、依赖重映射都能复用既有路径。
+     *
+     * @param userGoal   任务原始目标（触发首次规划的那句话）
+     * @param upstream   已完成步骤的描述行（含产出摘要）：<b>不会自动传入新步骤</b>，模型需把要点内联进指令
+     * @param tail       待重排步骤的描述行（含原指令与失败原因）
+     * @return 新一段的步骤列表；解析失败或无可用智能体返回空列表（调用方据此放弃重规划，不改库）
+     */
+    public List<PlanStep> replan(String userGoal, List<String> upstream, List<String> tail) {
+        List<Agent> agents = agentService.listAgents();
+        if (agents == null || agents.isEmpty()) {
+            log.debug("局部重规划：暂无可用智能体");
+            return List.of();
+        }
+        try {
+            String list = agentService.buildAgentListText(agents);
+            String system = PromptProperties.render(promptProperties.plannerReplanSystem(),
+                    Map.of("agentList", list));
+            ChatResponse response = composer.internalChatClient().prompt()
+                    .system(system)
+                    .user(buildReplanUser(userGoal, upstream, tail))
+                    .call()
+                    .chatResponse();
+            // 与首次规划同口径计入成本（type 复用 PLAN：两者都是规划往返，成本看板上无需再分一类）
+            llmUsageService.recordAsync("PLAN", null, null, response);
+            if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+                return List.of();
+            }
+            String reply = response.getResult().getOutput().getText();
+            if (reply == null || reply.isBlank()) return List.of();
+            return parsePlan(stripFences(reply));
+        } catch (Exception e) {
+            log.warn("局部重规划失败", e);
+            return List.of();
+        }
+    }
+
+    /** 拼局部重规划的 user 消息：原始目标 + 已完成步骤（附产出摘要）+ 待重排那一段的原貌。 */
+    private static String buildReplanUser(String userGoal, List<String> upstream, List<String> tail) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户目标：\n").append(userGoal == null ? "" : userGoal).append("\n\n");
+        sb.append("已经完成的步骤（保持不动，产出要点如下，可据此在新指令里引用其结论）：\n");
+        if (upstream == null || upstream.isEmpty()) {
+            sb.append("（无，本段就是计划的开始）\n");
+        } else {
+            for (String line : upstream) sb.append(line).append("\n");
+        }
+        sb.append("\n需要你重新规划的步骤（从这一步开始，到原计划结尾）：\n");
+        if (tail == null || tail.isEmpty()) {
+            sb.append("（无）\n");
+        } else {
+            for (String line : tail) sb.append(line).append("\n");
+        }
+        sb.append("\n请只输出这一段的新步骤。");
+        return sb.toString();
+    }
+
     /** 解析规划回复为步骤列表：识别 {@code steps} 数组，逐个取 agentCode + instruction + dependsOn（Hutool JSONUtil，规避 Jackson）。 */
     private List<PlanStep> parsePlan(String reply) {
         try {

@@ -31,7 +31,7 @@ public class AgentTrace {
     /** 本轮形态：agent=普通/智能体对话，planner=规划模式。 */
     private String mode;
 
-    /** 处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排。 */
+    /** 处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审。 */
     private String routeSource;
 
     /** 本轮实际处理（规划模式为最终步骤）的智能体编码。 */

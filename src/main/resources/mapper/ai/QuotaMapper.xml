@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.ai.mapper.QuotaMapper">
+
+    <!--
+      按用户汇总时间窗内的全量 token：agent_trace（回答 + 工具循环）UNION ALL llm_usage（裸调用）。
+      归属靠 JOIN conversation 判定（两表都没有 user_id 列）；无会话的调用天然不计入，属于有意为之。
+      COALESCE 不可省：零行时 SUM 返回 NULL，而接收方是 primitive long，NULL 会直接抛
+      IllegalArgumentException（"0,null" 这类型）；且配额比较一旦拿到 NULL 会静默判 false，
+      表现为「配额永远不生效」——两种后果都很难查。
+    -->
+    <select id="sumUserTokensSince" resultType="long">
+        SELECT COALESCE(SUM(x.tokens), 0)
+        FROM (
+            SELECT t.total_tokens AS tokens
+            FROM agent_trace t
+            JOIN conversation c ON c.id = t.conversation_id
+            WHERE c.user_id = #{userId}
+              AND t.created_at &gt;= #{since}
+            UNION ALL
+            SELECT u.total_tokens AS tokens
+            FROM llm_usage u
+            JOIN conversation c ON c.id = u.conversation_id
+            WHERE c.user_id = #{userId}
+              AND u.created_at &gt;= #{since}
+        ) x
+    </select>
+
+</mapper>

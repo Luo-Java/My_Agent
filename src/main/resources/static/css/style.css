@@ -468,6 +468,364 @@ header {
     opacity: .5;
     cursor: not-allowed;
 }
+/* 次要动作（重新规划）：中性描边，不与主按钮抢视觉焦点。与上面的 hover 规则同特异性，靠源顺序覆盖。 */
+.resume-bar-btn-ghost {
+    border-color: rgba(148, 163, 184, .35);
+    background: transparent;
+    color: var(--text-soft);
+}
+.resume-bar-btn-ghost:hover:not(:disabled) {
+    background: rgba(148, 163, 184, .14);
+    border-color: rgba(148, 163, 184, .5);
+}
+
+/* ===== 待确认计划卡片（规划模式「先看计划」开关开启时，AI 气泡内） =====
+   规划暂停后展示步骤清单与「执行计划」按钮；配色沿用规划主题的蓝色（与 .resume-bar 同族）。
+   点按钮走的就是断点续跑通路，因此按钮的禁用条件与续跑一致（loading）。 */
+.plan-card {
+    margin: 0 0 10px;
+    border: 1px solid rgba(124, 176, 255, .22);
+    border-radius: 10px;
+    background: rgba(59, 130, 246, .08);
+    overflow: hidden;
+}
+
+.plan-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(124, 176, 255, .16);
+    font-size: 13px;
+    color: var(--primary-text);
+}
+
+.plan-card-title {
+    font-weight: 500;
+}
+
+.plan-card-state {
+    flex: none;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, .18);
+    color: var(--primary-text);
+    font-size: 12px;
+}
+
+.plan-card-state.done {
+    background: rgba(148, 163, 184, .18);
+    color: var(--text-soft);
+}
+
+.plan-card-steps {
+    padding: 6px 12px;
+}
+
+.plan-step {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-soft);
+}
+
+.plan-step-no {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: rgba(59, 130, 246, .18);
+    color: var(--primary-text);
+    font-size: 11px;
+    line-height: 18px;
+    text-align: center;
+}
+
+.plan-step-agent {
+    flex: none;
+    color: var(--primary-text);
+    font-weight: 500;
+}
+
+.plan-step-inst {
+    flex: 1;
+    word-break: break-word;
+}
+
+.plan-run-btn {
+    display: block;
+    width: calc(100% - 24px);
+    margin: 2px 12px 12px;
+    padding: 7px 12px;
+    border: 1px solid rgba(124, 176, 255, .4);
+    border-radius: 8px;
+    background: rgba(59, 130, 246, .16);
+    color: var(--primary-text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease;
+}
+
+.plan-run-btn:hover:not(:disabled) {
+    background: rgba(59, 130, 246, .28);
+    border-color: rgba(124, 176, 255, .6);
+}
+
+.plan-run-btn:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+/* 计划卡片底部动作行：「执行计划」仍是主按钮，右边挂次要的「存为模板」。
+   存为模板在计划执行后仍可用 —— 恰恰是跑完才知道这套步骤真行得通。 */
+.plan-card-actions {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin: 2px 12px 12px;
+}
+
+/* 进入 flex 行后由 flex 分配宽度，抵消 .plan-run-btn 原本「整宽块」的自定位 */
+.plan-card-actions .plan-run-btn {
+    flex: 1;
+    width: auto;
+    margin: 0;
+}
+
+.plan-card-actions .plan-tpl-btn {
+    flex: 0 0 auto;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-soft);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+}
+
+.plan-card-actions .plan-tpl-btn:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+}
+
+.plan-card-actions .plan-tpl-btn:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+/* ===== 规划模板弹窗 ===== */
+.tpl-list {
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+
+.tpl-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background .12s;
+}
+
+.tpl-item:last-child { border-bottom: none; }
+.tpl-item:hover { background: var(--surface); }
+.tpl-item.active { background: rgba(59, 130, 246, .14); }
+
+.tpl-item-main { flex: 1; min-width: 0; }
+.tpl-item-name { font-size: 13px; color: var(--text); }
+
+.tpl-item-meta {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--text-soft);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tpl-del {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-soft);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color .15s, color .15s;
+}
+
+.tpl-del:hover { border-color: var(--danger); color: var(--danger); }
+
+.tpl-empty {
+    padding: 18px 4px;
+    text-align: center;
+    color: var(--text-soft);
+    font-size: 13px;
+}
+
+.tpl-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.tpl-err {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--danger);
+}
+
+/* 步骤就地编辑：「先看计划」下逐条审阅、改完再执行。
+   只读态是「序号 + 智能体 + 指令」的单行 flex；编辑态整块改成纵向表单，
+   序号要显式 inline-block 才能保住方块外观（它原本靠 flex item 隐式 blockify）。 */
+.plan-step.editing {
+    display: block;
+    padding: 8px 0;
+}
+
+.plan-step.editing .plan-step-no {
+    display: inline-block;
+    margin-right: 6px;
+}
+
+.plan-step-deps {
+    flex: none;
+    font-size: 11px;
+    color: var(--text-soft);
+    opacity: .8;
+}
+
+.plan-step-edit {
+    flex: none;
+    padding: 1px 8px;
+    border: 1px solid rgba(124, 176, 255, .3);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--primary-text);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.plan-step-edit:hover {
+    background: rgba(59, 130, 246, .18);
+}
+
+.plan-step-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 6px 0 0 26px;
+}
+
+.plan-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.plan-field > span {
+    font-size: 11px;
+    opacity: .85;
+}
+
+.plan-field select,
+.plan-field textarea {
+    padding: 5px 8px;
+    border: 1px solid rgba(124, 176, 255, .25);
+    border-radius: 6px;
+    background: rgba(15, 23, 42, .35);
+    color: var(--primary-text);
+    font-size: 12px;
+    font-family: inherit;
+    resize: vertical;
+}
+
+.plan-field select:focus,
+.plan-field textarea:focus {
+    outline: none;
+    border-color: rgba(124, 176, 255, .6);
+}
+
+.dep-opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding-top: 2px;
+}
+
+.dep-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--primary-text);
+    cursor: pointer;
+}
+
+.plan-step-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-top: 2px;
+}
+
+.plan-step-save,
+.plan-step-cancel {
+    padding: 4px 12px;
+    border: 1px solid rgba(124, 176, 255, .4);
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.plan-step-save {
+    background: rgba(59, 130, 246, .22);
+    color: var(--primary-text);
+}
+
+.plan-step-save:hover:not(:disabled) {
+    background: rgba(59, 130, 246, .34);
+}
+
+.plan-step-cancel {
+    background: transparent;
+    border-color: rgba(148, 163, 184, .3);
+    color: var(--text-soft);
+}
+
+.plan-step-save:disabled,
+.plan-step-cancel:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.plan-step-err {
+    font-size: 12px;
+    color: #f87171;
+}
+
+.plan-card-hint {
+    padding: 0 12px 10px;
+    font-size: 11px;
+    color: var(--text-soft);
+    opacity: .75;
+}
 
 /* ===== RAG 引用来源（AI 气泡内，回答正文的 [n] 角标对应这里的第 n 条） ===== */
 .msg-citations {
@@ -543,6 +901,216 @@ header {
     flex: none;
     color: var(--text-soft);
     font-variant-numeric: tabular-nums;
+}
+
+/* ===== 并行评审候选（AI 气泡内，正文是裁决者综合后的答案） ===== */
+/* 与「引用来源」共用同一套折叠外壳（head/body/caret/hint），只是内容形态不同 */
+.msg-review {
+    margin: 8px 0 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(0, 0, 0, .18);
+    overflow: hidden;
+    white-space: normal;
+}
+
+.review-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-soft);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.review-head:hover { color: var(--primary-text); }
+
+.review-caret {
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+/* 「正文为综合结果 / 综合失败取自第 1 份」：靠右弱化，同一视觉语言 */
+.review-hint {
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-soft);
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 1px 6px;
+}
+
+/* 候选作答是完整回答，展开后可能很长：给整体一个高度上限并允许内部滚动，
+   避免一条回复把整个会话区撑到需要长距离滚动才能看到下一条消息 */
+.review-body {
+    border-top: 1px solid var(--border);
+    padding: 6px 10px 8px;
+    max-height: 360px;
+    overflow: auto;
+}
+
+.review-item + .review-item {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+}
+
+.review-item-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12px;
+    line-height: 1.7;
+}
+
+.review-no {
+    flex: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--primary-text);
+    font-weight: 500;
+}
+
+.review-agent {
+    flex: none;
+    color: var(--text);
+    font-weight: 500;
+}
+
+.review-code {
+    flex: none;
+    color: var(--text-soft);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    opacity: .75;
+}
+
+/* 候选原文：保留换行（模型输出是多段文本），并沿用气泡内正常字号 */
+.review-reply {
+    margin-top: 2px;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ===== 跨会话回忆（AI 气泡内，本轮注入过的历史片段） ===== */
+.msg-recall {
+    margin: 8px 0 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(0, 0, 0, .18);
+    overflow: hidden;
+    white-space: normal;
+}
+
+.recall-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-soft);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.recall-head:hover { color: var(--primary-text); }
+
+.recall-caret {
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.recall-hint {
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-soft);
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 1px 6px;
+}
+
+.recall-body {
+    border-top: 1px solid var(--border);
+    padding: 6px 10px 8px;
+    max-height: 320px;
+    overflow: auto;
+}
+
+.recall-item + .recall-item {
+    margin-top: 7px;
+    padding-top: 7px;
+    border-top: 1px dashed var(--border);
+}
+
+.recall-item-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12px;
+    line-height: 1.7;
+}
+
+.recall-no {
+    flex: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--primary-text);
+    font-weight: 500;
+}
+
+/* 会话标题是「这是在哪次聊天里说的」的锚点：空间不够时优先截断它而不是挤掉时间/命中数 */
+.recall-title {
+    flex: 1;
+    min-width: 0;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.recall-role {
+    flex: none;
+    font-size: 11px;
+    color: var(--text-soft);
+    background: var(--surface);
+    border-radius: 5px;
+    padding: 0 5px;
+}
+
+/* 用户自己说过的话与助手说过的话区分开，便于快速定位「是我说的还是它说的」 */
+.recall-role.me {
+    color: var(--primary-text);
+}
+
+.recall-time {
+    flex: none;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+.recall-hits {
+    flex: none;
+    color: var(--text-soft);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    opacity: .8;
+}
+
+.recall-snippet {
+    margin-top: 2px;
+    padding-left: 22px;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-soft);
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 
 /* ===== Markdown 渲染内容（AI 气泡内） ===== */
@@ -785,7 +1353,10 @@ header {
    开启态只用淡色底 + 内描边 + 着色文字，不用高饱和实底与外发光。
    （旧版开启态是整块亮蓝/亮绿实底 + 14px 光晕 + 白字加粗，
    视觉权重盖过右侧「发送」主按钮，并排时两块高饱和色互相打架。） */
-.attach-btn {
+/* 输入区行内工具钮（附件 / 模板）：同一行、同一视觉权重，共用一套外观 —— 写成一条选择器列表
+   而不是复制两份，否则以后调一处忘了另一处，两个并排的按钮会逐渐长得不一样。 */
+.attach-btn,
+.tpl-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -801,8 +1372,10 @@ header {
     cursor: pointer;
     transition: background .15s, color .15s, border-color .15s;
 }
-.attach-btn:hover { border-color: var(--border-strong); background: var(--surface); color: var(--text); }
-.attach-btn:disabled { opacity: .45; cursor: not-allowed; }
+.attach-btn:hover,
+.tpl-btn:hover { border-color: var(--border-strong); background: var(--surface); color: var(--text); }
+.attach-btn:disabled,
+.tpl-btn:disabled { opacity: .45; cursor: not-allowed; }
 
 /* 行内小图标：stroke 取 currentColor，随所在控件的文字色一起亮起 */
 .tg-ico {
@@ -950,6 +1523,15 @@ button {
 .input-bar button:disabled {
     opacity: .5;
     cursor: not-allowed;
+}
+
+/* 生成中的「停止」按钮：与发送按钮同形，换红色系 —— 中断与提交是两种语义，不能长一样 */
+.stop-btn {
+    background: linear-gradient(135deg, #b91c1c, #ef4444);
+}
+
+.stop-btn:hover {
+    background: linear-gradient(135deg, #991b1b, #dc2626);
 }
 
 .empty {
@@ -1426,6 +2008,18 @@ button {
 .planner-badge {
     color: #c4b5fd;
     background: rgba(139, 92, 246, .18);
+}
+
+/* 并行评审：琥珀色 —— 与规划（紫）、RAG（绿）区分开，也暗示「会多花几次模型调用」 */
+.review-badge {
+    color: #fcd34d;
+    background: rgba(245, 158, 11, .16);
+}
+
+/* 跨会话：青色 —— 检索增强类，与 RAG 同族但可辨识 */
+.cross-badge {
+    color: #7dd3fc;
+    background: rgba(56, 189, 248, .16);
 }
 
 .empty-sub {
@@ -2488,9 +3082,46 @@ button {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    max-height: 56vh;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 52vh;
     overflow-y: auto;
 }
+
+/* 列表项必须保持自身高度。flex column 容器里子项默认 flex-shrink:1，条数一多就会把它们「等比压扁」——
+   而且是压到刚好贴合容器高度，所以连滚动条都不出现，只是每行行高塌陷、文字被 overflow:hidden 裁掉重叠，
+   看起来就是「下面的数据变形」。给子项固定 flex 值后，超出的部分才会正常溢出并触发 .trace-list 滚动。 */
+.trace-list > * { flex: 0 0 auto; }
+
+/* 分页条：列表固定每页条数，行高不再随数据量变化（变形问题的治本手段之一） */
+.trace-pager {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex: none;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.trace-pager .pg-info { font-variant-numeric: tabular-nums; }
+
+.trace-pager .pg-btns { display: flex; gap: 6px; }
+
+.pg-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--text-soft);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.pg-btn:hover:not(:disabled) { color: var(--text); border-color: var(--primary); }
+
+.pg-btn:disabled { opacity: .4; cursor: default; }
 
 /* 追踪看板聚合条：把当前会话的追踪记录汇总成一眼可读的指标（轮次/token/耗时/工具/错误） */
 .trace-summary {
@@ -2922,3 +3553,210 @@ button {
 .eval-batch-time { color: var(--text-soft); flex: none; }
 .eval-batch-stat { color: var(--text); }
 .eval-batch-extra { color: var(--text-soft); }
+
+/* ===== 消息重做（重新生成 / 编辑重发）=====
+   操作条默认透明、悬停整条消息才浮现：每条消息常驻两个按钮会把阅读区变成工具栏。 */
+.msg-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity .15s;
+}
+.msg:hover .msg-actions { opacity: 1; }
+.msg.user .msg-actions { justify-content: flex-end; }
+
+.msg-act {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-soft);
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-family: inherit;
+}
+.msg-act:hover {
+    color: var(--primary-text);
+    border-color: var(--border-strong);
+    background: var(--primary-soft);
+}
+
+/* ===== 编辑重发态提示条（输入区顶部）===== */
+.edit-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--primary-soft);
+    border: 1px solid var(--border-strong);
+    font-size: 12.5px;
+    color: var(--text);
+}
+.edit-banner-text { flex: 1; }
+.edit-banner-cancel {
+    flex: none;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--primary-text);
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-family: inherit;
+}
+.edit-banner-cancel:hover { background: rgba(255, 255, 255, .06); }
+
+/* ===== 长期记忆面板 ===== */
+.modal-memory { width: min(680px, calc(100vw - 32px)); }
+.mem-tip { padding: 18px 2px; color: var(--text-soft); font-size: 13px; }
+.mem-tip-error { color: var(--danger); }
+.mem-meta {
+    font-size: 12.5px;
+    color: var(--text-soft);
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+}
+.mem-field { display: block; margin-bottom: 16px; }
+.mem-label { display: block; font-size: 12.5px; color: var(--text-soft); margin-bottom: 6px; }
+.mem-field textarea {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 10px 12px;
+    resize: vertical;
+}
+.mem-field textarea:focus { outline: none; border-color: var(--border-strong); }
+.mem-hint {
+    font-size: 12px;
+    color: var(--text-soft);
+    line-height: 1.7;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface);
+}
+/* 重置是破坏性动作（清掉长期记忆），用危险色与「保存」拉开距离，避免误点 */
+.mem-reset { color: var(--danger); border-color: rgba(248, 113, 113, .32); }
+.mem-reset:hover:not(:disabled) { background: rgba(248, 113, 113, .1); }
+.mem-spacer { flex: 1; }
+
+/* ===== 智能体导入 / 导出（管理页工具条）===== */
+.ag-io-btn { padding: 8px 14px; font-size: 13px; }
+
+/* ===== 步骤审批点（执行到「需审批」步骤先暂停，批准后继续）=====
+   计划卡片上的「需审批」勾选 + 暂停后气泡里的审批卡片。
+   审批卡片刻意用琥珀色而非计划卡片的蓝色：蓝色表示「计划」，琥珀表示「等你决定」，
+   两者同时出现在一条消息里时颜色本身就能区分「哪块要动」。 */
+.plan-step-approve {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text-soft);
+    opacity: .8;
+    cursor: pointer;
+    user-select: none;
+}
+.plan-step-approve.on { color: #fbbf24; opacity: 1; }
+.plan-step-approve input { margin: 0; cursor: pointer; }
+.plan-step-approve input:disabled { cursor: not-allowed; }
+
+.approval-card {
+    margin: 0 0 10px;
+    border: 1px solid rgba(251, 191, 36, .28);
+    border-radius: 10px;
+    background: rgba(251, 191, 36, .08);
+    overflow: hidden;
+}
+.approval-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(251, 191, 36, .18);
+    font-size: 13px;
+    color: #fbbf24;
+}
+.approval-card-title { font-weight: 500; }
+.approval-card-state {
+    flex: none;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(251, 191, 36, .18);
+    color: #fbbf24;
+    font-size: 12px;
+}
+.approval-card-state.done {
+    background: rgba(148, 163, 184, .18);
+    color: var(--text-soft);
+}
+.approval-card-body { padding: 8px 12px; font-size: 13px; }
+.approval-agent { color: var(--text); font-weight: 500; }
+.approval-inst {
+    margin-top: 4px;
+    color: var(--text-soft);
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+.approval-hint {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-soft);
+    opacity: .85;
+}
+.approval-card-actions {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin: 2px 12px 12px;
+}
+.approval-ok-btn {
+    flex: 1;
+    padding: 7px 12px;
+    border: 1px solid rgba(251, 191, 36, .45);
+    border-radius: 8px;
+    background: rgba(251, 191, 36, .16);
+    color: #fbbf24;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+.approval-ok-btn:hover:not(:disabled) { background: rgba(251, 191, 36, .26); }
+.approval-card-actions .approval-cancel-btn {
+    flex: 0 0 auto;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-soft);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+.approval-card-actions .approval-cancel-btn:hover:not(:disabled) {
+    border-color: rgba(248, 113, 113, .4);
+    color: var(--danger);
+}
+.approval-ok-btn:disabled,
+.approval-card-actions .approval-cancel-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ===== 成本配额刻度（输入区右下角）=====
+   只展示本人当日用量；超限的拦截与说明在后端（流内 error 事件红字），前端不参与放行判断。 */
+.quota-hint {
+    margin-left: auto;
+    flex: none;
+    font-size: 12px;
+    color: var(--text-soft);
+    opacity: .75;
+}
+.quota-hint.warn { color: #fbbf24; opacity: 1; }

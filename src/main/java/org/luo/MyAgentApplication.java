@@ -4,9 +4,14 @@ import org.luo.ai.properties.EvalProperties;
 import org.luo.ai.properties.MemoryProperties;
 import org.luo.ai.properties.PlannerProperties;
 import org.luo.ai.properties.PromptProperties;
+import org.luo.ai.properties.QuotaProperties;
 import org.luo.ai.properties.RagProperties;
+import org.luo.ai.properties.CrossSessionProperties;
+import org.luo.ai.properties.ReviewProperties;
+import org.luo.ai.properties.SafetyProperties;
 import org.luo.ai.properties.ToolCallProperties;
 import org.luo.ai.properties.VisionProperties;
+import org.luo.edu.properties.EduProperties;
 import org.luo.system.security.JwtProperties;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
@@ -17,7 +22,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 @MapperScan({"org.luo.ai.mapper", "org.luo.edu.mapper", "org.luo.system.mapper"})
 @EnableConfigurationProperties({PromptProperties.class, VisionProperties.class, RagProperties.class,
         MemoryProperties.class, ToolCallProperties.class, PlannerProperties.class, EvalProperties.class,
-        JwtProperties.class})
+        JwtProperties.class, EduProperties.class, QuotaProperties.class, SafetyProperties.class,
+        ReviewProperties.class, CrossSessionProperties.class})
 public class MyAgentApplication {
 
     public static void main(String[] args) {

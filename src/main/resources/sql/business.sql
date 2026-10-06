@@ -76,7 +76,8 @@ CREATE TABLE course (
   PRIMARY KEY (id),
   KEY idx_course_class (class_id),
   KEY idx_course_subject (subject_id),
-  KEY idx_course_semester (semester_id)
+  KEY idx_course_semester (semester_id),
+  KEY idx_course_teacher (teacher_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='课程表';
 
 CREATE TABLE period (
@@ -97,7 +98,8 @@ CREATE TABLE course_arrangement (
   classroom       VARCHAR(32) DEFAULT NULL            COMMENT '教室',
   PRIMARY KEY (id),
   KEY idx_arr_course (course_id),
-  KEY idx_arr_day (day_of_week, start_period_id)
+  KEY idx_arr_day (day_of_week, start_period_id),
+  KEY idx_arr_end_period (end_period_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='排课表';
 
 CREATE TABLE exam (
@@ -110,7 +112,8 @@ CREATE TABLE exam (
   PRIMARY KEY (id),
   KEY idx_exam_semester (semester_id),
   KEY idx_exam_class (class_id),
-  KEY idx_exam_subject (subject_id)
+  KEY idx_exam_subject (subject_id),
+  KEY idx_exam_date (exam_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='考试表';
 
 CREATE TABLE score (

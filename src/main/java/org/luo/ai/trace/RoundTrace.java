@@ -50,7 +50,7 @@ public class RoundTrace {
     private final LocalDateTime startedAt = LocalDateTime.now();
     private final long startNanos = System.nanoTime();
 
-    /** 处理方来源：BOUND=会话显式绑定 / ROUTE=智能路由命中 / NONE=通用助手 / PLAN=规划编排。 */
+    /** 处理方来源：BOUND=会话显式绑定 / ROUTE=智能路由命中 / NONE=通用助手 / PLAN=规划编排 / REVIEW=并行评审。 */
     private String routeSource;
     /** 本轮实际处理（或规划最终步骤）的智能体编码。 */
     private String agentCode;

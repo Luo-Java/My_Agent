@@ -11,6 +11,7 @@ import org.luo.edu.dto.CourseDTO;
 import org.luo.edu.entity.Course;
 import org.luo.edu.entity.CourseArrangement;
 import org.luo.edu.mapper.CourseMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.CourseArrangementService;
 import org.luo.edu.service.CourseService;
 import org.luo.edu.vo.CourseVO;
@@ -27,6 +28,9 @@ import java.util.List;
 public class CourseServiceImpl extends ServiceImpl<CourseMapper, Course> implements CourseService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private CourseArrangementService arrangementService;
 
     @Override
@@ -37,7 +41,9 @@ public class CourseServiceImpl extends ServiceImpl<CourseMapper, Course> impleme
 
     @Override
     public List<OptionVO> options() {
-        return baseMapper.selectOptions();
+        // 下拉选项装上限：XML 里没有 LIMIT，靠分页插件注入（false = 不额外跑 count）
+        List<OptionVO> rows = baseMapper.selectOptions(new Page<>(1, eduProperties.probeLimit(), false));
+        return eduProperties.trim(rows, "course");
     }
 
     @Override

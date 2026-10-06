@@ -11,6 +11,7 @@ import org.luo.edu.dto.PeriodDTO;
 import org.luo.edu.entity.CourseArrangement;
 import org.luo.edu.entity.Period;
 import org.luo.edu.mapper.PeriodMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.CourseArrangementService;
 import org.luo.edu.service.PeriodService;
 import org.luo.edu.vo.OptionVO;
@@ -26,6 +27,9 @@ import java.util.List;
 public class PeriodServiceImpl extends ServiceImpl<PeriodMapper, Period> implements PeriodService {
 
     @Resource
+    private EduProperties eduProperties;
+
+    @Resource
     private CourseArrangementService arrangementService;
 
     @Override
@@ -39,7 +43,10 @@ public class PeriodServiceImpl extends ServiceImpl<PeriodMapper, Period> impleme
 
     @Override
     public List<OptionVO> options() {
-        return list(new LambdaQueryWrapper<Period>().orderByAsc(Period::getId)).stream()
+        // 下拉选项装上限：靠分页插件注入 LIMIT（false = 不额外跑 count），避免无界全表装载
+        List<Period> rows = page(new Page<>(1, eduProperties.probeLimit(), false),
+                new LambdaQueryWrapper<Period>().orderByAsc(Period::getId)).getRecords();
+        return eduProperties.trim(rows, "period").stream()
                 .map(x -> new OptionVO(x.getId().longValue(), "第" + x.getPeriodNo() + "节 " + x.getStartTime() + "-" + x.getEndTime()))
                 .toList();
     }

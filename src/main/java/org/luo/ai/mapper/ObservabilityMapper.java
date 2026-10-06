@@ -36,7 +36,7 @@ public interface ObservabilityMapper {
     /** 按形态拆解（agent / planner）。 */
     List<ModeBucket> aggregateByMode(@Param("since") LocalDateTime since);
 
-    /** 按处理方来源拆解（BOUND / ROUTE / NONE / PLAN）。 */
+    /** 按处理方来源拆解（BOUND / ROUTE / NONE / PLAN / REVIEW）。 */
     List<RouteBucket> aggregateByRouteSource(@Param("since") LocalDateTime since);
 
     /** 按智能体拆解（agent_code 降序轮次）。 */

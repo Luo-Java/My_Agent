@@ -7,7 +7,9 @@ import org.luo.ai.properties.PromptProperties;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.entity.Agent;
 import org.luo.ai.entity.Conversation;
+import org.luo.ai.service.CrossSessionSearchService;
 import org.luo.ai.service.KbSearchService;
+import org.luo.ai.tool.SubAgentTool;
 import org.luo.ai.tool.ToolRegistry;
 import org.luo.ai.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClient;
@@ -25,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.luo.ai.agent.PromptService;
 import org.luo.ai.agent.QueryRewriteService;
@@ -37,7 +40,8 @@ import org.luo.ai.agent.QueryRewriteService;
  * <p>
  * 工具挂载由 {@link #decorateRequest} 门控：普通对话不挂；智能体对话按 {@code tools_json} 装配声明
  * （未配置=全量、{@code []}=不挂、白名单=按名取子集，见 {@link ToolRegistry#resolve(String)}），
- * 避免闲聊/翻译类智能体看到 SQL、天气等无关工具。
+ * 避免闲聊/翻译类智能体看到 SQL、天气等无关工具。动态工具（{@code call_agent}）另走
+ * {@link ToolRegistry#dynamicToolRequested} 判定，需白名单显式声明，实例每轮由 {@link SubAgentTool} 现构。
  * <p>
  * <b>两个 Advisor 分工</b>：{@link ToolUsageLoggingAdvisor} 只打日志；{@link RoundTraceAdvisor} 把工具调用与
  * token 写进当轮 {@link RoundTrace}，后者需要 trace，故由 {@link #decorateRequest} 塞进 advisor 上下文
@@ -50,6 +54,10 @@ public class ChatComposer {
     /** 预取改写的等待上限（秒）：超时即放弃、改用用户原话检索。远小于模型全局超时（60s），正常路径不产生实际等待。 */
     private static final long REWRITE_JOIN_TIMEOUT_SECONDS = 10;
 
+    /** 空进度回调：无 trace（同步接口 / 无事件通道）时使用。 */
+    private static final Consumer<String> NO_PROGRESS = text -> {
+    };
+
     /** 数据实时性强化规则：仅对声明了该原则的智能体追加（软约束之外再以即时指令重申「先查库」），文本外置于 agent.prompt.realtime-rule。 */
     private final String realtimeDataRule;
 
@@ -59,9 +67,13 @@ public class ChatComposer {
     private final ChatClient internalChatClient;
     private final PromptService promptService;
     private final ToolRegistry toolRegistry;
+    /** 转交工具（{@code call_agent}）：实例依赖调用方智能体，故由本类每轮现场构造（见 {@link SubAgentTool}）。 */
+    private final SubAgentTool subAgentTool;
     private final ChatMemory chatMemory;
     private final KbSearchService kbSearchService;
     private final QueryRewriteService queryRewriteService;
+    /** 跨会话召回：在本人其他会话的历史消息里做关键词匹配（与知识库检索是两条独立链路，见其类注释）。 */
+    private final CrossSessionSearchService crossSessionSearchService;
     /** 检索问题改写的预取线程池（见 {@link #prefetchRetrievalQuery}）。 */
     private final Executor prefetchExecutor;
 
@@ -71,10 +83,12 @@ public class ChatComposer {
                         RoundTraceAdvisor roundTraceAdvisor,
                         PromptService promptService,
                         ToolRegistry toolRegistry,
+                        SubAgentTool subAgentTool,
                         ChatMemory chatMemory,
                         PromptProperties promptProperties,
                         KbSearchService kbSearchService,
                         QueryRewriteService queryRewriteService,
+                        CrossSessionSearchService crossSessionSearchService,
                         @Qualifier("roundPrefetchExecutor") Executor prefetchExecutor) {
         // 中间步骤客户端：先 clone（须在 defaultAdvisors 之前，避免继承记忆 Advisor）
         this.internalChatClient = chatClientBuilder.clone()
@@ -83,10 +97,12 @@ public class ChatComposer {
                 .defaultAdvisors(memoryAdvisor, toolUsageLoggingAdvisor, roundTraceAdvisor).build();
         this.promptService = promptService;
         this.toolRegistry = toolRegistry;
+        this.subAgentTool = subAgentTool;
         this.chatMemory = chatMemory;
         this.realtimeDataRule = promptProperties.realtimeRule();
         this.kbSearchService = kbSearchService;
         this.queryRewriteService = queryRewriteService;
+        this.crossSessionSearchService = crossSessionSearchService;
         this.prefetchExecutor = prefetchExecutor;
     }
 
@@ -120,30 +136,56 @@ public class ChatComposer {
                                        Agent agent, String paramBlock, String material, RoundTrace trace,
                                        CompletableFuture<String> prefetchedQuery) {
         KbSearchService.KbContext kb = retrieve(conversationId, message, conv, agent, trace, prefetchedQuery);
-        String systemPrompt = applyRealtimeRule(promptService.resolveSystemPrompt(agent)
-                + buildLongTermMemoryText(conv)
-                + kb.text()
-                + (paramBlock == null ? "" : paramBlock));
-        // 附件材料只进当轮 system（记忆 Advisor 仅持久化 .user() 纯提问）
-        systemPrompt = withMaterial(systemPrompt, material);
+        // 跨会话召回：只作用于普通对话（规划步骤与规划回退不走这里，见 CrossSessionSearchService 类注释）
+        CrossSessionSearchService.Recall recall = recall(conversationId, message, conv, trace);
+        String systemPrompt = buildRoundSystemPrompt(agent, conv, kb.text(), recall.text(), material, paramBlock);
         ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
                 .system(systemPrompt)
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
-        return new ComposedRequest(decorateRequest(spec, agent, trace), kb.citations());
+        return new ComposedRequest(decorateRequest(spec, agent, trace, conversationId), kb.citations(), recall);
+    }
+
+    /**
+     * 拼装一轮对话的 system prompt（<b>唯一的拼装口径</b>）：人设 → 长期记忆 → 知识库资料 → 跨会话回忆
+     * → 已确认参数 → 当轮附件材料。
+     * <p>
+     * 抽成公共方法的理由：并行评审要为每个候选各拼一份 system（同样的前缀，只有人设不同），若那份自己
+     * 拼一遍，两边一旦漂移就会出现「普通对话带了长期记忆、评审候选没带」这类只有对比才发现的问题。
+     * 顺序在本方法内固定，新增素材（如跨会话回忆）只需改这一处。
+     *
+     * @param kbText     知识库资料文本（可为 null/空）
+     * @param recallText 跨会话回忆文本（可为 null/空）
+     * @param paramBlock 已确认参数块（可为 null/空）
+     * @param material   当轮附件材料（可为 null/空）
+     */
+    public String buildRoundSystemPrompt(Agent agent, Conversation conv, String kbText, String recallText,
+                                         String material, String paramBlock) {
+        String systemPrompt = applyRealtimeRule(promptService.resolveSystemPrompt(agent)
+                + buildLongTermMemoryText(conv)
+                + blankToEmpty(kbText)
+                + blankToEmpty(recallText)
+                + blankToEmpty(paramBlock));
+        // 附件材料只进当轮 system（记忆 Advisor 仅持久化 .user() 纯提问）
+        return withMaterial(systemPrompt, material);
+    }
+
+    /** null/空白归一为空串（拼接友好）。 */
+    private static String blankToEmpty(String s) {
+        return s == null ? "" : s;
     }
 
     /** 通用助手兜底请求（无智能体、不挂工具）：规划回退或目标与任何智能体无关时使用；同样跟随会话 RAG 开关（只检索全局库）。 */
     public ComposedRequest buildDefaultRequest(Conversation conv, String conversationId, String message,
                                               String material, RoundTrace trace) {
         KbSearchService.KbContext kb = retrieve(conversationId, message, conv, null, trace, null);
-        String systemPrompt = promptService.resolveSystemPrompt(null) + buildLongTermMemoryText(conv) + kb.text();
-        systemPrompt = withMaterial(systemPrompt, material);
+        // 走同一个拼装口径（人设=通用助手、无参数块、无跨会话回忆）：规划回退路径不召回历史会话
+        String systemPrompt = buildRoundSystemPrompt(null, conv, kb.text(), null, material, null);
         ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
                 .system(systemPrompt)
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
-        return new ComposedRequest(decorateRequest(spec, null, trace), kb.citations());
+        return new ComposedRequest(decorateRequest(spec, null, trace, conversationId), kb.citations());
     }
 
     /** 附件材料追加到 system 末尾（仅当轮可见：system 每轮重建、不落库）。 */
@@ -224,6 +266,24 @@ public class ChatComposer {
         }
     }
 
+    /**
+     * 跨会话召回统一入口：会话开关 → 提词 → 关键词检索。与 {@link #retrieve} 完全对称（含进度播报口径），
+     * 区别只在「检索对象」：这里是用户自己的历史会话，不是知识库。
+     * <p>
+     * 用户身份取自 {@code conv.userId}（该实体已由 {@code ConversationService} 做过归属校验），
+     * 因此不需要再往这一层传 userId —— 与「身份一律从 HTTP 线程取出」的原则不冲突：
+     * 这里用的不是 ThreadLocal，而是已校验实体的字段。
+     */
+    private CrossSessionSearchService.Recall recall(String conversationId, String message,
+                                                    Conversation conv, RoundTrace trace) {
+        if (conv == null || !Boolean.TRUE.equals(conv.getCrossSession())) {
+            return CrossSessionSearchService.Recall.EMPTY;
+        }
+        // 进度走 trace 通道（与 RAG 命中播报同一机制）：同步接口无 trace 时静默，不影响正确性
+        Consumer<String> progress = trace == null ? NO_PROGRESS : trace::reportProgress;
+        return crossSessionSearchService.recall(conversationId, message, conv.getUserId(), progress);
+    }
+
     /** 会话级 RAG 开关取值（null 视为关闭）。 */
     public boolean ragOn(Conversation conv) {
         return conv != null && Boolean.TRUE.equals(conv.getRagEnabled());
@@ -232,16 +292,32 @@ public class ChatComposer {
     /**
      * 按智能体装配工具、应用其模型参数，并把当轮 trace 挂进 advisor 上下文。仅路由/绑定到智能体时才挂工具
      * （未配置=全量、{@code []}=不挂、白名单=按名取子集）；显式声明不用工具时跳过 {@code .tools()}。
+     * <p>
+     * <b>动态工具另算一路</b>：{@code call_agent} 的实例依赖「调用方是谁」（候选清单要排除自己），
+     * 且候选随库变化，所以不能进 {@link ToolRegistry} 的静态池——此处按白名单显式声明现场构造并与静态工具<b>合并</b>。
+     * 合并后统一 {@code .tools()} 挂载：分两次调用后者会覆盖前者。
+     *
+     * @param conversationId 当前会话 id（动态工具用于成本流水归属；静态工具路径不使用）
      */
     public ChatClient.ChatClientRequestSpec decorateRequest(ChatClient.ChatClientRequestSpec spec, Agent agent,
-                                                            RoundTrace trace) {
+                                                            RoundTrace trace, String conversationId) {
         if (trace != null) {
             spec = spec.advisors(a -> a.param(RoundTrace.CONTEXT_KEY, trace));
         }
         if (agent == null) return spec;
-        ToolCallback[] tools = toolRegistry.resolve(agent.getToolsJson());
-        // 显式 (Object[]) 传参：消除 tools(ToolCallback...) 的 varargs 提示性告警（@SuppressWarnings 实测无效）
-        if (tools.length > 0) spec = spec.tools((Object[]) tools);
+        ToolCallback[] staticTools = toolRegistry.resolve(agent.getToolsJson());
+        // 转交工具：白名单专属（全量不含它，理由见 SubAgentTool 类注释）
+        ToolCallback dynamicTool = toolRegistry.dynamicToolRequested(agent.getToolsJson(), SubAgentTool.TOOL_NAME)
+                ? subAgentTool.build(agent, conversationId)
+                : null;
+        int total = staticTools.length + (dynamicTool == null ? 0 : 1);
+        if (total > 0) {
+            ToolCallback[] tools = new ToolCallback[total];
+            System.arraycopy(staticTools, 0, tools, 0, staticTools.length);
+            if (dynamicTool != null) tools[staticTools.length] = dynamicTool;
+            // 显式 (Object[]) 传参：消除 tools(ToolCallback...) 的 varargs 提示性告警（@SuppressWarnings 实测无效）
+            spec = spec.tools((Object[]) tools);
+        }
         return applyAgentOptions(spec, agent);
     }
 
@@ -309,9 +385,26 @@ public class ChatComposer {
     }
 
     /**
-     * 一次组装的产物：请求规格 + 本轮引用来源。citations 必须与请求一起返回——编号在拼 system 时生成，
-     * 拆两次算会导致序号与来源漂移。
+     * 一次组装的产物：请求规格 + 本轮引用来源 + 跨会话召回。citations 必须与请求一起返回——编号在拼 system
+     * 时生成，拆两次算会导致序号与来源漂移；{@code recall} 同理（它既注入 system、又要推 SSE 事件给前端展示），
+     * 故一并回传而不是调用方自己再跑一遍。
      */
-    public record ComposedRequest(ChatClient.ChatClientRequestSpec spec, List<KbCitation> citations) {
+    public record ComposedRequest(ChatClient.ChatClientRequestSpec spec, List<KbCitation> citations,
+                                  CrossSessionSearchService.Recall recall) {
+
+        /** 无跨会话召回的构造（规划回退等路径使用）。 */
+        public ComposedRequest(ChatClient.ChatClientRequestSpec spec, List<KbCitation> citations) {
+            this(spec, citations, CrossSessionSearchService.Recall.EMPTY);
+        }
+
+        /** 是否发生了跨会话召回（调用方据此决定要不要推 {@code recall} 事件）。 */
+        public boolean hasRecall() {
+            return recall != null && !recall.isEmpty();
+        }
+
+        /** 召回事件载荷；无召回返回 null（{@code RoundResult.withRecall} 对空串同样忽略）。 */
+        public String recallJson() {
+            return hasRecall() ? recall.json() : null;
+        }
     }
 }

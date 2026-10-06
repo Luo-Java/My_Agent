@@ -99,7 +99,10 @@
                 <span class="chat-title">Spring AI 智能对话</span>
                 <span v-if="currentAgentName" class="agent-badge">{{ currentAgentIcon }} {{ currentAgentName }}</span>
                 <span v-if="currentPlanner" class="agent-badge planner-badge">🧭 规划模式</span>
+                <!-- 评审与规划互斥，故两个徽标不会同时出现；跨会话是独立检索增强，可与任一形态叠加 -->
+                <span v-if="reviewEnabled" class="agent-badge review-badge">⚖ 并行评审</span>
                 <span v-if="currentRagOn" class="agent-badge rag-badge">📚 RAG</span>
+                <span v-if="crossSession" class="agent-badge cross-badge">🔎 跨会话</span>
                 <!-- 右侧动作区：整体靠最右（.header-actions 的 margin-left:auto）。
                      靠右由本容器统一负责，不依赖某个按钮自带 margin-left:auto ——
                      「追踪」按钮在无会话时不渲染，若把靠右挂在它身上，整组会塌回标题旁边。 -->
@@ -107,6 +110,12 @@
                     <!-- 链路追踪入口：查看本会话每轮的路由 / 规划 / RAG 命中 / 工具调用 / token / 耗时（只读，异步落库） -->
                     <button v-if="currentId" class="nav-pill" @click="openTrace"
                             title="查看本会话的链路追踪：路由来源、规划步骤、RAG 命中、工具调用、token 与耗时">🔍 追踪</button>
+                    <!-- 会话导出：把当前会话导出为 Markdown（含附件文件名与 RAG 引用来源）。 -->
+                    <button v-if="currentId" class="nav-pill" @click="exportConversation"
+                            title="把当前会话导出为 Markdown 文件">⬇ 导出</button>
+                    <!-- 长期记忆面板：双层记忆此前完全黑盒，这里把摘要与核心事实摊开，可查看、订正、重置。 -->
+                    <button v-if="currentId" class="nav-pill" @click="openMemory"
+                            title="查看并编辑本会话的长期记忆（滚动摘要 + 核心事实）">🧠 记忆</button>
                     <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话。
                          ADMIN 专属（后端 CostController 标了 @RequireRole(ADMIN)，接口本身返回 403）——
                          成本是全站聚合口径、天然跨用户，收敛到管理员；普通账号不渲染该入口。 -->
@@ -132,11 +141,22 @@
                 </span>
             </header>
             <!-- 未完成任务提示条：当前会话存在 RUNNING 任务时显示（断点续跑入口）。
-                 点「继续执行」走 POST /api/chat/task/resume，回填已完成步骤、只跑剩余步骤。 -->
+                 两种来源共用它：①「先看计划」暂停下的待确认计划（一步未跑，doneSteps=0）；
+                 ②执行中途中断的规划任务（跑过一部分）。刷新页面后计划卡片会消失，本提示条是恢复执行入口。
+                 点按钮走 POST /api/chat/task/resume，回填已完成步骤、只跑剩余步骤。 -->
             <div class="resume-bar" v-if="runningTask">
                 <span class="resume-bar-ico">⏸</span>
-                <span class="resume-bar-text">上次任务尚未完成（已完成 {{ runningTask.doneSteps || 0 }}/{{ runningTask.totalSteps || 0 }} 步）</span>
-                <button class="resume-bar-btn" :disabled="loading" @click="resumeTask">继续执行</button>
+                <span class="resume-bar-text" v-if="!runningTask.doneSteps">已生成执行计划（共 {{ runningTask.totalSteps || 0 }} 步），尚未执行</span>
+                <span class="resume-bar-text" v-else>上次任务尚未完成（已完成 {{ runningTask.doneSteps }}/{{ runningTask.totalSteps || 0 }} 步）</span>
+                <button class="resume-bar-btn" :disabled="loading" @click="resumeTask">
+                    {{ runningTask.doneSteps ? '继续执行' : '执行计划' }}
+                </button>
+                <!-- 局部重规划：原计划这一段本身行不通时的出口。只重排「第一个未成功步骤及其之后」，
+                     已完成的步骤与其产出保持不动；结果作为新计划卡片推入消息区，确认后再执行。 -->
+                <button class="resume-bar-btn resume-bar-btn-ghost" :disabled="loading || replanning"
+                        @click="replanTask">
+                    {{ replanning ? '规划中…' : '重新规划' }}
+                </button>
             </div>
             <div class="messages" ref="scroll">
                 <div class="empty" v-if="messages.length === 0">
@@ -148,6 +168,126 @@
                 <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role === 'user' ? 'user' : 'ai'">
                     <div class="avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
                     <div class="bubble">
+                        <!-- 待确认计划卡片（规划模式「先看计划」）：规划只产出计划、未执行任何步骤，
+                             点「执行计划」走续跑通路开跑。计划明细同时也作为正文推过一遍，
+                             所以刷新后卡片消失、内容仍能从消息正文里回看。 -->
+                        <div class="plan-card" v-if="m.plan">
+                            <div class="plan-card-head">
+                                <span class="plan-card-title">📋 执行计划 · {{ m.plan.steps.length }} 步</span>
+                                <span class="plan-card-state" :class="{ done: m.planDone }">
+                                    {{ m.planDone ? '已执行' : (m.planRunning ? '执行中…' : '待确认') }}
+                                </span>
+                            </div>
+                            <div class="plan-card-steps">
+                                <div class="plan-step" v-for="s in m.plan.steps" :key="s.index"
+                                     :class="{ editing: s.editing }">
+                                    <span class="plan-step-no">{{ s.index }}</span>
+                                    <!-- 只读态：智能体 + 指令 + 依赖标注，右侧「需审批」勾选与「编辑」入口 -->
+                                    <template v-if="!s.editing">
+                                        <span class="plan-step-agent">{{ s.agentName }}</span>
+                                        <span class="plan-step-inst">{{ s.instruction }}</span>
+                                        <span class="plan-step-deps" v-if="s.dependsOn && s.dependsOn.length">
+                                            依赖 第 {{ s.dependsOn.map(d => d + 1).join('、') }} 步
+                                        </span>
+                                        <!-- 审批点：勾选后执行到此步会先暂停等你确认（计划未开跑时可改，
+                                             勾选即落库，不必再走「编辑 → 保存」） -->
+                                        <label class="plan-step-approve"
+                                               :class="{ on: s.approvalRequired }"
+                                               title="勾选后，执行到这一步会暂停等你确认；批准后才继续往下跑">
+                                            <input type="checkbox" :checked="!!s.approvalRequired"
+                                                   :disabled="m.planRunning || m.planDone || s.approving"
+                                                   @change="toggleStepApproval(m, s, $event.target.checked)" />
+                                            需审批
+                                        </label>
+                                        <button type="button" class="plan-step-edit"
+                                                v-if="!m.planRunning && !m.planDone"
+                                                @click="editPlanStep(m, s)">编辑</button>
+                                    </template>
+                                    <!-- 编辑态：改智能体 / 指令 / 依赖前驱。保存后落库，「执行计划」时按新值跑 -->
+                                    <div class="plan-step-form" v-else>
+                                        <label class="plan-field">
+                                            <span>智能体</span>
+                                            <select v-model="s.editAgentCode">
+                                                <option v-for="a in agents" :key="a.id" :value="a.agentCode">
+                                                    {{ a.name }}（{{ a.agentCode }}）
+                                                </option>
+                                            </select>
+                                        </label>
+                                        <label class="plan-field">
+                                            <span>指令</span>
+                                            <textarea v-model="s.editInstruction" rows="2"
+                                                      placeholder="给该智能体的具体指令"></textarea>
+                                        </label>
+                                        <!-- 依赖只能选更早的步骤（执行层按依赖分层推进，指向自身/后序会死等） -->
+                                        <div class="plan-field plan-field-deps" v-if="s.index > 1">
+                                            <span>依赖前序（决定本步输入来自哪些步骤，不选则用原始目标）</span>
+                                            <div class="dep-opts">
+                                                <label v-for="p in m.plan.steps.slice(0, s.index - 1)"
+                                                       :key="p.index" class="dep-opt">
+                                                    <input type="checkbox" :value="p.index - 1" v-model="s.editDeps" />
+                                                    第 {{ p.index }} 步 · {{ p.agentName }}
+                                                </label>
+                                            </div>
+                                        </div>
+                                        <div class="plan-step-actions">
+                                            <button type="button" class="plan-step-save"
+                                                    :disabled="s.saving" @click="savePlanStep(m, s)">
+                                                {{ s.saving ? '保存中…' : '保存' }}
+                                            </button>
+                                            <button type="button" class="plan-step-cancel"
+                                                    :disabled="s.saving" @click="cancelPlanStep(s)">取消</button>
+                                            <span class="plan-step-err" v-if="s.editError">{{ s.editError }}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="plan-card-hint" v-if="!m.planDone">
+                                可直接编辑任一步再执行；要增删步骤或整体重排，用顶部提示条的「重新规划」
+                            </div>
+                            <div class="plan-card-actions">
+                                <button type="button" class="plan-run-btn"
+                                        :disabled="loading || m.planRunning || m.planDone"
+                                        @click="runPlan(m)">
+                                    {{ m.planDone ? '计划已执行' : (m.planRunning ? '执行中…' : '执行计划') }}
+                                </button>
+                                <!-- 存为模板：把这份步骤骨架沉淀成可复用资产（不含本次目标与各步产出）。
+                                     计划执行后仍可存 —— 跑完才知道这套步骤真的行得通。 -->
+                                <button type="button" class="plan-tpl-btn"
+                                        :disabled="loading || m.planRunning || !m.plan.taskId"
+                                        @click="openSaveTemplate(m)"
+                                        title="把这份步骤骨架存为模板，下次同类目标直接套用">存为模板</button>
+                            </div>
+                        </div>
+                        <!-- 待审批卡片（步骤审批点）：执行到「需审批」步骤时暂停，该步与剩余步骤都未执行。
+                             批准走「写标记 + 续跑」两步（后端 approve 只写 approved=1，随后复用断点续跑通路继续），
+                             所以这里点一次「批准并继续」＝ 一次 approve + 一次 resume。 -->
+                        <div class="approval-card" v-if="m.approval">
+                            <div class="approval-card-head">
+                                <span class="approval-card-title">
+                                    ⏸ 待审批 · 第 {{ m.approval.index }}/{{ m.approval.totalSteps }} 步
+                                </span>
+                                <span class="approval-card-state" :class="{ done: m.approvalDone }">
+                                    {{ m.approvalDone ? '已处理' : (m.approvalRunning ? '处理中…' : '等待确认') }}
+                                </span>
+                            </div>
+                            <div class="approval-card-body">
+                                <div class="approval-agent">{{ m.approval.agentName }}</div>
+                                <div class="approval-inst" v-if="m.approval.instruction">{{ m.approval.instruction }}</div>
+                                <div class="approval-hint">
+                                    批准后从这里接着往下跑（前面步骤的产出会保留）；终止则剩余步骤不再执行，已完成的产出仍留在库里。
+                                </div>
+                            </div>
+                            <div class="approval-card-actions">
+                                <button type="button" class="approval-ok-btn"
+                                        :disabled="loading || m.approvalRunning || m.approvalDone"
+                                        @click="approveAndResume(m)">
+                                    {{ m.approvalDone ? '已处理' : (m.approvalRunning ? '处理中…' : '批准并继续') }}
+                                </button>
+                                <button type="button" class="approval-cancel-btn"
+                                        :disabled="loading || m.approvalRunning || m.approvalDone"
+                                        @click="cancelPlanTask(m)">终止计划</button>
+                            </div>
+                        </div>
                         <!-- 执行过程：本次运行期间的实时进度（任务规划 + 每步执行情况）。
                              它不属于消息正文，后端也不写入会话记忆，刷新或重开会话后不会再出现。 -->
                         <div class="steps-box" v-if="m.steps && m.steps.length">
@@ -184,6 +324,55 @@
                                 <span v-if="m.content">{{ m.content }}</span>
                             </div>
                             <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
+                            <!-- 并行评审候选（C1）：本轮由若干候选智能体「互相不可见地」独立作答，
+                                 再由裁决者综合成最终回答。正文是综合后的答案，这里摊开每次候选答了什么，
+                                 让「答案是怎么来的」可追溯。候选只作展示，不进正文、不进会话记忆。
+                                 数据来自当轮 SSE review 事件；不落库，刷新后不再出现。 -->
+                            <div v-if="m.role !== 'user' && m.review" class="msg-review">
+                                <div class="review-head" @click="m.reviewOpen = !m.reviewOpen">
+                                    <span class="review-caret">{{ m.reviewOpen ? '▾' : '▸' }}</span>
+                                    <span>⚖ 并行评审 · {{ m.review.candidates.length }} 个候选</span>
+                                    <span class="review-hint">
+                                        {{ m.review.judged ? '正文为综合结果' : '综合失败，正文取自第 1 份' }}
+                                    </span>
+                                </div>
+                                <div class="review-body" v-show="m.reviewOpen">
+                                    <div class="review-item" v-for="c in m.review.candidates" :key="c.index">
+                                        <div class="review-item-head">
+                                            <span class="review-no">{{ c.index }}</span>
+                                            <span class="review-agent">{{ c.agentName || c.agentCode }}</span>
+                                            <span v-if="c.agentCode" class="review-code">{{ c.agentCode }}</span>
+                                        </div>
+                                        <div class="review-reply">{{ c.reply }}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- 跨会话回忆（A3）：本轮从「本人其他会话」里召回并注入过的历史片段。
+                                 与引用来源的分工：引用来源指向知识库（外部资料），这里指向你自己的历史对话。
+                                 只作展示、不进正文、不进会话记忆；后端刻意不落库，刷新后不再出现。 -->
+                            <div v-if="m.role !== 'user' && m.recall && m.recall.length" class="msg-recall">
+                                <div class="recall-head" @click="m.recallOpen = !m.recallOpen">
+                                    <span class="recall-caret">{{ m.recallOpen ? '▾' : '▸' }}</span>
+                                    <span>🔎 回忆到的历史 · {{ m.recall.length }} 条</span>
+                                    <span class="recall-hint">来自你其他会话</span>
+                                </div>
+                                <div class="recall-body" v-show="m.recallOpen">
+                                    <div class="recall-item" v-for="h in m.recall" :key="h.index">
+                                        <div class="recall-item-head">
+                                            <span class="recall-no">[{{ h.index }}]</span>
+                                            <span class="recall-title">{{ h.conversationTitle || '（未命名会话）' }}</span>
+                                            <span class="recall-role" :class="{ me: h.role === 'user' }">
+                                                {{ h.role === 'user' ? '我' : 'AI' }}
+                                            </span>
+                                            <span class="recall-time">{{ h.createdAt }}</span>
+                                            <span class="recall-hits" :title="'命中 ' + h.hitCount + ' 个检索词'">
+                                                ×{{ h.hitCount }}
+                                            </span>
+                                        </div>
+                                        <div class="recall-snippet">{{ h.snippet }}</div>
+                                    </div>
+                                </div>
+                            </div>
                             <!-- RAG 引用来源（溯源）：回答正文里的 [n] 角标对应这里的第 n 条。
                                  数据来自当轮 SSE citations 事件或历史接口的 citations 字段；
                                  与「执行过程」同理只作展示，不进正文、不进会话记忆。 -->
@@ -207,10 +396,28 @@
                         <span v-else-if="loading && i === messages.length - 1" class="typing">
                             <span></span><span></span><span></span>
                         </span>
+                        <!-- 消息重做：编辑重发（用户消息）/ 重新生成（AI 回复）。生成中一律不出现 ——
+                             此时截断历史会与正在写入的那一轮撞车。 -->
+                        <div class="msg-actions" v-if="canRedo(i)">
+                            <button v-if="m.role === 'user'" type="button" class="msg-act"
+                                    title="修改这条提问并重新发送（发送时会删除它之后的内容）"
+                                    @click="startEditMessage(m, i)">编辑重发</button>
+                            <button v-else type="button" class="msg-act"
+                                    title="用它前面的提问重新生成一次（会删除这条回复及其后的内容）"
+                                    @click="regenerate(m, i)">重新生成</button>
+                        </div>
                     </div>
                 </div>
             </div>
             <div class="input-bar">
+                <!-- 编辑重发态提示条：发送时会先删除这条消息及其后的全部内容，再用输入框里的新文本重发。
+                     放在输入区而不是消息旁边，是因为「要改的是输入框里的这段文本」。 -->
+                <div v-if="editingIndex >= 0" class="edit-banner">
+                    <span class="edit-banner-text">
+                        正在编辑第 {{ editingIndex + 1 }} 条消息 —— 发送后会删除它之后的内容并重新发送
+                    </span>
+                    <button type="button" class="edit-banner-cancel" @click="cancelEditMessage">取消编辑</button>
+                </div>
                 <!-- 附件预览：图片显示缩略图，文档显示文件 chip；发送时由后端 /api/chat/attachment/process
                      转成文本（当轮注入 LLM）+ 原文件落盘（供历史回看）。解析文本不进会话记忆，刷新后不重复消耗 token；
                      落盘文件的历史可见性由消息元数据支撑（历史接口返回 /files/ 链接）。 -->
@@ -224,7 +431,11 @@
                 <div class="input-row">
                     <textarea v-model="input" @keydown.enter.exact.prevent="send"
                               placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-                    <button :disabled="loading || !input.trim()" @click="send">发送</button>
+                    <!-- 生成中：按钮切成「停止」，断开本轮 SSE。没有它时连接一旦挂起，
+                         输入框会永久锁死（只能刷新页面），用户也没有中途喊停的手段。 -->
+                    <button v-if="loading" class="stop-btn" @click="stopGeneration"
+                            title="停止接收本轮回复（服务端可能仍会完成本轮并落库）">停止</button>
+                    <button v-else :disabled="!input.trim()" @click="send">发送</button>
                 </div>
                 <!-- 输入框左下角模式开关：勾选「智能规划」= 由动态规划器运行时编排多个智能体协同完成目标，
                      取消 = 普通对话（智能路由 / 追问）。选择会写回会话，刷新后保持上次选择。
@@ -239,12 +450,39 @@
                     </button>
                     <input ref="fileInput" type="file" :accept="ACCEPT" multiple style="display:none"
                            @change="onFilePicked" />
+                    <!-- 从模板开始：用已保存的步骤骨架生成计划（零模型调用），生成后可逐条改、再确认执行。
+                         它不改变会话的规划开关 —— 「规划」这一步被换成「读模板」，其余流程完全一致。 -->
+                    <button type="button" class="tpl-btn" @click="openTemplateList"
+                            title="从模板开始：用已保存的步骤骨架生成计划，省掉一次规划模型调用">
+                        <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+                        <span>模板</span>
+                    </button>
                     <label class="planner-toggle" :class="{ on: planMode && !currentAgentId, disabled: !!currentAgentId }">
                         <input type="checkbox" v-model="planMode" :disabled="!!currentAgentId" @change="onPlannerChange"
                                title="勾选后按规划模式执行：AI 自动编排多个智能体协同完成你的目标" />
                         <span class="toggle-switch"></span>
                         <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="6" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="12" r="2.5"/><path d="M7.6 6.7l8.8 4.6M7.6 17.3l8.8-4.6"/></svg>
                         <span class="toggle-text">智能规划</span>
+                    </label>
+                    <!-- 「先看计划」开关（仅规划模式出现）：开启后规划只产出计划并暂停，弹出计划卡片，
+                         用户点「执行计划」才真正跑步骤（执行复用断点续跑通路）。关闭=规划完直接执行。 -->
+                    <label v-if="planMode && !currentAgentId" class="planner-toggle"
+                           :class="{ on: plannerConfirm }"
+                           title="开启后规划只生成计划并暂停，确认无误再执行；关闭则规划完直接执行">
+                        <input type="checkbox" v-model="plannerConfirm" @change="onPlannerConfirmChange" />
+                        <span class="toggle-switch"></span>
+                        <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                        <span class="toggle-text">先看计划</span>
+                    </label>
+                    <!-- 「⚖ 评审」开关（会话级）：开启后本轮由 LLM 挑若干候选智能体并行独立作答，
+                         再由裁决者综合成最终回答（候选走 review 事件，只作展示、不落记忆）。
+                         与规划互斥 —— 两者都是「编排形态」，开启任一方会自动关掉另一方。 -->
+                    <label class="planner-toggle" :class="{ on: reviewEnabled }"
+                           title="开启后由多个候选智能体并行作答，再由裁决者综合成最终回答（与智能规划互斥）">
+                        <input type="checkbox" v-model="reviewEnabled" @change="onReviewChange" />
+                        <span class="toggle-switch"></span>
+                        <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M7 7h10M5 7l-2.5 6a3 3 0 0 0 5 0L5 7zM19 7l-2.5 6a3 3 0 0 0 5 0L19 7z"/><path d="M8 21h8"/></svg>
+                        <span class="toggle-text">评审</span>
                     </label>
                     <!-- RAG 开关（会话级）：开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，
                          命中内容注入上下文作回答依据；关闭=不使用 RAG（仅靠模型知识）。写回会话，刷新后保持。 -->
@@ -254,8 +492,26 @@
                         <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8.5" ry="3"/><path d="M3.5 5.5v13c0 1.7 3.8 3 8.5 3s8.5-1.3 8.5-3v-13"/><path d="M3.5 12c0 1.7 3.8 3 8.5 3s8.5-1.3 8.5-3"/></svg>
                         <span class="toggle-text">RAG</span>
                     </label>
+                    <!-- 「🔎 跨会话」开关（会话级）：开启后每轮先用 LLM 从本轮问题里抽检索关键词，
+                         在本人「其他会话」的历史消息里做关键词召回并注入上下文（只查本人、排除当前会话）。
+                         与规划 / 评审无关，可与任何形态叠加；召回走关键词字面匹配，换个说法就召回不到。 -->
+                    <label class="rag-toggle" :class="{ on: crossSession }"
+                           title="开启后在本人的其他会话里检索相关历史并注入上下文（只查本人会话，排除当前会话）">
+                        <input type="checkbox" v-model="crossSession" @change="onCrossSessionChange" />
+                        <span class="toggle-switch"></span>
+                        <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.4 15.4L21 21"/><path d="M8 10.5h5"/><path d="M10.5 8v5"/></svg>
+                        <span class="toggle-text">跨会话</span>
+                    </label>
                     <span v-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
+                    <span v-else-if="reviewEnabled" class="input-hint">评审已开：本轮多候选并行作答后综合，模型调用次数会增加</span>
                     <span v-else-if="!ragEnabled" class="input-hint">未开启 RAG，本轮不使用知识库</span>
+                    <!-- 成本配额（仅后端开启 agent.quota.enabled 且非豁免时出现）：展示本人当日用量。
+                         超限时本轮会被后端明确拒绝（流里推一条 error 红字），这里只是提前给个刻度。 -->
+                    <span v-if="quota.enabled && !quota.exempt" class="quota-hint"
+                          :class="{ warn: quota.limit > 0 && quota.used / quota.limit >= 0.9 }"
+                          :title="'本日 token 用量 ' + quota.used + ' / 上限 ' + quota.limit + '（每日 00:00 重置）'">
+                        ⚡ {{ fmtTokens(quota.used) }} / {{ fmtTokens(quota.limit) }}
+                    </span>
                 </div>
             </div>
         </template>
@@ -273,6 +529,14 @@
                         <input v-model="agentQuery" class="ag-search-input" placeholder="搜索名称 / 编码 / 描述" />
                         <button v-if="agentQuery" class="ag-search-clear" title="清空" @click="agentQuery = ''">✕</button>
                     </div>
+                    <!-- 导入 / 导出：把智能体当资产搬进搬出。包内只含智能体本身（人设 / 参数 / 工具 /
+                         模型参数），不含专属知识库的文件内容 —— 那属于知识库模块，需在新环境另行重建。 -->
+                    <button class="btn-ghost ag-io-btn" @click="exportAgents"
+                            title="把全部智能体导出为 JSON 文件（不含专属知识库内容）">导出</button>
+                    <button class="btn-ghost ag-io-btn" @click="triggerAgentImport"
+                            title="从 JSON 文件导入智能体：按 agent_code 匹配，可跳过或覆盖同编码的">导入</button>
+                    <input ref="agentImportInput" type="file" accept=".json,application/json" style="display:none"
+                           @change="onAgentImportFile" />
                     <button class="new-chat-btn agent-manage-new" @click="openCreateAgent">＋ 新建智能体</button>
                 </div>
             </div>
@@ -989,6 +1253,113 @@
          数据来自后端 agent_trace 表：每轮对话在回复产出后异步落库，记录路由来源 / 规划步骤 /
          RAG 命中与引用 / 工具调用与参数摘要 / token 用量 / 耗时 / 成功失败。
          用途：回答「这轮为什么路由到它」「规划器排了哪几步」「RAG 有没有命中」「花了多少 token」。 -->
+    <!-- ===== 规划模板弹窗 =====
+         一个弹窗两种模式：save=把计划卡片上那份步骤骨架存成模板；use=选模板 + 填本次目标 → 生成计划。
+         模板只存「怎么排」（智能体 + 指令 + 依赖），不含「做什么」—— 目标每次都不一样，所以 use 模式必填。
+         生成计划后不自动执行：与「先看计划」同一节奏，用户可先用卡片上的「编辑」逐条改，再点「执行计划」。 -->
+    <div class="modal-mask" v-if="tplModal.open" @click.self="closeTplModal">
+        <div class="modal">
+            <div class="modal-head">
+                <span>{{ tplModal.mode === 'save' ? '存为模板' : '从模板开始' }}</span>
+                <button class="modal-close" @click="closeTplModal">✕</button>
+            </div>
+            <div class="modal-body">
+                <template v-if="tplModal.mode === 'save'">
+                    <label>模板名称 <span class="req">*</span></label>
+                    <input v-model="tplModal.name" maxlength="100" placeholder="如：周报生成 / 成绩核查" />
+                    <label>备注（可选）</label>
+                    <input v-model="tplModal.description" maxlength="500"
+                           placeholder="适用什么场景、套用时该填什么目标" />
+                    <div class="tpl-hint">
+                        只保存步骤骨架（{{ tplModal.stepCount }} 步：智能体 + 指令 + 依赖），不含本次目标与各步产出。
+                    </div>
+                </template>
+                <template v-else>
+                    <div v-if="tplModal.loading" class="tpl-empty">加载中…</div>
+                    <div v-else-if="!tplModal.items.length" class="tpl-empty">
+                        还没有模板。先跑一次规划，在计划卡片上点「存为模板」把步骤存下来。
+                    </div>
+                    <template v-else>
+                        <div class="tpl-list">
+                            <div v-for="t in tplModal.items" :key="t.id" class="tpl-item"
+                                 :class="{ active: tplModal.selectedId === t.id }" @click="selectTemplate(t)">
+                                <div class="tpl-item-main">
+                                    <div class="tpl-item-name">{{ t.name }}</div>
+                                    <div class="tpl-item-meta">
+                                        {{ t.stepCount }} 步 · 套用 {{ t.useCount }} 次<span
+                                            v-if="t.description"> · {{ t.description }}</span>
+                                    </div>
+                                </div>
+                                <!-- 点两次才删（第一次只是进入待确认态）：模板列表就在手边，误删代价虽小但不该没有门槛 -->
+                                <button type="button" class="tpl-del" @click.stop="removeTemplate(t)"
+                                        :title="tplModal.confirmId === t.id ? '再点一次确认删除' : '删除该模板'">
+                                    {{ tplModal.confirmId === t.id ? '确认删除' : '删除' }}
+                                </button>
+                            </div>
+                        </div>
+                        <label>本次目标 <span class="req">*</span></label>
+                        <input v-model="tplModal.goal" maxlength="500"
+                               placeholder="这次要完成什么？它会作为第一步的输入（模板只给步骤，不给目标）" />
+                    </template>
+                </template>
+                <div class="tpl-err" v-if="tplModal.error">{{ tplModal.error }}</div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" @click="closeTplModal">取消</button>
+                <button v-if="tplModal.mode === 'save'" class="btn-primary"
+                        :disabled="tplModal.saving || !tplModal.name.trim()" @click="submitSaveTemplate">
+                    {{ tplModal.saving ? '保存中…' : '保存' }}
+                </button>
+                <button v-else class="btn-primary"
+                        :disabled="tplModal.saving || !tplModal.selectedId || !tplModal.goal.trim()"
+                        @click="submitApplyTemplate">
+                    {{ tplModal.saving ? '生成中…' : '生成计划' }}
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 长期记忆面板：把此前完全黑盒的双层记忆摊开给用户。
+         「已压缩 N / M 条」直接回答「它为什么还记着那么早的事」；游标只读展示 —— 手改它会让下次
+         自动压缩从错误位置继续。这里改的是「内容」，重置才会连游标一起归零。 -->
+    <div class="modal-mask" v-if="memoryModal.open" @click.self="memoryModal.open = false">
+        <div class="modal modal-memory">
+            <div class="modal-head">
+                <span>🧠 长期记忆</span>
+                <button class="modal-close" @click="memoryModal.open = false">✕</button>
+            </div>
+            <div class="modal-body">
+                <div v-if="memoryModal.loading" class="mem-tip">读取中…</div>
+                <div v-else-if="memoryModal.error" class="mem-tip mem-tip-error">{{ memoryModal.error }}</div>
+                <template v-else>
+                    <div class="mem-meta">{{ memoryCoverage() }}</div>
+                    <label class="mem-field">
+                        <span class="mem-label">滚动摘要</span>
+                        <textarea v-model="memoryModal.summary" rows="9"
+                                  placeholder="较早对话的压缩摘要；留空表示没有长期摘要"></textarea>
+                    </label>
+                    <label class="mem-field">
+                        <span class="mem-label">核心事实</span>
+                        <textarea v-model="memoryModal.coreFacts" rows="6"
+                                  placeholder="姓名 / 身份 / 偏好 / 待办等长期关键事实；留空表示没有"></textarea>
+                    </label>
+                    <div class="mem-hint">
+                        这两段会随每轮对话注入模型，修订后立即生效。清空内容等于「忘掉这些」，
+                        但历史消息本身不受影响；要让记忆从头重新压缩，用左下角的「重置全部记忆」。
+                    </div>
+                </template>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost mem-reset" :disabled="memoryModal.saving || memoryModal.loading"
+                        @click="resetMemory">重置全部记忆</button>
+                <span class="mem-spacer"></span>
+                <button class="btn-ghost" @click="memoryModal.open = false">关闭</button>
+                <button class="btn-primary" :disabled="memoryModal.saving || memoryModal.loading"
+                        @click="saveMemory">{{ memoryModal.saving ? '保存中…' : '保存' }}</button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-mask" v-if="traceModal.open" @click.self="traceModal.open = false">
         <div class="modal modal-trace">
             <div class="modal-head">
@@ -1009,7 +1380,8 @@
                     </button>
                 </div>
                 <div v-if="traceModal.error" class="trace-empty">{{ traceModal.error }}</div>
-                <div v-else class="trace-list">
+                <template v-else>
+                <div class="trace-list" ref="traceListRef">
                     <div v-if="traceStats.count" class="trace-summary">
                         <div class="ts-item"><span class="ts-num">{{ traceStats.count }}</span><span class="ts-label">轮次</span></div>
                         <div class="ts-item"><span class="ts-num">{{ traceStats.totalTokens }}</span><span class="ts-label">token 合计</span></div>
@@ -1017,9 +1389,9 @@
                         <div class="ts-item"><span class="ts-num">{{ traceStats.toolCalls }}</span><span class="ts-label">工具调用</span></div>
                         <div class="ts-item"><span class="ts-num" :class="{ 'ts-err': traceStats.errorCount }">{{ traceStats.errorCount }}</span><span class="ts-label">错误轮</span></div>
                     </div>
-                    <div class="trace-item" v-for="(t, ti) in traceModal.items" :key="t.traceId">
-                        <div class="trace-row" @click="toggleTrace(ti)">
-                            <span class="trace-caret">{{ traceModal.expanded[ti] ? '▾' : '▸' }}</span>
+                    <div class="trace-item" v-for="t in tracePageItems" :key="t.traceId">
+                        <div class="trace-row" @click="toggleTrace(t.traceId)">
+                            <span class="trace-caret">{{ traceModal.expanded[t.traceId] ? '▾' : '▸' }}</span>
                             <span class="trace-time">{{ fmtTime(t.createdAt) }}</span>
                             <span class="trace-tag" :class="t.status === 'error' ? 'tag-err' : 'tag-ok'">
                                 {{ t.status === 'error' ? '失败' : '成功' }}
@@ -1034,7 +1406,7 @@
                                 <span :title="'本轮总耗时'">⏱ {{ fmtElapsed(t.elapsedMs) }}</span>
                             </span>
                         </div>
-                        <div class="trace-detail" v-show="traceModal.expanded[ti]">
+                        <div class="trace-detail" v-show="traceModal.expanded[t.traceId]">
                             <div class="trace-q" v-if="t.userMessage">用户：{{ t.userMessage }}</div>
                             <div class="trace-q trace-rq" v-if="t.retrievalQuery">🔍 检索改写：{{ t.retrievalQuery }}</div>
                             <div class="trace-kv" v-if="t.errorMessage"><b>错误</b>{{ t.errorMessage }}</div>
@@ -1071,6 +1443,21 @@
                         </div>
                     </div>
                 </div>
+                <!-- 分页条：每页固定条数，数据量只影响页数、不影响行高。
+                     此前整份列表一次渲染，行被 flex 等比压扁 —— 越往下越「变形」，这就是分页要治的根。
+                     可见条件按「有数据」而不是「页数 > 1」：本会话与全部会话共用同一套分页，
+                     但本会话多半不足一页，只显示页码信息（按钮组跟着页数隐藏），
+                     否则用户会以为「只有全部会话才分页」。loading 中不渲染，避免闪一条「共 0 轮」。 -->
+                <div class="trace-pager" v-if="!traceModal.loading && traceModal.items.length">
+                    <span class="pg-info">共 {{ traceModal.items.length }} 轮 · 第 {{ traceModal.page }} / {{ tracePageCount }} 页</span>
+                    <span class="pg-btns" v-if="tracePageCount > 1">
+                        <button class="pg-btn" :disabled="traceModal.page <= 1"
+                                @click="traceGoPage(traceModal.page - 1)">‹ 上一页</button>
+                        <button class="pg-btn" :disabled="traceModal.page >= tracePageCount"
+                                @click="traceGoPage(traceModal.page + 1)">下一页 ›</button>
+                    </span>
+                </div>
+                </template>
             </div>
             <div class="modal-foot">
                 <span class="field-hint">traceId 可在服务端日志中检索，用于定位单轮全链路日志。</span>

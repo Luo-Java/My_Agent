@@ -11,6 +11,10 @@ import java.util.regex.Pattern;
  * <p>
  * 业务表与 agent 系统表在<b>同一库</b>，故必须用白名单显式放行业务表，防止模型越权读 conversation /
  * chat_message / agent 等系统表。只读校验：仅允许 SELECT / WITH 开头，去注释去字符串后按关键字黑名单拦写操作。
+ * <p>
+ * 两道校验对注释的处理<b>刻意不同</b>，不可互相替换：关键字黑名单用 {@link #stripCommentsAndStrings}
+ * （注释整段删除，让拆分写法合并回关键字）；表名白名单用 {@link #maskCommentsAndStrings}
+ * （注释替换为空格，还原 MySQL 眼里的 token 边界）。用错任一处都会漏检 —— 详见两个方法的说明。
  */
 public final class SqlSafety {
 
@@ -82,6 +86,11 @@ public final class SqlSafety {
 
     /** 校验 SQL 涉及的表是否都在业务白名单内。返回 null 表示通过，非空字符串为拦截原因（含越权的表名）。 */
     public static String tableVerdict(String sql) {
+        // 可执行注释必须先拒：其内容会被数据库执行，却会在掩注释时被抹成空格 —— 校验「看不见」的表名不能放行。
+        if (containsExecutableComment(sql)) {
+            return "SQL 中不允许出现 MySQL 版本注释或优化器提示（以 /*! 或 /*+ 开头的块注释）："
+                    + "其内容会被数据库执行、却在校验时被当作注释掩去，无法安全校验。";
+        }
         List<String> tables = extractTables(sql);
         if (tables.isEmpty()) {
             return null; // 提取不到表名（如 SELECT 1），放行由数据库报错
@@ -98,11 +107,14 @@ public final class SqlSafety {
     /**
      * 从 SQL 提取 FROM / JOIN 出现的表名（去重、保持出现顺序）。支持逗号多表与带别名的表——
      * 只取每段的<b>首个</b>标识符，别名自然被忽略。
+     * <p>
+     * 匹配前先经 {@link #maskCommentsAndStrings}：注释必须「变空格」而不是「被删掉」，
+     * 否则 {@code FROM/**}{@code /sys_user} 会粘成 {@code FROMsys_user} 而漏检（详见该方法说明）。
      */
     public static List<String> extractTables(String sql) {
         List<String> result = new ArrayList<>();
         if (sql == null) return result;
-        Matcher m = TABLE_CLAUSE_PATTERN.matcher(sql);
+        Matcher m = TABLE_CLAUSE_PATTERN.matcher(maskCommentsAndStrings(sql));
         while (m.find()) {
             for (String part : m.group(1).split(",")) {
                 Matcher name = TABLE_NAME_PATTERN.matcher(part.trim());
@@ -145,18 +157,44 @@ public final class SqlSafety {
         return false;
     }
 
-    /** 去掉 SQL 中的行注释(--)、块注释(/* *\/)和单引号字符串字面量，便于做关键字黑名单检查。 */
+    /**
+     * 去掉 SQL 中的行注释(--)、块注释(/* *\/)和单引号字符串字面量，便于做关键字黑名单检查。
+     * <p>
+     * 用于「删掉后检查是否含关键字」的场景（{@link #readOnlyVerdict}）：整段删除、不留占位，
+     * 正好让 {@code del/**}{@code ete} 这类拆分写法合并回 {@code delete} 而被拦。
+     * 但<b>不能</b>拿它提取表名 —— 原因见 {@link #maskCommentsAndStrings}。
+     */
     public static String stripCommentsAndStrings(String sql) {
+        return replaceCommentsAndStrings(sql, false);
+    }
+
+    /**
+     * 把注释与字符串字面量<b>替换为一个空格</b>（而非删除），其余字符原样保留。供<b>表名提取</b>使用。
+     * <p>
+     * 为什么表名提取必须用它：MySQL 在词法阶段把块注释当 <b>token 分隔符</b>，{@code FROM/**}{@code /sys_user}
+     * 与 {@code FROM sys_user} 完全等价。若先删掉注释再匹配，{@code FROM} 会与表名粘成 {@code FROMsys_user}，
+     * 而表名提取正则要求 {@code from}/{@code join} 后跟空白 —— 整整一条
+     * {@code SELECT * FROM/**}{@code /sys_user} 便提取不到任何表名，落进「无表可校验」的放行分支，白名单形同虚设。
+     * 替换为空格即还原数据库眼里的真实 token 边界。
+     */
+    public static String maskCommentsAndStrings(String sql) {
+        return replaceCommentsAndStrings(sql, true);
+    }
+
+    /** 两处共用的扫描状态机：{@code maskAsSpace=true} 时注释/字符串落一个空格，否则整段丢弃。 */
+    private static String replaceCommentsAndStrings(String sql, boolean maskAsSpace) {
         StringBuilder sb = new StringBuilder();
         int i = 0, n = sql.length();
         while (i < n) {
             char c = sql.charAt(i);
             if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {        // 行注释
                 while (i < n && sql.charAt(i) != '\n') i++;
+                if (maskAsSpace) sb.append(' ');
             } else if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {  // 块注释
                 i += 2;
                 while (i < n && !(sql.charAt(i) == '*' && i + 1 < n && sql.charAt(i + 1) == '/')) i++;
                 if (i < n) i += 2;
+                if (maskAsSpace) sb.append(' ');
             } else if (c == '\'') {                                         // 字符串字面量
                 i++;
                 while (i < n && sql.charAt(i) != '\'') {
@@ -164,6 +202,7 @@ public final class SqlSafety {
                     i++;
                 }
                 i++; // 跳过结束引号
+                if (maskAsSpace) sb.append(' ');
             } else {
                 sb.append(c);
                 i++;

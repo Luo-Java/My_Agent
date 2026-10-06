@@ -3,12 +3,14 @@ package org.luo.edu.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import jakarta.annotation.Resource;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.common.result.PageResult;
 import org.luo.edu.dto.ScoreDTO;
 import org.luo.edu.entity.Score;
 import org.luo.edu.mapper.ScoreMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.ScoreService;
 import org.luo.edu.vo.OptionVO;
 import org.luo.edu.vo.ScoreVO;
@@ -23,6 +25,9 @@ import java.util.List;
 @Service
 public class ScoreServiceImpl extends ServiceImpl<ScoreMapper, Score> implements ScoreService {
 
+    @Resource
+    private EduProperties eduProperties;
+
     @Override
     public PageResult<ScoreVO> page(ScoreDTO dto) {
         Page<ScoreVO> p = dto.toPage();
@@ -31,7 +36,10 @@ public class ScoreServiceImpl extends ServiceImpl<ScoreMapper, Score> implements
 
     @Override
     public List<OptionVO> options() {
-        return baseMapper.selectOptions();
+        // 下拉选项装上限：XML 里没有 LIMIT，靠分页插件注入（false = 不额外跑 count）。
+        // 这条最需要上限 —— 5 表 join 再 concat 拼文案，全量装载是 5 万行级别。
+        List<OptionVO> rows = baseMapper.selectOptions(new Page<>(1, eduProperties.probeLimit(), false));
+        return eduProperties.trim(rows, "score");
     }
 
     @Override

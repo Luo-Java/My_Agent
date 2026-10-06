@@ -16,7 +16,9 @@ function apiFetch(url, options) {
 }
 
 
-// 配置 marked：启用 GFM（表格/任务列表/删除线），关闭 sanitize 让代码块正常渲染
+// 配置 marked：启用 GFM（表格/任务列表/删除线）。
+// 注意：marked 自 v5 起已移除 sanitize 选项（旧注释「关闭 sanitize」是过时说法），它现在**只做**
+// Markdown → HTML，URL 消毒一概不管 —— 所以 renderMd 自己补一层清理（见 sanitizeHtml）。
 if (typeof marked !== 'undefined') {
     marked.setOptions({
         gfm: true,
@@ -24,7 +26,52 @@ if (typeof marked !== 'undefined') {
     });
 }
 
-/** 将 Markdown 文本转为 HTML（防 XSS：先转义 HTML 标签后交给 marked）。
+/** 判断链接/图片的 URL 是否安全：只放行 http(s) / mailto / tel 与站内相对路径。
+ *  判断前先剥掉控制字符 —— 浏览器解析 URL 时会忽略 href 里的 \t \n \r，
+ *  `java\nscript:alert(1)` 照样当 javascript: 执行，不先剥就等于没拦。 */
+function isSafeUrl(raw) {
+    if (raw == null) return false;
+    const url = String(raw).replace(/[\u0000-\u0020]/g, '').toLowerCase();
+    if (url === '') return false;
+    if (url.startsWith('#') || url.startsWith('/') || url.startsWith('./')
+        || url.startsWith('../') || url.startsWith('?')) {
+        return true;    // 锚点 / 站内绝对路径 / 相对路径
+    }
+    const scheme = /^([a-z][a-z0-9+.\-]*):/.exec(url);
+    return !scheme || ['http', 'https', 'mailto', 'tel'].includes(scheme[1]);
+}
+
+/** 对 marked 产出的 HTML 做白名单清理：拔掉可执行标签、事件属性与非法 URL 协议。
+ *  为什么不引 DOMPurify：输入在进 marked 之前已把 & < > 转义，marked 能产出的标签本就只有
+ *  a/img/code/pre/table/h1-6/p/ul/ol/li/blockquote/em/strong/del/hr/br 这些，真正残留的面只剩
+ *  a[href] / img[src] 的协议（`[x](javascript:...)` 走的是 Markdown 链接语法，转义挡不住）。
+ *  DOMParser + 协议白名单已足够覆盖这点残留，不必为此再往 static/js/lib 塞一个 200KB 依赖。 */
+function sanitizeHtml(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('script,iframe,object,embed,form,style,link,meta,base').forEach(function (n) { n.remove(); });
+    doc.querySelectorAll('*').forEach(function (el) {
+        Array.prototype.slice.call(el.attributes).forEach(function (attr) {
+            const name = attr.name.toLowerCase();
+            if (name.indexOf('on') === 0 || name === 'srcdoc' || name === 'style') {
+                el.removeAttribute(attr.name);
+            }
+        });
+    });
+    doc.querySelectorAll('a[href]').forEach(function (a) {
+        if (!isSafeUrl(a.getAttribute('href'))) {
+            a.removeAttribute('href');
+            return;
+        }
+        a.setAttribute('rel', 'noopener noreferrer');
+        a.setAttribute('target', '_blank');
+    });
+    doc.querySelectorAll('img[src]').forEach(function (img) {
+        if (!isSafeUrl(img.getAttribute('src'))) img.removeAttribute('src');
+    });
+    return doc.body.innerHTML;
+}
+
+/** 将 Markdown 文本转为 HTML（先转义 HTML 标签 → marked 渲染 → 再对产物做一次 URL 协议白名单清理）。
  *  ```echarts 代码块会被识别并替换为图表容器 div（.echarts-box，data-option 存 JSON），
  *  由 renderCharts() 用 ECharts 渲染成真正的图表；JSON 未完整时保留为代码块。 */
 function renderMd(text) {
@@ -47,7 +94,9 @@ function renderMd(text) {
     } catch {
         html = escaped;
     }
-    // 3) 还原图表占位：JSON 合法 → 图表容器 div；非法（流式未完整）→ 保留代码块
+    // 3) 清理 marked 产物（只清它 —— 第 4 步拼出的图表容器是我们自己的安全 HTML，不需要过这一道）
+    html = sanitizeHtml(html);
+    // 4) 还原图表占位：JSON 合法 → 图表容器 div；非法（流式未完整）→ 保留代码块
     html = html.replace(/@@ECHARTS_(\d+)@@/g, (m, i) => {
         const c = charts[+i];
         if (!c) return '';
@@ -339,9 +388,59 @@ const app = createApp({
         // 「通用知识库 + 路由智能体专属库」（不手动选库）。变更即写回会话（刷新后保持）。
         const ragEnabled = ref(false);
 
+        // 规划模式「先看计划」开关：true=规划只产出计划并暂停，用户在卡片上确认后才执行；false=规划后直接执行。
+        // 只在规划模式下有意义（模板里 v-if 控制显隐），随会话切换回显、拨动即写回。
+        const plannerConfirm = ref(false);
+
+        // 「⚖ 评审」开关（会话级）：true=本轮由 LLM 选若干个候选智能体并行独立作答，再由裁决者综合成最终回答；
+        // false=普通单智能体回答（默认）。候选与最终答案同推（候选走 review 事件、只作展示不落记忆）。
+        // 与规划互斥：开启评审时后端会自动关掉 planner，这里同步前端状态（见 onReviewChange）。
+        const reviewEnabled = ref(false);
+
+        // 「🔎 跨会话」开关（会话级）：true=每轮先用 LLM 从本轮问题里抽关键词，在本人「其他会话」的历史消息里
+        // 做关键词召回并注入上下文；false=不检索（默认）。只查本人会话、天然排除当前会话。
+        const crossSession = ref(false);
+
         // 当前会话的未完成任务（RUNNING）：有则显示顶部「继续执行」提示条（断点续跑入口）。
         // 切换会话 / 发送完成 / 续跑完成后刷新；无 RUNNING 任务为 null。
         const runningTask = ref(null);
+
+        // 局部重规划请求进行中（按钮态）：一次模型往返、几秒量级，期间禁用按钮防重复提交。
+        const replanning = ref(false);
+
+        // ===== 消息重做（重新生成 / 编辑重发）=====
+        // 正在「编辑重发」的用户消息下标；-1 = 不在编辑态。
+        // 编辑态下 send() 会先把历史截断到该下标（删除它及其后的全部消息），再用输入框里的新文本重发，
+        // 因此重发走的仍是同一条 /api/chat/stream 通路，不需要第二套发送逻辑。
+        const editingIndex = ref(-1);
+
+        // ===== 长期记忆面板 =====
+        // 双层记忆此前完全黑盒：压缩由后端异步写入，用户看不到「它记住了什么」、也无法纠正记错的内容。
+        // 本面板把 summary / core_facts 摊开可编辑；summarizedCount 是执行游标，只展示不可改。
+        const memoryModal = reactive({
+            open: false, loading: false, saving: false, error: '',
+            summary: '', coreFacts: '', summarizedCount: 0, messageCount: 0
+        });
+
+        // 智能体导入用的隐藏文件选择器（与附件选择器同样走「点击按钮 → 触发 input」的方式）
+        const agentImportInput = ref(null);
+
+        // ===== 成本配额（本人当日 token 用量）=====
+        // 由后端 agent.quota 配置控制，默认关闭（此时后端回 enabled=false，前端不展示任何东西）。
+        // 前端这里<b>只做刻度展示</b>：真正的闸门在后端入口，超限会被明确拒绝并把原因作为一条 error 事件推回来
+        // （按既有错误渲染逻辑红字展示），前端不参与「放不放行」的判断，避免两处规则各说各话。
+        const quota = reactive({ enabled: false, exempt: false, used: 0, limit: 0 });
+
+        // ===== 规划模板（把跑顺的步骤骨架沉淀为可复用资产）=====
+        // 一个弹窗两个模式共用：'use' 选模板 + 填本次目标 → 生成计划；'save' 把某份计划卡片存成模板。
+        // items 只在 use 模式加载；selectedId 为空表示还没选模板（「生成计划」按钮据此禁用）。
+        // confirmId：删除采用「点两次确认」（项目不用原生 confirm，也不为一次误删开弹窗）——
+        // 第一次点只进入待确认态，再点同一个才真删；选中别的行会清掉它。
+        const tplModal = reactive({
+            open: false, mode: 'use', loading: false, items: [], selectedId: null, confirmId: null,
+            goal: '', name: '', description: '', stepCount: 0, taskId: null,
+            saving: false, error: ''
+        });
 
         // ===== 对话附件（图片 / 文档任意文件）=====
         // 待发送附件列表，每项 {file, previewUrl, isImage, type, content, filename}。
@@ -488,6 +587,14 @@ const app = createApp({
             });
         }
 
+        /** 是否展示某条消息的重做按钮。<b>生成中一律不展示</b>：此时截断历史会与正在写入的那一轮撞车。
+         *  用户消息要有可重发的文本或附件；AI 回复即使为空（失败轮）也允许重新生成。 */
+        function canRedo(i) {
+            const m = messages.value[i];
+            if (loading.value || !m) return false;
+            return m.role === 'user' ? !!(m.content || (m.attachments && m.attachments.length)) : true;
+        }
+
         // 根据智能体 ID 取名称（侧边栏/会话徽标用）
         function agentName(id) {
             const a = agents.value.find(x => x.id === id);
@@ -569,9 +676,76 @@ const app = createApp({
                 // 同步侧边栏会话对象：顶部徽标与会话列表「规划」标记即时更新
                 const conv = conversations.value.find(c => c.id === currentId.value);
                 if (conv) conv.planner = planMode.value;
+                // 开规划顺手关评审（后端 updatePlannerSwitch 同口径）：两者都是编排形态，不允许同时亮着
+                if (planMode.value && reviewEnabled.value) {
+                    reviewEnabled.value = false;
+                    if (conv) conv.reviewEnabled = false;
+                }
             } catch (e) {
                 planMode.value = !planMode.value;   // 保存失败回滚开关，避免 UI 与后端形态脱节
                 alert('保存智能规划开关失败：' + e.message);
+            }
+        }
+
+        // 「先看计划」开关变更 → 即时写回会话（与规划 / RAG 开关对称）。仅在规划模式下显示，
+        // 但关掉规划时不清它 —— 它记的是「偏好」（下次开规划是否先看计划），不是「当前状态」。
+        async function onPlannerConfirmChange() {
+            if (!currentId.value) return;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/planner-confirm', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: plannerConfirm.value })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const conv = conversations.value.find(c => c.id === currentId.value);
+                if (conv) conv.plannerConfirm = plannerConfirm.value;
+            } catch (e) {
+                plannerConfirm.value = !plannerConfirm.value;
+                alert('保存「先看计划」开关失败：' + e.message);
+            }
+        }
+
+        // 「⚖ 评审」开关变更 → 即时写回会话（与 RAG / 规划开关对称）。
+        // 与规划互斥：开启评审时后端会把 planner 置 false，这里必须把本地 planMode 也置 false ——
+        // 否则开关还亮着、顶部徽标还显示「规划」，而实际走的是评审链路，UI 与行为脱节。
+        async function onReviewChange() {
+            if (!currentId.value) return;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/review', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: reviewEnabled.value })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const conv = conversations.value.find(c => c.id === currentId.value);
+                if (conv) conv.reviewEnabled = reviewEnabled.value;
+                // 开评审顺手关规划（后端同口径）：本地状态一并对齐，不留「两个都亮着」的中间态
+                if (reviewEnabled.value && planMode.value) {
+                    planMode.value = false;
+                    if (conv) conv.planner = false;
+                }
+            } catch (e) {
+                reviewEnabled.value = !reviewEnabled.value;   // 保存失败回滚开关
+                alert('保存评审开关失败：' + e.message);
+            }
+        }
+
+        // 「🔎 跨会话」开关变更 → 即时写回会话。与规划 / 评审无关，是独立的检索增强开关（可与任何形态叠加）。
+        async function onCrossSessionChange() {
+            if (!currentId.value) return;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/cross-session', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: crossSession.value })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const conv = conversations.value.find(c => c.id === currentId.value);
+                if (conv) conv.crossSession = crossSession.value;
+            } catch (e) {
+                crossSession.value = !crossSession.value;
+                alert('保存跨会话开关失败：' + e.message);
             }
         }
 
@@ -595,6 +769,10 @@ const app = createApp({
         }
 
         // ===== 会话 =====
+        // 历史加载的请求序号：只允许「最后一次」请求的结果写进 messages。
+        // 快速点 A→B 时 A 的响应可能后到，把 B 的消息列表覆盖成 A 的 —— 序号对不上就直接丢弃。
+        let historySeq = 0;
+
         // 只把列表填进侧边栏，不自动打开任何会话：进入 / 刷新 chat.html 一律落在空白欢迎页，
         // 只有在侧边栏点击某条历史时才打开它。currentId 保持 null，
         // 用户直接提问时由 send() 兜底新建会话，不会产生空会话记录。
@@ -616,21 +794,39 @@ const app = createApp({
             } catch (e) { runningTask.value = null; }
         }
 
+        // ===== 成本配额：刷新本人当日用量 =====
+        /** 拉取本人配额用量（未启用时后端回 enabled=false）。纯提示用途，取不到就不显示，不打扰任何流程。 */
+        async function loadQuota() {
+            try {
+                const resp = await apiFetch('/api/chat/quota');
+                if (!resp.ok) return;
+                const d = await resp.json();
+                quota.enabled = !!d.enabled;
+                quota.exempt = !!d.exempt;
+                quota.used = d.used || 0;
+                quota.limit = d.limit || 0;
+            } catch (e) { /* 配额只是刻度：查询失败不提示、不重试 */ }
+        }
+
         // 开启新对话（默认助手，不绑定智能体）
         async function newConversation() {
             try {
                 const resp = await apiFetch('/api/chat/conversation', { method: 'POST' });
                 if (!resp.ok) { alert('创建会话失败'); return; }
                 const data = await resp.json();
+                historySeq++;   // 作废在途的历史请求：新的空会话不该被上一个会话的历史覆盖
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled, reviewEnabled: !!data.reviewEnabled, crossSession: !!data.crossSession },
                     ...conversations.value
                 ];
                 input.value = '';
                 planMode.value = false; // 新建普通会话：规划开关默认关闭
                 ragEnabled.value = false;   // 新建会话默认关闭 RAG；需要时在输入框自行开启
+                plannerConfirm.value = false; // 「先看计划」默认关闭（规划模式默认直接执行）
+                reviewEnabled.value = false;  // 评审默认关闭（多候选 = 多次模型调用，显式开启才走）
+                crossSession.value = false;   // 跨会话检索默认关闭（需要时在输入框自行开启）
                 runningTask.value = null;   // 新会话无未完成任务
                 mainView.value = 'chat';
                 scrollToBottom();
@@ -649,15 +845,19 @@ const app = createApp({
                 });
                 if (!resp.ok) { alert('创建会话失败'); return; }
                 const data = await resp.json();
+                historySeq++;   // 同 newConversation：作废在途的历史请求
                 currentId.value = data.conversationId;
                 messages.value = [];
                 conversations.value = [
-                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled },
+                    { id: data.conversationId, title: data.title, updatedAt: data.createdAt, agentId: data.agentId, planner: data.planner, ragEnabled: !!data.ragEnabled, reviewEnabled: !!data.reviewEnabled, crossSession: !!data.crossSession },
                     ...conversations.value
                 ];
                 input.value = '';
                 planMode.value = false; // 智能体会话不支持规划（planner 与 agentId 互斥），开关强制关闭
                 ragEnabled.value = false;   // 新会话默认关闭 RAG；需要时在输入框自行开启
+                plannerConfirm.value = false; // 「先看计划」仅规划模式有意义，智能体会话恒为关闭
+                reviewEnabled.value = false;  // 评审默认关闭；智能体会话里绑定的这个智能体会固定占一个候选位
+                crossSession.value = false;   // 跨会话检索默认关闭
                 runningTask.value = null;   // 新会话无未完成任务
                 agentView.open = false; // 从查看弹窗发起对话后关闭弹窗
                 mainView.value = 'chat'; // 切回聊天视图
@@ -668,6 +868,7 @@ const app = createApp({
         }
 
         async function selectConversation(id) {
+            const seq = ++historySeq;   // 本次请求的序号；期间再切会话会让它过期
             currentId.value = id;
             messages.value = [];
             mainView.value = 'chat'; // 从智能体管理视图点击历史时切回聊天视图
@@ -676,14 +877,22 @@ const app = createApp({
             planMode.value = !!(conv && conv.planner);
             // RAG 开关跟随会话：上次的开关状态回显（false=关闭）
             ragEnabled.value = !!(conv && conv.ragEnabled);
+            // 「先看计划」跟随会话回显（非规划会话后端恒为 false）
+            plannerConfirm.value = !!(conv && conv.plannerConfirm);
+            // 评审 / 跨会话开关跟随会话回显（后端字段：reviewEnabled / crossSession）
+            reviewEnabled.value = !!(conv && conv.reviewEnabled);
+            crossSession.value = !!(conv && conv.crossSession);
             loadRunningTask(); // 查询该会话是否有未完成任务（有则显示「继续执行」提示条）
             try {
                 const resp = await apiFetch('/api/chat/history?conversationId=' + encodeURIComponent(id));
-                if (resp.ok) {
-                    const data = await resp.json();
+                const data = resp.ok ? await resp.json() : null;
+                // 竞态守卫：resp.json() 也是 await，期间可能又切走了，所以拿到数据后要再判一次
+                if (seq !== historySeq) return;
+                if (data) {
                     messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations));
                 }
             } catch (e) { /* 忽略 */ }
+            if (seq !== historySeq) return;   // 结果已过期：不写 messages，也不滚动/渲染图表
             scrollToBottom();
             renderChartsNow(); // 历史消息可能含 echarts 块，渲染图表
         }
@@ -738,12 +947,222 @@ const app = createApp({
             }
         }
 
+        // ===== 消息重做（重新生成 / 编辑重发）=====
+        // 两者都是「先截断、再复用 send() 重发」：截断端点只负责删除，重发完全走既有流式通路。
+        // 所以这里不复制任何发送逻辑，只把历史裁到该裁的位置、把文本送回输入框。
+
+        /** 截断历史到「只保留前 keepCount 条」。失败抛错，由调用方中止本次重发。 */
+        async function truncateHistory(keepCount) {
+            const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/truncate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keepCount })
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        }
+
+        /** 重新生成第 i 条 AI 回复：删除该回复及其之后，用它前面那条用户消息原样重发。 */
+        async function regenerate(m, i) {
+            if (loading.value) return;
+            const ask = messages.value[i - 1];
+            if (!ask || ask.role !== 'user') { alert('找不到这条回复对应的提问，无法重新生成'); return; }
+            // 历史消息的附件只存了元数据、没有解析出的正文，重发无法还原 —— 说清楚再降级，不静默丢内容
+            if (ask.attachments && ask.attachments.length
+                && !confirm('重新生成不会重新上传当时的附件（只保留文字），继续吗？')) return;
+            if (!confirm('将删除这条回复及其之后的内容并重新生成，继续吗？')) return;
+            try {
+                await truncateHistory(i);   // 保留前 i 条 = 删除第 i 条（这条回复）及其后
+            } catch (e) {
+                alert('重新生成失败：' + e.message);
+                return;
+            }
+            messages.value = messages.value.slice(0, i);
+            attachments.value = [];
+            input.value = ask.content || '';
+            await send();
+        }
+
+        /** 进入「编辑重发」态：文本放回输入框，发送时先截断到它之前再用新文本重发。 */
+        function startEditMessage(m, i) {
+            if (loading.value) return;
+            editingIndex.value = i;
+            input.value = m.content || '';
+            nextTick(() => {
+                const el = document.querySelector('.input-box textarea');
+                if (el) el.focus();
+            });
+        }
+
+        /** 退出「编辑重发」态（只还原输入区，不动历史）。 */
+        function cancelEditMessage() {
+            editingIndex.value = -1;
+        }
+
+        // ===== 会话导出 =====
+        /** 导出当前会话为 Markdown。后端回文本、这里拼 Blob 下载 —— 裸链接带不上 Authorization 请求头。 */
+        async function exportConversation() {
+            if (!currentId.value) return;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/export');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                downloadBlob(data.content || '', data.filename || 'conversation.md', 'text/markdown');
+            } catch (e) {
+                alert('导出失败：' + e.message);
+            }
+        }
+
+        /** 触发浏览器下载（Blob → 临时 object URL → 合成点击）。用完释放，避免 object URL 泄漏。 */
+        function downloadBlob(content, filename, mime) {
+            const url = URL.createObjectURL(new Blob([content], { type: mime + ';charset=utf-8' }));
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        // ===== 长期记忆面板 =====
+        /** 拉取当前会话的记忆快照（摘要素 / 核心事实 / 游标 / 总条数）。 */
+        async function openMemory() {
+            if (!currentId.value) return;
+            memoryModal.open = true;
+            memoryModal.loading = true;
+            memoryModal.error = '';
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const d = await resp.json();
+                memoryModal.summary = d.summary || '';
+                memoryModal.coreFacts = d.coreFacts || '';
+                memoryModal.summarizedCount = d.summarizedCount || 0;
+                memoryModal.messageCount = d.messageCount || 0;
+            } catch (e) {
+                memoryModal.error = '读取失败：' + e.message;
+            } finally {
+                memoryModal.loading = false;
+            }
+        }
+
+        /** 保存记忆内容（只覆盖两列内容；游标由系统维护，不在请求范围内）。 */
+        async function saveMemory() {
+            if (!currentId.value || memoryModal.saving) return;
+            memoryModal.saving = true;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ summary: memoryModal.summary, coreFacts: memoryModal.coreFacts })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                memoryModal.open = false;
+            } catch (e) {
+                alert('保存记忆失败：' + e.message);
+            } finally {
+                memoryModal.saving = false;
+            }
+        }
+
+        /** 重置记忆：摘要 / 核心事实 / 游标三列归零，消息保留（下次超窗会从头重新摘要）。 */
+        async function resetMemory() {
+            if (!currentId.value || memoryModal.saving) return;
+            if (!confirm('重置会清空摘要与核心事实，并让下次记忆压缩从头开始（历史消息不会被删除）。继续吗？')) return;
+            memoryModal.saving = true;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory', {
+                    method: 'DELETE'
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                memoryModal.summary = '';
+                memoryModal.coreFacts = '';
+                memoryModal.summarizedCount = 0;
+            } catch (e) {
+                alert('重置记忆失败：' + e.message);
+            } finally {
+                memoryModal.saving = false;
+            }
+        }
+
+        /** 记忆覆盖度文案：直接回答「它为什么还记着那么早的事」。 */
+        function memoryCoverage() {
+            const total = memoryModal.messageCount || 0;
+            const done = memoryModal.summarizedCount || 0;
+            if (total === 0) return '本会话还没有消息';
+            return '已压缩 ' + done + ' / ' + total + ' 条消息'
+                + (done >= total ? '（全部已进摘要）' : '（其余落在近期窗口内，尚未压缩）');
+        }
+
         // ===== 智能体 =====
         async function loadAgents() {
             try {
                 const resp = await apiFetch('/api/agent');
                 if (resp.ok) agents.value = await resp.json();
             } catch (e) { /* 忽略 */ }
+        }
+
+        // ===== 智能体导入 / 导出（把智能体当资产搬进搬出）=====
+        /** 导出全部智能体为 JSON 文件。包内不含专属知识库内容（那属于知识库模块，需另行重建）。 */
+        async function exportAgents() {
+            try {
+                const resp = await apiFetch('/api/agent/export');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const list = await resp.json();
+                if (!list || !list.length) { alert('当前没有可导出的智能体'); return; }
+                const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+                downloadBlob(JSON.stringify(list, null, 2), 'agents-' + stamp + '.json', 'application/json');
+            } catch (e) {
+                alert('导出失败：' + e.message);
+            }
+        }
+
+        /** 点击「导入」→ 触发隐藏的文件选择器（与附件选择器同一套做法）。 */
+        function triggerAgentImport() {
+            if (agentImportInput.value) agentImportInput.value.click();
+        }
+
+        /**
+         * 读取并导入智能体文件。接受导出格式的数组，或含 agents 数组的对象。
+         * 冲突策略用一次 confirm 二选一：「覆盖」与「跳过」都是有意义的行为，不需要第三种态。
+         */
+        async function onAgentImportFile(event) {
+            const file = event.target.files && event.target.files[0];
+            event.target.value = '';   // 清空 value，否则连续选同一个文件不会再触发 change
+            if (!file) return;
+            let items;
+            try {
+                const parsed = JSON.parse(await file.text());
+                items = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.agents) ? parsed.agents : null);
+                if (!items) throw new Error('JSON 顶层应为数组，或含 agents 数组的对象');
+            } catch (e) {
+                alert('解析文件失败：' + e.message);
+                return;
+            }
+            if (!items.length) { alert('文件里没有智能体'); return; }
+            const overwrite = confirm(
+                '即将导入 ' + items.length + ' 个智能体。\n\n'
+                + '【确定】覆盖同编码的智能体（保留其 id 与创建时间）\n'
+                + '【取消】跳过同编码的，只新增不存在的'
+            );
+            try {
+                const resp = await apiFetch('/api/agent/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ agents: items, onConflict: overwrite ? 'overwrite' : 'skip' })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const r = await resp.json();
+                let msg = '导入完成：新增 ' + r.created + '，更新 ' + r.updated + '，跳过 ' + r.skipped;
+                if (r.errors && r.errors.length) {
+                    msg += '\n\n失败 ' + r.errors.length + ' 条：\n' + r.errors.slice(0, 5).join('\n');
+                    if (r.errors.length > 5) msg += '\n…';
+                }
+                alert(msg);
+                await loadAgents();
+            } catch (e) {
+                alert('导入失败：' + e.message);
+            }
         }
 
         // ===== 智能体管理：搜索 / 统计 / 卡片展示辅助 =====
@@ -822,6 +1241,7 @@ const app = createApp({
             if (s.includes('SqlQuery')) return '数据查询';
             if (s.includes('SqlSchema')) return '数据表结构';
             if (s.includes('Chart')) return '图表';
+            if (s.includes('SubAgent')) return '智能体协作';
             return s || '其他';
         }
 
@@ -1518,6 +1938,19 @@ const app = createApp({
         const traceModal = reactive({
             open: false, loading: false, items: [], expanded: {}, error: '',
             isAdmin: false, allConversations: false,
+            page: 1,
+        });
+        /** 每页条数：列表固定分页，行高不随数据量变化（此前一次性渲染，行被 flex 压扁）。 */
+        const TRACE_PAGE_SIZE = 10;
+        /** 列表滚动容器：翻页后滚回顶部，否则停在上一页的滚动位置，看着像「点了没反应」。 */
+        const traceListRef = ref(null);
+        /** 总页数（空列表也按 1 页算，页脚语感一致）。 */
+        const tracePageCount = computed(() =>
+            Math.max(1, Math.ceil((traceModal.items.length || 0) / TRACE_PAGE_SIZE)));
+        /** 当前页切片。注意统计条仍基于**全量** items —— 它回答「这个范围的总体情况」，不是「这一页」。 */
+        const tracePageItems = computed(() => {
+            const start = (traceModal.page - 1) * TRACE_PAGE_SIZE;
+            return (traceModal.items || []).slice(start, start + TRACE_PAGE_SIZE);
         });
         /** 追踪列表的聚合统计（看板视角）：轮次 / token 合计 / 平均耗时 / 工具调用数 / 错误轮。纯客户端聚合，不改后端。 */
         const traceStats = computed(() => {
@@ -1545,6 +1978,7 @@ const app = createApp({
             traceModal.items = [];
             traceModal.expanded = {};
             traceModal.error = '';
+            traceModal.page = 1;   // 重查/换范围一律回到第 1 页（否则可能停在一个已经不存在的页码上）
             // 角色在这里定一次：弹窗只有点开才渲染，此时 Auth 早已就绪（页面未解锁时点不到按钮）。
             traceModal.isAdmin = !!(window.Auth && window.Auth.hasRole && window.Auth.hasRole('ADMIN'));
             try {
@@ -1586,12 +2020,22 @@ const app = createApp({
             }
             return '本会话暂无追踪记录（追踪在本轮回复产出后异步落库，可稍后重试）';
         }
-        function toggleTrace(i) {
-            traceModal.expanded[i] = !traceModal.expanded[i];
+        /** 展开/收起某轮明细。key 用 traceId 而不是列表下标 —— 分页后下标会跨页重复，
+            用下标会让「第 1 页第 3 条」和「第 2 页第 3 条」共用同一个展开态。 */
+        function toggleTrace(traceId) {
+            traceModal.expanded[traceId] = !traceModal.expanded[traceId];
+        }
+        /** 翻页：夹在 [1, 总页数] 内；翻完把列表滚回顶部，否则停在上一页的滚动位置像「没反应」。 */
+        function traceGoPage(p) {
+            const next = Math.min(Math.max(1, p), tracePageCount.value);
+            if (next === traceModal.page) return;
+            traceModal.page = next;
+            const el = traceListRef.value;
+            if (el) el.scrollTop = 0;
         }
         /** 处理方来源 → 中文标签（与后端 agent_trace.route_source 取值对应）。 */
         function routeLabel(src) {
-            return ({ BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排' })[src] || (src || '-');
+            return ({ BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排', REVIEW: '并行评审' })[src] || (src || '-');
         }
         /** 形态 → 中文标签。 */
         function modeLabel(mode) {
@@ -1829,21 +2273,85 @@ const app = createApp({
             };
         }
 
+        // ===== 本轮生成的中断控制 =====
+        // 服务端是 SSE：客户端断开后服务端仍会把本轮跑完并落库，「停止」的语义是「不再接收」，
+        // 不是「取消服务端计算」—— 这点必须说清楚，否则用户会以为点了停止就等于白跑一轮。
+        let streamAbort = null;      // 当前这轮的 AbortController；null = 没有在跑
+        let streamIdleTimer = null;  // 空闲计时器：连心跳都没有了，说明这条连接其实已经死了
+        let stopReason = '';         // 主动断开的原因：'' 未断开 / 'user' 用户点停止 / 'idle' 空闲超时
+        // 空闲上限：后端 SSE 心跳 15s（app.sse.heartbeat-seconds），这里取 4 个心跳的余量。
+        // 没有它时，连接被中间层静默掐断会让 reader.read() 一直挂着 —— 输入框永久锁死，只能刷新页面。
+        const STREAM_IDLE_MS = 60000;
+
+        /** 开始一轮生成：拿到本轮的中断开关，并清掉上一轮遗留的断开原因。 */
+        function beginStream() {
+            stopReason = '';
+            streamAbort = new AbortController();
+            return streamAbort.signal;
+        }
+
+        /** 结束一轮生成：清计时器、释放中断开关（finally 里无条件调用）。 */
+        function endStream() {
+            if (streamIdleTimer) { clearTimeout(streamIdleTimer); streamIdleTimer = null; }
+            streamAbort = null;
+        }
+
+        /** 每收到一段数据就重置空闲计时；到点仍未收到任何字节 → 判定连接已死，主动断开。 */
+        function resetIdleTimer() {
+            if (streamIdleTimer) clearTimeout(streamIdleTimer);
+            streamIdleTimer = setTimeout(() => {
+                if (streamAbort) { stopReason = 'idle'; streamAbort.abort(); }
+            }, STREAM_IDLE_MS);
+        }
+
+        /** 用户点「停止」：断开本轮 SSE（服务端那轮仍会跑完，见本节开头说明）。 */
+        function stopGeneration() {
+            if (streamAbort) { stopReason = 'user'; streamAbort.abort(); }
+        }
+
         // ===== 发送消息（流式） =====
         async function send() {
             const text = input.value.trim();
             // 允许「只有图片没有文字」的场景（如「这张图是什么」）；两者都空才拒绝
             if (loading.value) return;
             if (!text && attachments.value.length === 0) return;
-            // 空白页（首页进入 / 刷新）时用户可能已经拨好规划 / RAG 开关，此刻还没有会话可写回。
-            // newConversation() 会把两个开关复位为默认关闭，所以先暂存本次选择，建会话后再补写：
-            // 否则用户拨动的选择被静默丢弃，且 RAG 不写回会话时本轮根本不会走检索。
+            // 空白页（首页进入 / 刷新）时用户可能已经拨好规划 / RAG / 评审 / 跨会话开关，此刻还没有会话可写回。
+            // newConversation() 会把开关复位为默认关闭，所以先暂存本次选择，建会话后再补写：
+            // 否则用户拨动的选择被静默丢弃，且 RAG / 跨会话不写回会话时本轮根本不会走检索。
             const pendingPlanner = planMode.value;
             const pendingRag = ragEnabled.value;
+            const pendingPlannerConfirm = plannerConfirm.value;
+            const pendingReview = reviewEnabled.value;
+            const pendingCrossSession = crossSession.value;
             if (!currentId.value) await newConversation();
             const convId = currentId.value;
             if (pendingPlanner && !planMode.value) { planMode.value = true; await onPlannerChange(); }
             if (pendingRag && !ragEnabled.value) { ragEnabled.value = true; await onRagEnabledChange(); }
+            if (pendingPlannerConfirm && !plannerConfirm.value) { plannerConfirm.value = true; await onPlannerConfirmChange(); }
+            // 补写顺序有讲究：先规划后评审。两者互斥且后端开启任一方会关掉另一方，
+            // 按「用户最后拨动的是哪一个」无从得知，这里以规划优先（与后端 selectHandler 的防御一致）。
+            if (pendingReview && !reviewEnabled.value) { reviewEnabled.value = true; await onReviewChange(); }
+            if (pendingCrossSession && !crossSession.value) { crossSession.value = true; await onCrossSessionChange(); }
+
+            // 编辑重发：先把历史截断到目标消息之前，再用输入框里的新文本走下面同一条流式通路。
+            // 截断失败则中止本轮（保留编辑态，用户可重试或取消）—— 不能在历史没裁干净的情况下重发，
+            // 否则新旧两条提问会同时留在会话里。
+            if (editingIndex.value >= 0) {
+                const keep = editingIndex.value;
+                try {
+                    await truncateHistory(keep);
+                } catch (e) {
+                    alert('重发失败：' + e.message);
+                    return;
+                }
+                editingIndex.value = -1;
+                messages.value = messages.value.slice(0, keep);
+            }
+
+            // 发起新一轮：此前留下的待确认计划卡片一律失效。
+            // 新的一轮规划会把旧 RUNNING 任务结为 CANCELLED（TaskService.cancelRunning），
+            // 卡片若仍可点，就会去执行一个已被取消的任务。
+            messages.value.forEach(x => { if (x.plan) x.planDone = true; });
 
             // 1) 把本轮所有附件一次性发给 /api/chat/attachment/process：
             //    图片→视觉模型识别、文档→解析为文本，后端按入参顺序返回 {type, filename, content}。
@@ -1904,11 +2412,13 @@ const app = createApp({
             scrollToBottom();
 
             const lastIndex = messages.value.length - 1;
+            const signal = beginStream();   // 本轮的中断开关：由「停止」按钮或空闲超时触发
 
             try {
                 const resp = await apiFetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    signal: signal,
                     body: JSON.stringify({
                         conversationId: convId,
                         message: userText,
@@ -1941,10 +2451,14 @@ const app = createApp({
                         if (!data) continue;
                         // 后端按事件类型给字段名：token=正文分片（进记忆）；progress=执行过程（不进记忆）；
                         // citations=RAG 引用来源（正文推完后发一次，不进记忆，单独落库供历史回看）；
-                        // error=本轮出错（红字提示、不进正文）
+                        // plan=待确认计划；approval=执行到审批关卡暂停的待批步骤；error=本轮出错（红字提示、不进正文）
                         let progress = '';
                         let error = '';
                         let citations = '';
+                        let planJson = '';
+                        let approvalJson = '';
+                        let reviewJson = '';
+                        let recallJson = '';
                         try {
                             const parsed = JSON.parse(data);
                             if (parsed && typeof parsed.error === 'string') {
@@ -1956,6 +2470,20 @@ const app = createApp({
                             } else if (parsed && typeof parsed.citations === 'string') {
                                 citations = parsed.citations;
                                 data = '';
+                            } else if (parsed && typeof parsed.plan === 'string') {
+                                planJson = parsed.plan;
+                                data = '';
+                            } else if (parsed && typeof parsed.approval === 'string') {
+                                approvalJson = parsed.approval;
+                                data = '';
+                            } else if (parsed && typeof parsed.review === 'string') {
+                                // 并行评审候选（C1）：正文之前先到，最终答案由裁决者综合而来
+                                reviewJson = parsed.review;
+                                data = '';
+                            } else if (parsed && typeof parsed.recall === 'string') {
+                                // 跨会话回忆（A3）：本轮从本人其他会话召回的历史片段（JSON 数组）
+                                recallJson = parsed.recall;
+                                data = '';
                             } else {
                                 data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
                             }
@@ -1963,6 +2491,7 @@ const app = createApp({
                             // 兼容旧格式：非 JSON 时按原始文本处理
                         }
                         const m = messages.value[lastIndex];
+                        if (!m) return;   // 消息列表已被切会话/新建会话清空：没有可写的目标
                         if (error) {
                             // 错误事件：既在「执行过程」区留痕（红字），也在气泡里醒目展示（errText 直接可见，
                             // 不再藏在折叠的步骤里）；绝不混进正文（正文会进会话记忆）。
@@ -1983,6 +2512,48 @@ const app = createApp({
                                     m.citesOpen = true;
                                 }
                             } catch (e) { /* 引用解析失败不影响正文展示 */ }
+                        } else if (planJson) {
+                            // 待确认计划（规划模式「先看计划」）：渲染成可点「执行计划」的卡片。
+                            // 计划明细同时也作为正文推了一遍，所以这里解析失败也不影响用户看到内容。
+                            try {
+                                const p = JSON.parse(planJson);
+                                if (p && Array.isArray(p.steps) && p.steps.length) {
+                                    m.plan = p;
+                                    m.planRunning = false;
+                                    m.planDone = false;
+                                }
+                            } catch (e) { /* 计划解析失败不影响正文展示 */ }
+                        } else if (approvalJson) {
+                            // 执行到审批关卡暂停：渲染审批卡片（批准并继续 / 终止计划）。
+                            // 暂停说明同时也作为正文推了一遍，解析失败也不影响用户看到「卡在哪一步」。
+                            try {
+                                const p = JSON.parse(approvalJson);
+                                if (p && typeof p.stepIndex === 'number') {
+                                    m.approval = p;
+                                    m.approvalRunning = false;
+                                    m.approvalDone = false;
+                                }
+                            } catch (e) { /* 审批信息解析失败不影响正文展示 */ }
+                        } else if (reviewJson) {
+                            // 并行评审：解析成候选列表挂在当前消息上，气泡底部渲染「⚖ 并行评审」区。
+                            // 默认折叠 —— 候选是完整作答，展开后可能很长；正文才是裁决后的答案。
+                            try {
+                                const p = JSON.parse(reviewJson);
+                                if (p && Array.isArray(p.candidates) && p.candidates.length) {
+                                    m.review = p;
+                                    m.reviewOpen = false;
+                                }
+                            } catch (e) { /* 评审信息解析失败不影响正文展示 */ }
+                        } else if (recallJson) {
+                            // 跨会话回忆：解析成命中列表挂在当前消息上，气泡底部渲染「🔎 回忆到的历史」区。
+                            // 它对应注入过的上下文，不进正文、不进会话记忆；刷新后不可回看（后端刻意不落库）。
+                            try {
+                                const list = JSON.parse(recallJson);
+                                if (Array.isArray(list) && list.length) {
+                                    m.recall = list;
+                                    m.recallOpen = true;
+                                }
+                            } catch (e) { /* 回忆列表解析失败不影响正文展示 */ }
                         } else if (data) {
                             // 正文首个分片到达：自动收起执行过程，让最终结果成为视觉焦点（仍可手动展开）
                             if (!m.content && m.steps && m.steps.length) m.stepsOpen = false;
@@ -1994,12 +2565,14 @@ const app = createApp({
                     }
                 };
 
+                resetIdleTimer();
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
                     buf += decoder.decode(value, { stream: true });
                     flushEvents();
                     scrollToBottom();
+                    resetIdleTimer();
                 }
                 buf += decoder.decode();
                 flushEvents();
@@ -2008,10 +2581,18 @@ const app = createApp({
                 loadConversations();
             } catch (e) {
                 const m = messages.value[lastIndex];
-                const msg = '请求失败：' + e.message +
-                    '（请确认后端已配置有效的 API Key / 服务地址，且 MySQL 已启动、服务已运行）';
-                m.errText = msg;
+                if (!m) return;   // 同上：列表已被清空，没有可写的目标
+                if (e && e.name === 'AbortError') {
+                    // 主动断开有两种来源，靠 stopReason 区分 —— 用户点的停止与连接自己死掉，说法不一样
+                    m.errText = stopReason === 'idle'
+                        ? '超过 ' + (STREAM_IDLE_MS / 1000) + ' 秒未收到新数据，已断开连接（网络中断或服务端未响应）。'
+                        : '已停止接收本轮回复（服务端可能仍会完成本轮并落库，重开该会话可见完整结果）。';
+                } else {
+                    m.errText = '请求失败：' + e.message +
+                        '（请确认后端已配置有效的 API Key / 服务地址，且 MySQL 已启动、服务已运行）';
+                }
             } finally {
+                endStream();
                 loading.value = false;
                 scrollToBottom();
                 // 释放预览 URL 并清空待发送附件（用户消息气泡已带 previewUrl 引用，可继续显示）
@@ -2021,6 +2602,7 @@ const app = createApp({
                 attachments.value = [];
                 // 发送完成后刷新未完成任务状态（规划任务执行中断会留下 RUNNING，正常跑完会 DONE）
                 loadRunningTask();
+                loadQuota();   // 本轮消耗刚计入流水，刷新配额刻度
             }
         }
 
@@ -2033,6 +2615,7 @@ const app = createApp({
             // 推一条空的 assistant 消息承接续跑输出（无用户气泡；续跑是对既有任务的延续）
             messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true });
             const lastIndex = messages.value.length - 1;
+            const signal = beginStream();   // 续跑同样可中断（与 send 共用一套中断控制）
             loading.value = true;
             scrollToBottom();
 
@@ -2040,6 +2623,7 @@ const app = createApp({
                 const resp = await apiFetch('/api/chat/task/resume', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    signal: signal,
                     body: JSON.stringify({ conversationId: convId })
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -2061,6 +2645,10 @@ const app = createApp({
                         let progress = '';
                         let error = '';
                         let citations = '';
+                        let planJson = '';
+                        let approvalJson = '';
+                        let reviewJson = '';
+                        let recallJson = '';
                         try {
                             const parsed = JSON.parse(data);
                             if (parsed && typeof parsed.error === 'string') {
@@ -2072,11 +2660,26 @@ const app = createApp({
                             } else if (parsed && typeof parsed.citations === 'string') {
                                 citations = parsed.citations;
                                 data = '';
+                            } else if (parsed && typeof parsed.plan === 'string') {
+                                planJson = parsed.plan;
+                                data = '';
+                            } else if (parsed && typeof parsed.approval === 'string') {
+                                approvalJson = parsed.approval;
+                                data = '';
+                            } else if (parsed && typeof parsed.review === 'string') {
+                                // 并行评审候选（C1）：正文之前先到，最终答案由裁决者综合而来
+                                reviewJson = parsed.review;
+                                data = '';
+                            } else if (parsed && typeof parsed.recall === 'string') {
+                                // 跨会话回忆（A3）：本轮从本人其他会话召回的历史片段（JSON 数组）
+                                recallJson = parsed.recall;
+                                data = '';
                             } else {
                                 data = (parsed && typeof parsed.token === 'string') ? parsed.token : '';
                             }
                         } catch (e) { /* 兼容旧格式 */ }
                         const m = messages.value[lastIndex];
+                        if (!m) return;   // 消息列表已被切会话/新建会话清空：没有可写的目标
                         if (error) {
                             if (!m.steps) m.steps = [];
                             m.steps.push('❌ ' + error);
@@ -2093,6 +2696,43 @@ const app = createApp({
                                     m.citesOpen = true;
                                 }
                             } catch (e) { /* 引用解析失败不影响正文 */ }
+                        } else if (planJson) {
+                            try {
+                                const p = JSON.parse(planJson);
+                                if (p && Array.isArray(p.steps) && p.steps.length) {
+                                    m.plan = p;
+                                    m.planRunning = false;
+                                    m.planDone = false;
+                                }
+                            } catch (e) { /* 计划解析失败不影响正文 */ }
+                        } else if (approvalJson) {
+                            // 续跑途中又撞上下一个审批点：同样渲染审批卡片，用户在此继续决定
+                            try {
+                                const p = JSON.parse(approvalJson);
+                                if (p && typeof p.stepIndex === 'number') {
+                                    m.approval = p;
+                                    m.approvalRunning = false;
+                                    m.approvalDone = false;
+                                }
+                            } catch (e) { /* 审批信息解析失败不影响正文 */ }
+                        } else if (reviewJson) {
+                            // 续跑一般不会走评审（评审与规划互斥、续跑是规划的延续），但事件解析保持一致口径：
+                            // 少一个分支就会让「意外到来」的事件被当成正文 token 拼进回答里。
+                            try {
+                                const p = JSON.parse(reviewJson);
+                                if (p && Array.isArray(p.candidates) && p.candidates.length) {
+                                    m.review = p;
+                                    m.reviewOpen = false;
+                                }
+                            } catch (e) { /* 评审信息解析失败不影响正文 */ }
+                        } else if (recallJson) {
+                            try {
+                                const list = JSON.parse(recallJson);
+                                if (Array.isArray(list) && list.length) {
+                                    m.recall = list;
+                                    m.recallOpen = true;
+                                }
+                            } catch (e) { /* 回忆列表解析失败不影响正文 */ }
                         } else if (data) {
                             if (!m.content && m.steps && m.steps.length) m.stepsOpen = false;
                             m.content += data;
@@ -2103,12 +2743,14 @@ const app = createApp({
                     }
                 };
 
+                resetIdleTimer();
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
                     buf += decoder.decode(value, { stream: true });
                     flushEvents();
                     scrollToBottom();
+                    resetIdleTimer();
                 }
                 buf += decoder.decode();
                 flushEvents();
@@ -2116,12 +2758,382 @@ const app = createApp({
                 loadConversations();
             } catch (e) {
                 const m = messages.value[lastIndex];
-                m.errText = '续跑失败：' + e.message;
+                if (!m) return;
+                if (e && e.name === 'AbortError') {
+                    m.errText = stopReason === 'idle'
+                        ? '超过 ' + (STREAM_IDLE_MS / 1000) + ' 秒未收到新数据，已断开连接（网络中断或服务端未响应）。'
+                        : '已停止接收本轮续跑（服务端可能仍会完成本轮并落库）。';
+                } else {
+                    m.errText = '续跑失败：' + e.message;
+                }
             } finally {
+                endStream();
                 loading.value = false;
                 // 续跑完成后刷新未完成任务状态：任务已 DONE/FAILED 则提示条消失
                 await loadRunningTask();
+                loadQuota();   // 续跑同样消耗 token，刷新配额刻度
                 scrollToBottom();
+            }
+        }
+
+        // ===== 执行「先看计划」卡片上的待确认计划 =====
+        // 走的就是续跑通路：计划已作为 RUNNING 任务落库、步骤全 PENDING，续跑自然会「从头跑完整计划」。
+        // 这样「确认执行」与「断点续跑」共用一套后端逻辑，不需要第二套执行入口。
+        async function runPlan(m) {
+            if (loading.value || !currentId.value || m.planRunning) return;
+            m.planRunning = true;
+            try {
+                await resumeTask();
+            } finally {
+                m.planRunning = false;
+                m.planDone = true;   // 无论成败都置为已消费：任务已 DONE/FAILED/CANCELLED，卡片不再可点
+            }
+        }
+
+        // ===== 计划步骤就地编辑（「先看计划」）=====
+        // 只改尚未执行的步骤。后端改的是 task_step 里 PENDING 的行，而执行侧（续跑通路）是从库里读步骤
+        // 重建执行的，所以「保存 → 点执行计划」天然按新值运行，不需要重新规划、也不需要第二套执行入口。
+        function editPlanStep(m, s) {
+            if (m.planRunning || m.planDone) return;
+            // 编辑值放在 editXxx 上，原值不动 —— 取消时直接丢弃即可，无需备份还原
+            s.editAgentCode = s.agentCode;
+            s.editInstruction = s.instruction || '';
+            s.editDeps = Array.isArray(s.dependsOn) ? s.dependsOn.slice() : [];
+            s.editError = '';
+            s.editing = true;
+        }
+
+        function cancelPlanStep(s) {
+            if (s.saving) return;
+            s.editing = false;
+            s.editError = '';
+        }
+
+        async function savePlanStep(m, s) {
+            if (s.saving || !currentId.value) return;
+            if (!s.editAgentCode) { s.editError = '请选择智能体'; return; }
+            s.saving = true;
+            s.editError = '';
+            try {
+                const resp = await apiFetch('/api/chat/task/step', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        conversationId: currentId.value,
+                        stepIndex: s.index - 1,          // 卡片上是 1 基展示，接口要 0 基下标
+                        agentCode: s.editAgentCode,
+                        instruction: s.editInstruction,
+                        dependsOn: s.editDeps
+                    })
+                });
+                if (!resp.ok) {
+                    // 后端业务校验失败会带中文原因（如「第 2 步已开始执行」），原样展示比显示状态码有用
+                    let msg = 'HTTP ' + resp.status;
+                    try {
+                        const body = await resp.json();
+                        if (body && body.message) msg = body.message;
+                    } catch (_) { /* 非 JSON 响应：保留状态码 */ }
+                    s.editError = msg;
+                    return;
+                }
+                // 保存成功：把编辑值写回展示字段（后端已按同一口径落库，两边保持一致）
+                const a = agents.value.find(x => x.agentCode === s.editAgentCode);
+                s.agentCode = s.editAgentCode;
+                if (a) s.agentName = a.name;
+                s.instruction = s.editInstruction;
+                s.dependsOn = s.editDeps.slice();
+                s.editing = false;
+            } catch (e) {
+                s.editError = '保存失败：' + e.message;
+            } finally {
+                s.saving = false;
+            }
+        }
+
+        // ===== 步骤审批点（执行到「需审批」步骤先暂停，批准后继续）=====
+        // 审批标记与步骤定义一样落在 task_step 上，执行侧（续跑通路）读库即生效，因此本组函数只做两件事：
+        // 写标记（勾选 / 批准）、以及「批准后立刻复用续跑」。没有任何第二套执行逻辑。
+
+        /** 勾选 / 取消「需审批」并立即落库。失败回滚勾选态 —— 界面不能显示成已生效而库里没变。 */
+        async function toggleStepApproval(m, s, checked) {
+            if (!currentId.value || s.approving) return;
+            const prev = !!s.approvalRequired;
+            s.approving = true;
+            s.approvalRequired = checked;
+            try {
+                const resp = await apiFetch('/api/chat/task/step', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        conversationId: currentId.value,
+                        stepIndex: s.index - 1,          // 卡片上是 1 基展示，接口要 0 基下标
+                        agentCode: s.agentCode,          // 该接口必填；此处原样回传，不动智能体
+                        instruction: s.instruction || '',
+                        dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn : [],
+                        approvalRequired: checked
+                    })
+                });
+                if (!resp.ok) {
+                    // 后端会给中文原因（如「第 2 步已开始执行，不能再修改」），原样展示比显示状态码有用
+                    let msg = 'HTTP ' + resp.status;
+                    try { const b = await resp.json(); if (b && b.message) msg = b.message; } catch (_) { /* 非 JSON */ }
+                    s.approvalRequired = prev;
+                    pushNotice('设置审批失败：' + msg);
+                }
+            } catch (e) {
+                s.approvalRequired = prev;
+                pushNotice('设置审批失败：' + e.message);
+            } finally {
+                s.approving = false;
+            }
+        }
+
+        /** 批准待审批步骤并立刻继续执行：先 approve 写标记，再走续跑通路接着跑。 */
+        async function approveAndResume(m) {
+            if (loading.value || m.approvalRunning || m.approvalDone || !currentId.value) return;
+            m.approvalRunning = true;
+            try {
+                const resp = await apiFetch('/api/chat/task/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: currentId.value, stepIndex: m.approval.stepIndex })
+                });
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try { const b = await resp.json(); if (b && b.message) msg = b.message; } catch (_) { /* 非 JSON */ }
+                    m.errText = '批准失败：' + msg;
+                    return;
+                }
+                // 标记已落库，卡片即视为处理完毕：后续输出由续跑推入的新消息承接（可能又是一张审批卡）
+                m.approvalDone = true;
+                await resumeTask();
+            } catch (e) {
+                m.errText = '批准失败：' + e.message;
+            } finally {
+                m.approvalRunning = false;
+            }
+        }
+
+        /** 终止当前计划：RUNNING → CANCELLED，剩余步骤不再执行（已完成步骤的产出保留在库里）。 */
+        async function cancelPlanTask(m) {
+            if (loading.value || m.approvalRunning || !currentId.value) return;
+            if (!confirm('终止后剩余步骤不会再执行（已完成步骤的产出仍保留在库里）。继续吗？')) return;
+            m.approvalRunning = true;
+            try {
+                const resp = await apiFetch('/api/chat/task/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: currentId.value })
+                });
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try { const b = await resp.json(); if (b && b.message) msg = b.message; } catch (_) { /* 非 JSON */ }
+                    m.errText = '终止失败：' + msg;
+                    return;
+                }
+                m.approvalDone = true;
+                m.planDone = true;          // 同一条消息上的计划卡片一并失效，避免还能点「执行计划」
+                await loadRunningTask();    // 任务已 CANCELLED：顶部「继续执行」提示条应随之消失
+            } catch (e) {
+                m.errText = '终止失败：' + e.message;
+            } finally {
+                m.approvalRunning = false;
+            }
+        }
+
+        // ===== 局部重规划（只重排「第一个未成功步骤及其之后」的一段）=====
+        // 与「续跑」的区别：续跑是原计划再跑一遍，重规划是这一段本身行不通时换一套。
+        // 后端只改库、不执行（与「先看计划」同一节奏），所以这里把新计划作为一张卡片推入消息区，
+        // 用户确认后再点卡片上的「执行计划」走续跑通路。
+        /** 往消息区推一条纯提示（无助手气泡语义，仅用 errText 位置展示原因）。 */
+        function pushNotice(text) {
+            messages.value.push({
+                role: 'assistant', content: '', html: '', version: 0,
+                steps: [], plan: null, errText: text
+            });
+            scrollToBottom();
+        }
+
+        async function replanTask() {
+            if (replanning.value || loading.value || !currentId.value) return;
+            const convId = currentId.value;
+            replanning.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/task/replan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: convId })
+                });
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try {
+                        const body = await resp.json();
+                        if (body && body.message) msg = body.message;
+                    } catch (_) { /* 非 JSON 响应：保留状态码 */ }
+                    pushNotice('重新规划失败：' + msg);
+                    return;
+                }
+                const data = await resp.json();
+                let plan = null;
+                try { plan = JSON.parse(data.plan); } catch (_) { plan = null; }
+                if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+                    pushNotice('重新规划没有产出可用步骤，原计划保持不变。');
+                    return;
+                }
+                // 请求期间用户可能切了会话：过期结果直接丢弃，不要写进别的会话的消息列表
+                if (currentId.value !== convId) return;
+                // 旧卡片标记为「已消费」：它展示的还是重规划前的步骤，不能再点执行
+                messages.value.forEach(x => { if (x.plan) { x.planDone = true; x.planRunning = false; } });
+                const msg = {
+                    role: 'assistant', content: data.text || '', html: '', version: 0,
+                    steps: [], stepsOpen: false, citesOpen: false,
+                    plan: plan, planRunning: false, planDone: false
+                };
+                messages.value.push(msg);
+                msg.html = renderMd(msg.content);
+                msg.version++;
+                scrollToBottom();
+                await loadRunningTask();   // 任务仍是 RUNNING（尚未执行），提示条应继续在
+            } catch (e) {
+                pushNotice('重新规划失败：' + e.message);
+            } finally {
+                replanning.value = false;
+            }
+        }
+
+        // ===== 规划模板（存 / 列 / 套用 / 删）=====
+        // 模板只存「怎么排」（智能体 + 指令 + 依赖的快照），不含「做什么」—— 所以套用时必须填本次目标，
+        // 它会成为后端 task.user_goal，并在执行时作为第一步的输入。套用**只生成计划卡片、不自动执行**：
+        // 与「先看计划」同一节奏，用户可以先逐条改（卡片上的「编辑」），再点「执行计划」走续跑通路。
+
+        /** 后端错误体是 {code,message,data}：优先展示服务端给的中文原因，取不到才退回状态码。 */
+        async function tplErrText(resp) {
+            try {
+                const body = await resp.json();
+                if (body && body.message) return body.message;
+            } catch (_) { /* 非 JSON 响应：保留状态码 */ }
+            return 'HTTP ' + resp.status;
+        }
+
+        /** 打开「从模板开始」：拉取本人模板列表（按创建时间倒序）。 */
+        async function openTemplateList() {
+            if (!currentId.value) { pushNotice('请先选择或新建一个会话'); return; }
+            Object.assign(tplModal, { open: true, mode: 'use', loading: true, items: [], selectedId: null,
+                confirmId: null, goal: '', saving: false, error: '' });
+            try {
+                const resp = await apiFetch('/api/chat/task/template/list');
+                if (!resp.ok) throw new Error(await tplErrText(resp));
+                tplModal.items = (await resp.json()) || [];
+            } catch (e) {
+                tplModal.error = '模板列表加载失败：' + e.message;
+            } finally {
+                tplModal.loading = false;
+            }
+        }
+
+        /** 打开「存为模板」：来源是某张计划卡片，用它的 taskId 定位（后端以库里的当前步骤为准）。 */
+        function openSaveTemplate(m) {
+            const plan = m && m.plan;
+            if (!plan || !plan.taskId) { pushNotice('这份计划没有可保存的任务'); return; }
+            Object.assign(tplModal, { open: true, mode: 'save', loading: false, items: [], selectedId: null,
+                confirmId: null, goal: '', saving: false, error: '',
+                name: '', description: '', taskId: plan.taskId, stepCount: (plan.steps || []).length });
+        }
+
+        function closeTplModal() {
+            if (tplModal.saving) return;   // 保存 / 生成进行中不关，避免请求结果无处安放
+            tplModal.open = false;
+        }
+
+        function selectTemplate(t) {
+            tplModal.selectedId = t.id;
+            tplModal.confirmId = null;     // 改选别的模板即撤销「待确认删除」
+            tplModal.error = '';
+        }
+
+        /** 把计划卡片的步骤骨架存为模板。 */
+        async function submitSaveTemplate() {
+            if (tplModal.saving) return;
+            const name = (tplModal.name || '').trim();
+            if (!name) { tplModal.error = '请填写模板名称'; return; }
+            tplModal.saving = true;
+            tplModal.error = '';
+            try {
+                const resp = await apiFetch('/api/chat/task/template/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ taskId: tplModal.taskId, name: name,
+                        description: (tplModal.description || '').trim() })
+                });
+                if (!resp.ok) { tplModal.error = await tplErrText(resp); return; }
+                tplModal.open = false;
+                pushNotice('已存为模板：' + name + '（在输入区「模板」里可套用）');
+            } catch (e) {
+                tplModal.error = '保存失败：' + e.message;
+            } finally {
+                tplModal.saving = false;
+            }
+        }
+
+        /** 套用模板：按骨架生成计划卡片（不执行）。 */
+        async function submitApplyTemplate() {
+            if (tplModal.saving || loading.value) return;
+            const convId = currentId.value;
+            const goal = (tplModal.goal || '').trim();
+            if (!tplModal.selectedId) { tplModal.error = '请先选择模板'; return; }
+            if (!goal) { tplModal.error = '请填写本次目标'; return; }
+            tplModal.saving = true;
+            tplModal.error = '';
+            try {
+                const resp = await apiFetch('/api/chat/task/template/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: convId, templateId: tplModal.selectedId, goal: goal })
+                });
+                if (!resp.ok) { tplModal.error = await tplErrText(resp); return; }
+                const data = await resp.json();
+                let plan = null;
+                try { plan = JSON.parse(data.plan); } catch (_) { plan = null; }
+                if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+                    tplModal.error = '该模板没有可用步骤';
+                    return;
+                }
+                tplModal.open = false;
+                // 请求期间用户可能切了会话：过期结果直接丢弃，不要写进别的会话的消息列表
+                if (currentId.value !== convId) return;
+                // 旧卡片标为已消费：新任务已落库，旧卡片上的「执行计划」现在会去跑新任务
+                messages.value.forEach(x => { if (x.plan) { x.planDone = true; x.planRunning = false; } });
+                const msg = {
+                    role: 'assistant', content: data.text || '', html: '', version: 0,
+                    steps: [], stepsOpen: false, citesOpen: false,
+                    plan: plan, planRunning: false, planDone: false
+                };
+                messages.value.push(msg);
+                msg.html = renderMd(msg.content);
+                msg.version++;
+                scrollToBottom();
+                await loadRunningTask();   // 新任务处于 RUNNING（未执行）：顶部提示条应随之出现
+            } catch (e) {
+                tplModal.error = '生成计划失败：' + e.message;
+            } finally {
+                tplModal.saving = false;
+            }
+        }
+
+        /** 删除模板：第一次点只是进入待确认态，再点同一个才真删（按钮文案会跟着变）。 */
+        async function removeTemplate(t) {
+            if (tplModal.confirmId !== t.id) {
+                tplModal.confirmId = t.id;
+                return;
+            }
+            tplModal.confirmId = null;
+            try {
+                const resp = await apiFetch('/api/chat/task/template/' + encodeURIComponent(t.id), { method: 'DELETE' });
+                if (!resp.ok) { pushNotice('删除失败：' + await tplErrText(resp)); return; }
+                tplModal.items = tplModal.items.filter(x => x.id !== t.id);
+                if (tplModal.selectedId === t.id) tplModal.selectedId = null;
+            } catch (e) {
+                pushNotice('删除失败：' + e.message);
             }
         }
 
@@ -2131,20 +3143,36 @@ const app = createApp({
             loadAgents();
             loadTools(); // 可用工具清单（智能体弹窗「工具装配」用）
             loadKbs(); // 侧边栏「知识库」计数
+            loadQuota(); // 本日成本配额用量（后端未启用时 enabled=false，输入区不显示）
         });
 
         return {
-            conversations, agents, messages, input, loading, currentId, planMode, ragEnabled,
-            runningTask, resumeTask,
-            onRagEnabledChange, onPlannerChange,
+            conversations, agents, messages, input, loading, currentId, planMode, ragEnabled, plannerConfirm,
+            reviewEnabled, crossSession,
+            runningTask, resumeTask, runPlan, replanning, replanTask,
+            editPlanStep, cancelPlanStep, savePlanStep,
+            // 步骤审批点：勾选「需审批」/ 批准并继续 / 终止计划
+            toggleStepApproval, approveAndResume, cancelPlanTask,
+            // 成本配额刻度（只展示，闸门在后端；fmtTokens 已在成本看板处导出）
+            quota,
+            // 规划模板：存 / 列 / 套用 / 删
+            tplModal, openTemplateList, openSaveTemplate, closeTplModal,
+            selectTemplate, submitSaveTemplate, submitApplyTemplate, removeTemplate,
+            onRagEnabledChange, onPlannerChange, onPlannerConfirmChange,
+            onReviewChange, onCrossSessionChange,
             // 多模态附件
             attachments, fileInput, triggerFilePicker, onFilePicked, removeAttachment, ACCEPT,
             editingId, editingTitle, agentModal, agentView,
             currentAgentName, currentAgentIcon, currentAgentId, currentPlanner, currentRagOn,
             mainView, iconPresets,
             kbs, kbModal, kbDetail, availableAgents, kbFileInput, chroma, loadChromaStatus, syncChroma,
-            send, newConversation, startAgentChat, selectConversation,
+            send, stopGeneration, newConversation, startAgentChat, selectConversation,
             startEdit, commitEdit, deleteConversation,
+            // 消息重做（重新生成 / 编辑重发）、会话导出、长期记忆面板
+            editingIndex, regenerate, startEditMessage, cancelEditMessage, truncateHistory, canRedo,
+            exportConversation, memoryModal, openMemory, saveMemory, resetMemory, memoryCoverage,
+            // 智能体导入 / 导出
+            exportAgents, triggerAgentImport, onAgentImportFile, agentImportInput,
             goChat, goAgents, goKbs,
             openCreateAgent, openEditAgent, closeAgentModal, saveAgent, deleteAgent,
             // 智能体管理页：搜索过滤 / 一览统计 / 卡片展示辅助
@@ -2162,9 +3190,9 @@ const app = createApp({
             strategyLabel, strategyDesc, overlapOptions, overlapText, overlapLabel,
             openRechunk, doRechunk,
             pickFiles, onFilesChosen, onDropFiles, removeFile, uploadFiles,
-            // 链路追踪（可观测）：traceModal + 展示辅助函数 + ADMIN 的范围切换
+            // 链路追踪（可观测）：traceModal + 分页 + 展示辅助函数 + ADMIN 的范围切换
             traceModal, traceStats, openTrace, toggleTrace, routeLabel, modeLabel, fmtElapsed, fmtScore,
-            setTraceScope, traceScopeHint,
+            setTraceScope, traceScopeHint, traceListRef, tracePageItems, tracePageCount, traceGoPage,
             // 成本看板（全量成本口径，仅 ADMIN）：costModal + 加载/关闭 + token 格式化
             costModal, openCost, closeCost, loadCost, fmtTokens,
             // 页面级角色视点：顶栏按角色显隐的入口都读它（当前仅 💰 成本）

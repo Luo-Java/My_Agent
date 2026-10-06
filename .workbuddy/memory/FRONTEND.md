@@ -12,6 +12,14 @@
 - 🔴 **错误提示必须落到界面上**：`error.value = ...` 只是赋值，页面上没有对应渲染点时用户什么都看不到 —— 表现为「点了按钮页面纹丝不动」，看起来像按钮坏了。`/observability.html` 2026-09-30 正是如此：error 有值，但 `.ob-error` 只写在非管理员分支里，管理员分支一个渲染点都没有。**凡有「加载失败」分支的页面，都要有 `v-if="error"` 的可见节点。**
 - **「没数据」与「没成功」必须分开渲染**：空窗口 / 空列表走 `v-else` 的「暂无数据」空态（判 `xxx.length`），请求失败才显示错误节点，两者不可共用同一块 UI —— 否则用户分不清「这个窗口真的没有记录」和「接口挂了」。空态有专门的回归用例（真实库上 `verify_observability_empty_window_sql.py` 反证过「空窗口聚合返回 NULL」，前端必须走 `v-else`「暂无数据」、不与错误节点共用，判据见上方红线）。
 
+## 流式生成：中断与竞态（`js/app.js`，2026-10-06）
+- **`send` / `resumeTask` 共用一套中断控制**，四项缺一不可：`beginStream()`（建 `AbortController` + 清 `stopReason`）→ `fetch` 带 `signal` → 读循环里每收到一段数据就 `resetIdleTimer()` → `finally` 无条件 `endStream()`（清计时器 + 释放）。漏掉 `finally` 那步会让下一轮的 `streamAbort` 指向已结束的控制器。
+- **空闲超时不可省**：`STREAM_IDLE_MS = 60000`（后端心跳 15s，取 4 个心跳余量）。没有它时，连接被中间层静默掐断会让 `reader.read()` 一直挂着 ⇒ **输入框永久锁死、只能刷新页面**。
+- **`AbortError` 必须按 `stopReason` 分流**：`'idle'`（超时）/ `'user'`（用户点停止）/ 其它（真错误）。混成一句会把用户主动停止显示成「请求失败」。
+- **停止文案要写明「服务端仍会完成本轮并落库」**：客户端 abort 拦不住后端（整轮跑在 `boundedElastic` 上），前端只是「不再接收」。不写清楚，用户刷新后看到完整回复会当成 bug。按钮样式 `.stop-btn`（红色，与发送按钮区分中断/提交两种语义）。
+- **切会话竞态靠 `historySeq` 序号**：`selectConversation` 进入即 `const seq = ++historySeq`，**拿到数据后与返回前各判一次**（`resp.json()` 本身也是 await）；`newConversation` / `startAgentChat` 也要 `historySeq++` —— 否则「点了会话立刻新建」会让旧会话的历史写进新会话的空列表。
+- **`messages.value[lastIndex]` 必须判存在**：切会话/新建会清空列表，原写法直接在 undefined 上取属性会抛错。
+
 ## 页面骨架
 - `index.html` = 首页、`chat.html` = 聊天页，**共用深色色板**（换肤改两处 `:root`）；`edu.html` 有独立 `edu.css`（同一套色板变量，改 `:root` 一处）。
 - **`#app` 禁加 `backdrop-filter` / `transform` / `filter`**（会为 fixed 弹窗建包含块 → 被圆角裁）。
@@ -62,7 +70,16 @@
 - 当前角色相关的入口/能力：`💰 成本`（ADMIN 专属，后端 `CostController`）、`🧪 评测`（ADMIN 专属，后端 `EvalController` —— 跑批是真实模型调用、会花钱，与成本同属「会花钱的运维动作」）、`🔍 追踪` 的「本会话 / 全部会话」切换（ADMIN 专属）、`用户管理` 菜单项（ADMIN 专属）。
 
 ## 聊天页（chat.html）
-- **无会话空白页是默认入口**（首页进入 / 刷新都是）→ 会话级操作必须处理 `currentId` 为空：开关类只改前端状态、由 `send()` 建会话后补写回（`newConversation()` 会复位开关）；**别在拨开关时建会话**（会留没说过话的空会话）。漏掉的表现 = 开关「点不动」（v-model 置 true 被 `@change` 改回）或选择被静默丢弃（RAG 不写回会话则本轮不检索）。
+- **追踪弹窗（🔍）按每页 10 条分页（2026-10-06）**：`TRACE_PAGE_SIZE=10`，`tracePageItems` 切片渲染，底部 `.trace-pager` 显示「共 N 轮 · 第 x / y 页」。三条口径别搞混：①**统计条基于全量 `traceModal.items`**，不是当前页（它回答「这个范围的总体情况」）；②展开态 key 必须是 **`traceId`**，用列表下标记会在翻页后串页（第 1 页第 3 条与第 2 页第 3 条共用同一个 key）；③`openTrace` 里 `page = 1` 重置，切范围 / 刷新都回到第 1 页，避免停在一个已不存在的页码上。
+- **分页条按「有数据」渲染，不要按「页数 > 1」（2026-10-06）**：`v-if="!traceModal.loading && traceModal.items.length"`，按钮组另加 `v-if="tracePageCount > 1"`。原因：分页逻辑本就与「本会话 / 全部会话」无关（共用同一套 `tracePageItems`），但按页数判断时**本会话不足 10 条 = 1 页 ⇒ 整条不渲染**，用户据此以为「只有全部会话才分页」。1 页时只出页码信息、不出按钮（两个全禁用的按钮只是占位噪声）。`loading` 条件是为了不闪一条「共 0 轮」。
+- **flex 列容器的子项必须显式 `flex: 0 0 auto`，否则条数一多就「变形」**：`.trace-list`（`flex-direction:column` + `max-height` + `overflow-y:auto`）里的 `.trace-item` 默认 `flex-shrink:1`，内容超高时 flex 会**等比压扁每个子项** —— 而且是压到刚好贴合容器，于是**连滚动条都不出现**，只看到行高塌陷、文字被各自的 `overflow:hidden` 裁掉后重叠。这就是用户报的「下面数据变形」。修法一行：`.trace-list > * { flex: 0 0 auto; }`。**凡是 `flex-direction:column` + 固定高度 + 子项数量不定（列表 / 卡片流）的地方，都该检查这条。**
+- **量「塌陷」要量 `.trace-item` 的高度与相邻行间距，不能量 `.trace-row`**：`.trace-row` 的高度由自身盒模型决定，父项被压扁时它只是被裁掉，`getBoundingClientRect().height` 依然是 34 —— 曾据此误判成「没塌」。正确指标：`.trace-item` 高度（正常 36，塌陷时 2）+ 相邻两行 `top` 之差（正常 42，塌陷时 8 = 行已重叠）。反证脚本 `probe_trace_collapse.js`（三步：现状 → 仅收紧容器 → 再注回旧 flex）。
+- **无会话空白页是默认入口**（首页进入 / 刷新都是）→ 会话级操作必须处理 `currentId` 为空：开关类只改前端状态、由 `send()` 建会话后补写回（`newConversation()` 会复位开关）；**别在拨开关时建会话**（会留没说过话的空会话）。漏掉的表现 = 开关「点不动」（v-model 置 true 被 `@change` 改回）或选择被静默丢弃（RAG 不写回会话则本轮不检索）。**`send()` 里的 `pendingXxx` 暂存 + 建会话后补写回是一组**：新增会话级开关时三处必须一起改（ref 声明 / `newConversation`+`startAgentChat` 里复位 / `selectConversation` 里回显 / `send()` 的 pending 暂存），漏任何一处都表现为「刷新或首次发送后开关状态不对」。
+- **会话级开关现有五个**：`ragEnabled` / `planMode` / `plannerConfirm` / `reviewEnabled` / `crossSession`，模板里全部暴露在 `return {...}`（忘了导出 = 模板里静默 undefined）。**规划与评审互斥**，前端必须**双向联动**：`onReviewChange` 成功写回后置 `planMode=false`（并同步 `conv.planner`），`onPlannerChange` 成功写回后置 `reviewEnabled=false` —— 只靠后端关掉会出现「两个开关都亮着 / 顶部徽标还显示规划，而实际走评审」的脱节。两个新开关都复用既有 `.planner-toggle` / `.rag-toggle` 样式与 `tg-ico` 图标，**别新造一套**。
+- **SSE 事件解析在两条通路各一份**（`send()` 的 `flushEvents` 与 `resumeTask()` 的 `flushEvents`，两段代码近似但注释不同）。**新增事件类型必须两处都加**，否则在 resume 通路里会落到最后的 `else if (data)` 分支 —— **被当成正文 token 拼进回答**（症状是回答里混进一坨 JSON），而不是报错。事件字段名与后端 `StreamEvent` 的静态工厂一一对应：`token` / `progress` / `citations` / `plan` / `approval` / `review` / `recall` / `error`。
+- **气泡内展示区块的顺序**：正文 `md-body` → 评审候选 → 跨会话回忆 → 引用来源。三者都插在 `<template v-if="m.role === 'user' ? … : m.content">` 内、都排在正文**之后**（结论在上、依据在下），且都用 `m.role !== 'user'` 再滤一层。`review` / `recall` **不落库**（后端刻意不持久化）⇒ 刷新后不再出现，别写成「历史也要回看」。
+- **折叠默认值按「内容长度」定，不按类型统一**：评审候选是完整作答（可能很长）⇒ `reviewOpen=false` 默认折叠，`.review-body` 给 `max-height: 360px; overflow: auto`；回忆列表条数少且对用户有用 ⇒ `recallOpen=true` 默认展开。候选原文用 `{{ }}` 插值而非 `v-html`（模板转义天然防注入）+ `white-space: pre-wrap` 保留模型输出的换行。
+- **顶栏徽标复用 `.agent-badge` + 修饰类**（`planner-badge` 紫 / `rag-badge` 绿 / `review-badge` 琥珀 / `cross-badge` 青）：徽标由**会话级 ref**（不是 `conversations` 里的对象）驱动，因为 `selectConversation` 会同时更新两者，而 `loadConversations` 只填列表不选中任何会话（`currentId` 为 null 时本就不该有徽标）。评审用琥珀色是刻意的：提示「会多花几次模型调用」。
 
 ## 教务页（edu.html / edu.js / edu.css）
 - **接口风格已统一为命令式**（无 RESTful 分支、无 `apiStyle`）：分页 `POST /api/edu/{表}/page`（body 带 `page/size` + 筛选条件）、下拉 `GET /api/edu/{表}/list`（只回 `OptionVO{id,label}`）、`GET /{id}`、`POST /save`、`PUT /update`（id 在 body）、`DELETE /delete/{id}`。**`/api/edu/dict` 已删**，别再调（预览 mock 对该路径返回 404，调了就看得见）。
@@ -84,7 +101,7 @@
 - **禁原生 `confirm`/`alert`**（系统绘制、与页面两个风格）→ 统一自绘 `dialog`：`askConfirm(msg,{title,okText,danger})` / `askAlert(msg,{title})` 返回 Promise（主按钮 true，取消/遮罩 false）；模板 `.edu-modal.is-dialog`（400px），危险按钮 `.edu-btn-danger`（淡红底 14% + 红描边，勿用高饱和实底）；删除文案用 `recordLabel(row)` 取首列可读值而非主键。后端的校验失败（唯一性 409 / 引用校验 409 / 404）就从这条 `askAlert` 路径弹出。
 
 ## UI 预览工具
-- `.workbuddy/tools/serve_preview.py`：托管 `static` + mock `/api/edu/**` **与 `/api/auth/me`**，并在 head 的 `Auth.requireLogin()` 之前**默认注入假 token**（`?__nologin=1` 不注入）—— 该页是受限页，head 里就上锁，没有 token 会一直停在登录框、列表永远拿不到数据（工具早期版本的截图就是这么卡住的）。**从项目根执行**，用完 TaskStop。
+- `.workbuddy/tools/serve_preview.py`：托管 `static` + mock `/api/edu/**`、`/api/auth/me`、`/api/chat/conversation` 与 **`/api/chat/stream`（固定 SSE，供 `?__auto=send` 走完整条对话渲染链路）**，并在 head 的 `Auth.requireLogin()` 之前**默认注入假 token**（`?__nologin=1` 不注入）—— 该页是受限页，head 里就上锁，没有 token 会一直停在登录框、列表永远拿不到数据（工具早期版本的截图就是这么卡住的）。**从项目根执行**，用完 TaskStop。
   - `?__js=<名称>`：把 `tools/<名称>.js` 注入到 `</body>` 前（样式/几何自查探针入口）。**量样式一律用探针**：`getBoundingClientRect` + `getComputedStyle` 写进 `<pre id="__probe">`，dump-dom 读出来比对 —— 顶栏深色小胶囊在缩略图上看不清，靠肉眼必误判。（现成探针 `probe_topbar.js` 与配套 `verify_topbar.py` 已于 2026-09-30 删除；需要时按 `serve_preview.py` 的 `?__js` 机制在同目录现写一个 `.js` 即可，详见 `TOOLING.md` 的 `?__js` 说明。）
   - `?__errcap=1`：在 head 最前注入运行时错误捕获（`window.onerror` / `unhandledrejection` / 劫持 `console.error|warn`），结果写进隐藏的 `<pre id="__errcap">` JSON 数组，**dump-dom 时由探针读出 `errs=`**。`errs=[]` = 页面零 JS 错误（脚本一上来就建元素，故能区分「没报错」与「没注入」）。要不要它取决于问题形态：`--dump-dom` 只给 DOM，**运行时异常（尤其 Vue 渲染里抛的那种）在 DOM 上常常看不出来**。
 - ~~`.workbuddy/tools/verify_pages.py`~~（**已删除，2026-09-30**：9-22 通用 6 页冒烟，其「改完 static 必跑」职责由 `verify_observability.py` / `verify_topbar.py` 承接，但三者连同全部 `probe_*.js` 探针也已在 2026-09-30 一并删除；判据 `ERRCAP=[]` 作为通用原则保留）。
@@ -92,7 +109,8 @@
 - ~~`.workbuddy/tools/probe_edu_table.py`~~（**已删除，2026-09-30**：9-22 抓 edu 列表三态的一次性探针）。其沉淀的通用坑保留：
   - **「请求在途」的帧抓不到，这是硬限制**：`--virtual-time-budget` 遇未决 fetch 会**暂停**（服务端拖 25s，dump 也老老实实等 25s，抓回来的是终态）；不虚拟时间则 dump 约 0.5s 就出，比 `__auto` 的 `load+500ms` 定时器还早，点击步骤根本来不及跑；`--timeout` 在 `--headless=new` 下被静默忽略（给了 2500ms 实测 0.5s 就出）。⇒ 判定「切视图时有没有闪旧数据」只能真机肉眼（或上 CDP 逐帧），别指望 dump-dom。
 - ~~`.workbuddy/tools/probe_auth.py`~~（**已删除，2026-09-30**：9-22 对真实服务的鉴权对照探针；其职责「mock 覆盖不到密钥/签发链路，改服务端鉴权后用真实服务复核」已写成上方红线文字，不再依赖脚本）。
-- **退役（2026-09-30，tools 已精简）**：9-22 那一代工具已全部删除 —— `preview_user.py` / `verify_auth_gate.py` / `probe_frontend.py`（上轮删）、`CropShot.java` / `check_preview_inject.py` / `probe_token_concurrency.py` / `probe_edu_table.py` / `verify_pages.py` / `probe_auth.py`（本轮删）。其中 `preview_user.py` 独有的三项能力（`?noanim` / `?probe=lock` / `/__mock` 故障注入）未迁移，需要时按思路自建；其余职责已并入 `serve_preview.py` 或沉淀为上方红线文字。当前 tools 剩 5 个自洽 `.py`（见 `TOOLING.md` 顶部索引；`probe_*.js` 探针已全部删除，需要时按 `?__js` 机制现写）。
+- **退役（2026-09-30，tools 已精简）**：9-22 那一代工具已全部删除 —— `preview_user.py` / `verify_auth_gate.py` / `probe_frontend.py`（上轮删）、`CropShot.java` / `check_preview_inject.py` / `probe_token_concurrency.py` / `probe_edu_table.py` / `verify_pages.py` / `probe_auth.py`（本轮删）。其中 `preview_user.py` 独有的三项能力（`?noanim` / `?probe=lock` / `/__mock` 故障注入）未迁移，需要时按思路自建；其余职责已并入 `serve_preview.py` 或沉淀为上方红线文字。
+- **注入式探针 2026-10-06 部分回补**（当前 `tools/` 有 3 个：`probe_approval.js` / `probe_review.js` / `probe_badges.js`；完整清单见 `TOOLING.md` 顶部索引）。回补理由：**「由 SSE 事件或开关状态驱动的 UI」（审批卡片 / 评审候选 / 回忆列表 / 徽标）靠静态 HTML 与肉眼都验不到** —— 只有真跑一遍 `send()` → 读流 → 解析 → 渲染才能证明「区块确实会出」，而不是「模板里有这段」。写新探针时沿用同一套骨架：`load` + `setTimeout(2200)` 等流跑完 → 收集指标 → 写 `<pre id="__probe">`；需要验交互的（折叠展开、点开关）在写完之后再挂一个 `setTimeout` 二段采数。
 - **耗时特性（重要，决定怎么排截图）**：无头 + `--virtual-time-budget` 下每毫秒虚拟时间约烧 4ms 真实时间，**且只要发生整页跳转，单次调用固定 ~184s**（与 budget 是 3000 还是 6000 无关）；不跳转的场景 4~6s 就出（首页/弹框类）。所以：能用 `--dump-dom` 判定的（落在哪页、有没有弹框）优先 dump-dom；必须出图时避开跳转链路，或接受 3 分钟。
 - **无头截图只有一个坑：`--virtual-time-budget` 冻结 CSS 动画/帧驱动的时间轴** —— `.rise` 停在 `opacity:0`（首页看着「只剩顶栏」）、登录弹框的 `auth-fade`/`auth-pop` 停在低透明度帧（看着像「遮罩没压暗 + 卡片透明」）、首页 `#net` 粒子与 ECharts 动画同理。要终态得主动关动画（做法见上面退役说明①）。**别把这类现象当成 CSS 写错** —— 本次曾误判为 `backdrop-filter` 在无头软件渲染下失真。
 - **`--dump-dom` 的字符串断言要匹配 DOM 属性，别匹配裸串**：DOM 里含 `<script>` 的内容（含预览工具注入的注释）与探针文本，`grep auth-locked` 会命中注释里的同名文字造成假阳性 → 一律写成 `class="auth-locked"` / `class="auth-veil is-page"` 这类属性形态。（本轮就这么误报过一次。）

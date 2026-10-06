@@ -45,6 +45,9 @@ public class PromptProperties {
     /** 动态规划器提示词模板（含 {agentList} 占位符）。 */
     private List<String> plannerSystem = new ArrayList<>();
 
+    /** 局部重规划提示词模板（只重排失败步及其之后的一段；含 {agentList} 占位符）。 */
+    private List<String> plannerReplanSystem = new ArrayList<>();
+
     /** 参数抽取器提示词模板（含 {schemaText} 占位符）。 */
     private List<String> paramExtractorSystem = new ArrayList<>();
 
@@ -59,6 +62,18 @@ public class PromptProperties {
 
     /** 检索查询改写提示词（RAG 多轮指代消解；纯静态，输入由调用方拼在 user 消息里）。 */
     private List<String> queryRewriteSystem = new ArrayList<>();
+
+    /** 跨会话搜索的关键词提取提示词（纯静态，输入是用户原话；输出「每行一个关键词」）。 */
+    private List<String> crossSessionQuerySystem = new ArrayList<>();
+
+    /** 跨会话历史块模板（注入系统提示词；含 {items} 占位符，编号即召回列表序号）。 */
+    private List<String> crossSessionContext = new ArrayList<>();
+
+    /** 并行评审的候选挑选提示词（含 {count} / {agentList} 占位符；输出严格 JSON）。 */
+    private List<String> reviewPickerSystem = new ArrayList<>();
+
+    /** 并行评审的裁决综合提示词（纯静态，各候选作答由调用方拼在 user 消息里）。 */
+    private List<String> reviewJudgeSystem = new ArrayList<>();
 
     // ------------------------------------------------------------------
     // 便捷读取器：把 List<String> 拼接为带 \n 的完整文本
@@ -88,6 +103,10 @@ public class PromptProperties {
         return join(plannerSystem);
     }
 
+    public String plannerReplanSystem() {
+        return join(plannerReplanSystem);
+    }
+
     public String paramExtractorSystem() {
         return join(paramExtractorSystem);
     }
@@ -106,6 +125,22 @@ public class PromptProperties {
 
     public String queryRewriteSystem() {
         return join(queryRewriteSystem);
+    }
+
+    public String crossSessionQuerySystem() {
+        return join(crossSessionQuerySystem);
+    }
+
+    public String crossSessionContext() {
+        return join(crossSessionContext);
+    }
+
+    public String reviewPickerSystem() {
+        return join(reviewPickerSystem);
+    }
+
+    public String reviewJudgeSystem() {
+        return join(reviewJudgeSystem);
     }
 
     /** 把行列表拼接为带换行的完整文本；空列表返回空串。 */

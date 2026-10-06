@@ -2,20 +2,37 @@ package org.luo.ai.controller;
 
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
+import org.luo.ai.agent.handler.PlannerRoundHandler;
+import org.luo.ai.dto.ApplyTaskTemplateRequest;
+import org.luo.ai.dto.ApproveStepRequest;
 import org.luo.ai.dto.ChatAttachment;
 import org.luo.ai.dto.ChatRequest;
 import org.luo.ai.dto.ResumeTaskRequest;
+import org.luo.ai.dto.SaveTaskTemplateRequest;
 import org.luo.ai.dto.StreamEvent;
+import org.luo.ai.dto.TaskTemplateSummary;
+import org.luo.ai.dto.UpdateTaskStepRequest;
 import org.luo.ai.entity.Task;
+import org.luo.ai.entity.TaskTemplate;
 import org.luo.ai.service.ChatService;
+import org.luo.ai.service.ContentSafetyService;
 import org.luo.ai.service.ConversationService;
+import org.luo.ai.service.QuotaService;
 import org.luo.ai.service.TaskService;
+import org.luo.ai.service.TaskTemplateService;
+import org.luo.common.exception.AiBusinessException;
+import org.luo.common.exception.AiErrorCode;
+import org.luo.system.constant.SysRoleCode;
 import org.luo.system.security.AuthContext;
+import org.luo.system.security.LoginUser;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -36,7 +53,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 对话接口（与会话管理业务分离，后者见 ConversationController）。
  * <p>
  * POST /api/chat/send   - 同步返回完整回复；POST /api/chat/stream - SSE 流式返回；
- * POST /api/chat/task/resume - SSE 流式续跑未完成任务；GET /api/chat/task/running - 查询当前会话的未完成任务。
+ * POST /api/chat/task/resume - SSE 流式续跑未完成任务；GET /api/chat/task/running - 查询当前会话的未完成任务；
+ * PUT  /api/chat/task/step   - 就地编辑待确认计划中尚未执行的某一步（智能体 / 指令 / 依赖 / 审批标记）；
+ * POST /api/chat/task/approve - 批准「待审批步骤」（写标记，随后由前端走 resume 继续执行）；
+ * POST /api/chat/task/cancel - 终止当前会话未完成的任务（RUNNING → CANCELLED，剩余步骤不再执行）；
+ * POST /api/chat/task/replan - 局部重规划：只重排第一个未成功步骤及其之后的一段；
+ * GET/POST/DELETE /api/chat/task/template/** - 规划模板：列表 / 存为模板 / 套用 / 删除（按用户隔离）。
+ * <p>
+ * <b>成本配额闸门</b>：{@code /send}、{@code /stream}、{@code /task/resume} 三个「会花 token 的入口」在开跑前
+ * 检查当前用户的当日用量（{@link org.luo.ai.service.QuotaService}）；超限时<b>明确报错、不静默降级</b>——
+ * 同步接口抛业务异常，流式接口推一条 {@code error} 事件（前端红字展示）。
+ * <p>
+ * <b>内容安全护栏（输入侧）</b>：{@code /send} 与 {@code /stream} 在模型调用前过一遍
+ * {@link org.luo.ai.service.ContentSafetyService#checkInput}，命中即拒绝（422 / {@code error} 事件），
+ * <b>本轮零模型调用</b>，绝不「悄悄过滤掉敏感词再问模型」。默认关闭（{@code agent.safety.enabled=false}）。
  * <p>
  * <b>传输层兜底</b>（与业务无关，纯防连接被静默挂死）：有限超时（{@code app.sse.timeout-seconds}，默认 300s，
  * 不用 {@code 0L} 永不超时——上游卡死会让连接与异步线程永久泄漏）；心跳（{@code app.sse.heartbeat-seconds}，
@@ -54,6 +84,11 @@ public class ChatController {
     private final ChatService chatService;
     private final ConversationService conversationService;
     private final TaskService taskService;
+    private final TaskTemplateService templateService;
+    /** 成本配额闸门：/send、/stream、/task/resume 三个花 token 的入口在开跑前查一次。 */
+    private final QuotaService quotaService;
+    /** 内容安全护栏（输入侧）：命中即拒绝，本轮不产生任何模型调用。 */
+    private final ContentSafetyService safetyService;
 
     /** SSE 连接最长存活时间（秒）。必须有限，默认 300s，足够覆盖最长的规划 + 多轮工具调用。 */
     private final long sseTimeoutSeconds;
@@ -71,13 +106,17 @@ public class ChatController {
     private final ScheduledExecutorService heartbeatScheduler;
 
     public ChatController(ChatService chatService, ConversationService conversationService,
-                          TaskService taskService,
+                          TaskService taskService, TaskTemplateService templateService, QuotaService quotaService,
+                          ContentSafetyService safetyService,
                           @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
                           @Value("${app.sse.heartbeat-seconds:15}") long heartbeatSeconds,
                           @Qualifier("sseHeartbeatScheduler") ScheduledExecutorService heartbeatScheduler) {
         this.chatService = chatService;
         this.conversationService = conversationService;
         this.taskService = taskService;
+        this.templateService = templateService;
+        this.quotaService = quotaService;
+        this.safetyService = safetyService;
         this.sseTimeoutSeconds = sseTimeoutSeconds;
         this.heartbeatSeconds = heartbeatSeconds;
         this.heartbeatScheduler = heartbeatScheduler;
@@ -86,7 +125,18 @@ public class ChatController {
     /** 同步对话：等待完整回复后一次性返回 {@code {"content": "..."}}。 */
     @PostMapping("/send")
     public Map<String, String> send(@RequestBody ChatRequest request) {
-        Long userId = AuthContext.require().id();
+        LoginUser user = AuthContext.require();
+        Long userId = user.id();
+        // 内容安全（输入侧）：命中即拒绝，本轮不产生任何模型调用。与配额同一位置、同一「明确拒绝」口径
+        String blocked = safetyService.checkInput(request.message());
+        if (blocked != null) {
+            throw new AiBusinessException(AiErrorCode.CONTENT_BLOCKED, blocked);
+        }
+        QuotaService.QuotaStatus quota = quotaService.status(userId, isAdmin(user));
+        if (quota.exhausted()) {
+            // 同步接口没有事件通道，只能抛业务异常：429 + 说明文案（已用/上限/重置时间），不静默降级
+            throw new AiBusinessException(AiErrorCode.QUOTA_EXCEEDED, quota.exhaustedMessage());
+        }
         String conversationId = resolveConversationId(request.conversationId(), userId);
         conversationService.checkAccess(conversationId, userId);
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
@@ -107,13 +157,20 @@ public class ChatController {
         // 有限超时（而非 0L=永不超时）：上游卡死时连接与异步线程能自动释放，不会永久泄漏
         SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
         // 身份在 HTTP 线程取出后向下传：进入异步（boundedElastic）后 ThreadLocal 失效
-        Long userId = AuthContext.require().id();
+        LoginUser user = AuthContext.require();
+        Long userId = user.id();
         String conversationId = resolveConversationId(request.conversationId(), userId);
         conversationService.checkAccess(conversationId, userId);   // 越权会话在建立 SSE 之前就 404
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
         AttachmentBundle bundle = extractAttachments(request.attachments());
-        Flux<StreamEvent> flux = chatService.stream(conversationId, request.message(),
-                bundle.material(), bundle.metaJson(), request.planner(), userId);
+        // 内容安全（输入侧）：命中只推一条 error 事件、不订阅执行体 —— 与配额超限同一处理方式，本轮零模型调用
+        String blocked = safetyService.checkInput(request.message());
+        // 配额闸门：超限只推一条 error（不订阅执行体，本轮不会有任何模型调用）；接近上限则先播提示再照常执行
+        Flux<StreamEvent> flux = blocked != null
+                ? Flux.just(StreamEvent.error(blocked))
+                : guarded(quotaService.status(userId, isAdmin(user)),
+                        chatService.stream(conversationId, request.message(),
+                                bundle.material(), bundle.metaJson(), request.planner(), userId));
 
         // 流结束标记：心跳任务据此自停；同时保证「流结束后不再往已完成的 emitter 写」
         AtomicBoolean finished = new AtomicBoolean(false);
@@ -176,10 +233,12 @@ public class ChatController {
     @PostMapping(value = "/task/resume", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter resume(@RequestBody ResumeTaskRequest request) {
         SseEmitter emitter = new SseEmitter(sseTimeoutSeconds > 0 ? sseTimeoutSeconds * 1000L : 0L);
-        Long userId = AuthContext.require().id();
+        LoginUser user = AuthContext.require();
+        Long userId = user.id();
         String conversationId = resolveConversationId(request.conversationId(), userId);
         conversationService.checkAccess(conversationId, userId);
-        Flux<StreamEvent> flux = chatService.resume(conversationId, userId);
+        Flux<StreamEvent> flux = guarded(quotaService.status(userId, isAdmin(user)),
+                chatService.resume(conversationId, userId));
 
         AtomicBoolean finished = new AtomicBoolean(false);
         Disposable subscription = flux.doOnNext(event -> {
@@ -233,6 +292,207 @@ public class ChatController {
         String scopedId = resolveConversationId(conversationId, userId);
         conversationService.checkAccess(scopedId, userId);
         return taskService.findRunning(scopedId);
+    }
+
+    /**
+     * 查当前登录用户的成本配额状态（前端输入区展示「本日已用 / 上限」）。
+     * <p>
+     * 返回的是<b>本人</b>用量，不是全站数据，因此不要求 ADMIN —— 与成本看板（跨会话全站聚合，仅 ADMIN）是
+     * 两个不同的东西。配额未启用时 {@code enabled=false}，前端据此隐藏提示条。
+     */
+    @GetMapping("/quota")
+    public Map<String, Object> quota() {
+        LoginUser user = AuthContext.require();
+        QuotaService.QuotaStatus s = quotaService.status(user.id(), isAdmin(user));
+        return Map.of("enabled", s.enabled(), "exempt", s.exempt(), "used", s.used(),
+                "limit", s.limit(), "remaining", s.remaining());
+    }
+
+    /**
+     * 就地编辑「先看计划」待确认任务中的某一步（智能体 / 指令 / 依赖前驱）。
+     * <p>
+     * 同步接口（非 SSE）：改动落库后由前端重新点「执行计划」触发续跑。之所以不做成「改完直接跑」，
+     * 是因为「先看计划」的语义就是「逐条审阅、想清楚再跑」——连续改几步不该中途启动执行。
+     * <p>
+     * 越权与不存在的会话统一由 {@link ConversationService#checkAccess} 判 404；无 RUNNING 任务说明
+     * 计划已被执行或取消，返回 404 而非静默成功。
+     */
+    @PutMapping("/task/step")
+    public Map<String, Object> updateStep(@RequestBody UpdateTaskStepRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        Task task = requireRunning(scopedId);
+        if (request.stepIndex() == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少步骤下标");
+        }
+        String rejected = taskService.updatePendingStep(task.getId(), request.stepIndex(),
+                request.agentCode(), request.instruction(), request.dependsOn(), request.approvalRequired());
+        if (rejected != null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, rejected);
+        }
+        return Map.of("ok", true, "stepIndex", request.stepIndex());
+    }
+
+    /**
+     * 批准「待审批步骤」：写 {@code approved=1}，使该步可被放行执行。
+     * <p>
+     * 同步接口（非 SSE），<b>只写标记不执行</b>：前端紧接着调 {@link #resume} 那条续跑通路继续跑。
+     * 这样「批准」与「执行」各自职责单一，执行逻辑仍只有 {@code resumeTask} 一处。
+     */
+    @PostMapping("/task/approve")
+    public Map<String, Object> approveStep(@RequestBody ApproveStepRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        Task task = requireRunning(scopedId);
+        if (request.stepIndex() == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少步骤下标");
+        }
+        String rejected = taskService.approveStep(task.getId(), request.stepIndex());
+        if (rejected != null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, rejected);
+        }
+        return Map.of("ok", true, "stepIndex", request.stepIndex());
+    }
+
+    /**
+     * 终止当前会话未完成的任务（把 RUNNING 结为 CANCELLED），剩余步骤不再执行。
+     * <p>
+     * 审批卡片的「终止计划」走这里，也是「一条跑歪的计划不想再要了」的通用出口——此前只有切换执行入口
+     * 才能摆脱它。已完成的步骤与其产出保留在库里（不影响会话消息），只是任务不再处于待续跑状态。
+     */
+    @PostMapping("/task/cancel")
+    public Map<String, Object> cancelTask(@RequestBody ResumeTaskRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        requireRunning(scopedId);   // 没有 RUNNING 任务时明确 404，不静默成功
+        taskService.cancelRunning(scopedId);
+        return Map.of("ok", true);
+    }
+
+    /** 取当前会话的 RUNNING 任务；不存在则 404（计划已被执行完 / 已取消）。 */
+    private Task requireRunning(String conversationId) {
+        Task task = taskService.findRunning(conversationId);
+        if (task == null) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "当前会话没有待确认或未完成的计划");
+        }
+        return task;
+    }
+
+    /**
+     * 局部重规划未完成任务：只重排「第一个未成功步骤及其之后」的一段，已完成步骤与其产出保持不动。
+     * <p>
+     * 同步接口（一次模型往返），返回重排后的<b>完整</b>计划，与 {@code plan} 事件同构，前端按同一套渲染。
+     * 刻意不自动执行：与「先看计划」保持同一节奏——改动落库后由用户确认，再点「执行计划」走续跑通路。
+     */
+    @PostMapping("/task/replan")
+    public Map<String, Object> replan(@RequestBody ResumeTaskRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        PlannerRoundHandler.ReplanOutcome outcome = chatService.replan(scopedId);
+        if (outcome == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST,
+                    "没有可重新规划的步骤（任务不存在、已全部完成，或模型未能产出新方案）");
+        }
+        return Map.of("plan", outcome.planJson(), "text", outcome.text());
+    }
+
+    // ===== 规划模板：把跑顺的规划步骤骨架沉淀为可复用资产 =====
+    // 模板只存「怎么排」（智能体 + 指令 + 依赖），不含「做什么」；套用时由用户填本次目标，
+    // 落库成新的 task 后仍走 /task/resume 执行 —— 与「先看计划」「局部重规划」同一条执行通路。
+
+    /** 列出当前用户的规划模板（创建时间倒序）。模板按用户隔离，只回本人的。 */
+    @GetMapping("/task/template/list")
+    public List<TaskTemplateSummary> listTemplates() {
+        return templateService.list(AuthContext.require().id());
+    }
+
+    /**
+     * 把某次任务的步骤骨架存为模板。
+     * <p>
+     * 归属校验走「先按 taskId 取任务、再用任务的 conversationId 过会话校验」—— 不传 conversationId 是因为
+     * 任务跑完后状态已是 DONE/FAILED，而 {@code findRunning} 只认 RUNNING，按会话定位反而取不到想存的那次。
+     * 步骤以<b>库里的当前形态</b>为准（局部重规划会改库），不采信前端传来的快照。
+     */
+    @PostMapping("/task/template/save")
+    public Map<String, Object> saveTemplate(@RequestBody SaveTaskTemplateRequest request) {
+        Long userId = AuthContext.require().id();
+        Task task = taskService.findById(request.taskId());
+        if (task == null) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "任务不存在");
+        }
+        conversationService.checkAccess(task.getConversationId(), userId);   // 越权会话在这里 404
+        TaskTemplate tpl = templateService.saveFromTask(task.getId(), userId, request.name(),
+                request.description(), taskService.listSteps(task.getId()));
+        if (tpl == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "模板名称不能为空，且任务需要有可保存的步骤");
+        }
+        return Map.of("id", tpl.getId(), "name", tpl.getName());
+    }
+
+    /**
+     * 套用模板：按骨架在当前会话落库一个新任务（<b>不自动执行</b>），返回与 {@code plan} 事件同构的计划 JSON，
+     * 前端按同一套渲染成计划卡片，用户确认（或逐条改）后点「执行计划」。
+     * <p>
+     * 与「先看计划」同一节奏的理由：套用后立刻执行等于把「模板对不对」和「这套步骤跑不跑得通」两件事
+     * 捆在一次操作里，出错时用户分不清是哪一层的问题；先看再跑，中间还能用就地编辑调。
+     */
+    @PostMapping("/task/template/apply")
+    public Map<String, Object> applyTemplate(@RequestBody ApplyTaskTemplateRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        TaskTemplate tpl = templateService.findOwned(request.templateId(), userId);
+        if (tpl == null) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "模板不存在");
+        }
+        if (request.goal() == null || request.goal().isBlank()) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "请填写本次目标");
+        }
+        PlannerRoundHandler.ApplyOutcome outcome = chatService.applyTemplate(scopedId, tpl, request.goal().strip());
+        if (outcome == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "该模板没有可用步骤");
+        }
+        templateService.markUsed(tpl.getId());
+        return Map.of("plan", outcome.planJson(), "text", outcome.text());
+    }
+
+    /** 删除本人的模板；不存在或非本人一律 404（与查询同一口径，防拿 ID 探测他人模板）。 */
+    @DeleteMapping("/task/template/{id}")
+    public Map<String, Object> deleteTemplate(@PathVariable Long id) {
+        if (templateService.delete(id, AuthContext.require().id()) == 0) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "模板不存在");
+        }
+        return Map.of("ok", true);
+    }
+
+    /**
+     * 配额闸门：给流式执行体套一层入口检查。
+     * <ul>
+     *   <li><b>超限</b>：只推一条 {@code error} 事件、<b>不订阅</b>执行体 —— 本轮不会有任何模型调用，
+     *       前端按既有错误渲染逻辑红字展示「已用多少 / 上限多少 / 何时重置」，不是静默降级；</li>
+     *   <li><b>接近上限</b>：先插一条 {@code progress} 提示再照常执行（只提示、不拦截）；</li>
+     *   <li><b>未启用 / 已豁免 / 正常</b>：原样返回执行体。</li>
+     * </ul>
+     * 注意 {@code body} 是惰性的（{@code Flux.create} 的 lambda 在订阅时才跑），所以「只推 error」这条路上
+     * 传进来的执行体不会被启动，不存在白跑一次对话的可能。
+     */
+    private static Flux<StreamEvent> guarded(QuotaService.QuotaStatus quota, Flux<StreamEvent> body) {
+        if (quota.exhausted()) {
+            return Flux.just(StreamEvent.error(quota.exhaustedMessage()));
+        }
+        if (quota.warn()) {
+            return Flux.concat(Flux.just(StreamEvent.progress(quota.warnMessage())), body);
+        }
+        return body;
+    }
+
+    /** 是否 ADMIN（配额豁免判定用；角色由 HTTP 线程从登录态读取）。 */
+    private static boolean isAdmin(LoginUser user) {
+        return user.hasRole(SysRoleCode.ADMIN);
     }
 
     /**

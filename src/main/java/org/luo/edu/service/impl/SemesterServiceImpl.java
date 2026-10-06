@@ -12,6 +12,7 @@ import org.luo.edu.entity.Course;
 import org.luo.edu.entity.Exam;
 import org.luo.edu.entity.Semester;
 import org.luo.edu.mapper.SemesterMapper;
+import org.luo.edu.properties.EduProperties;
 import org.luo.edu.service.CourseService;
 import org.luo.edu.service.ExamService;
 import org.luo.edu.service.SemesterService;
@@ -26,6 +27,9 @@ import java.util.List;
  */
 @Service
 public class SemesterServiceImpl extends ServiceImpl<SemesterMapper, Semester> implements SemesterService {
+
+    @Resource
+    private EduProperties eduProperties;
 
     @Resource
     private CourseService courseService;
@@ -44,7 +48,10 @@ public class SemesterServiceImpl extends ServiceImpl<SemesterMapper, Semester> i
 
     @Override
     public List<OptionVO> options() {
-        return list(new LambdaQueryWrapper<Semester>().orderByAsc(Semester::getId)).stream()
+        // 下拉选项装上限：靠分页插件注入 LIMIT（false = 不额外跑 count），避免无界全表装载
+        List<Semester> rows = page(new Page<>(1, eduProperties.probeLimit(), false),
+                new LambdaQueryWrapper<Semester>().orderByAsc(Semester::getId)).getRecords();
+        return eduProperties.trim(rows, "semester").stream()
                 .map(x -> new OptionVO(x.getId().longValue(), x.getName()))
                 .toList();
     }
