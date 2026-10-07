@@ -5,3 +5,8 @@
 # spring.config.import 以 optional:file: 方式加载；部署改用环境变量注入）
 /application-local.yaml
 /config/application-local.yaml
+
+# 助手工作目录：项目记忆（memory/）与本地验证工具（tools/：预览 mock + 浏览器探针）。
+# 属助手数据、不是项目资产；且记忆含未发布的架构与安全细节，公开仓库不宜携带。
+# 只停止跟踪，文件仍保留在本地工作区。
+/.workbuddy/
