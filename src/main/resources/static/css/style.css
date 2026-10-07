@@ -903,6 +903,78 @@ header {
     font-variant-numeric: tabular-nums;
 }
 
+/* ===== 引用回链（正文角标 ⇄ 来源条目 ⇄ 原文弹窗） ===== */
+
+/* 正文里的 [n]：由 renderMd 的 linkifyCitations 包成 <sup>。默认按正文色，hover 才点亮——
+   满篇回答里几十个角标同时发蓝会把正文割碎。 */
+.cite-ref {
+    color: var(--primary-text);
+    font-size: .78em;
+    font-weight: 500;
+    vertical-align: super;
+    line-height: 0;
+    padding: 0 1px;
+    border-radius: 3px;
+    cursor: pointer;
+    user-select: none;
+}
+.cite-ref:hover { background: rgba(59, 130, 246, .22); }
+
+/* 点角标后定位到的那一条：短暂高亮，让「点的是哪一个」有落点。
+   用背景闪烁而不是描边，避免改变行高（列表高度一变，滚动位置就跳）。 */
+.cite-hit {
+    background: rgba(59, 130, 246, .16);
+    border-radius: 6px;
+    transition: background .25s ease;
+}
+
+/* 来源条目的「原文」按钮：低调，hover 才显出可点。 */
+.cite-open {
+    flex: none;
+    font-size: 11px;
+    line-height: 1;
+    padding: 3px 7px;
+    color: var(--text-soft);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+}
+.cite-open:hover { color: var(--primary-text); border-color: rgba(59, 130, 246, .45); }
+
+/* 原文弹窗 */
+.modal-chunk { width: min(760px, calc(100vw - 32px)); }
+.chunk-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 12.5px;
+    color: var(--text-soft);
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+}
+.chunk-kb { color: var(--primary-text); font-weight: 500; }
+.chunk-id { margin-left: auto; font-variant-numeric: tabular-nums; opacity: .8; }
+.chunk-text {
+    margin: 0;
+    max-height: 52vh;
+    overflow-y: auto;
+    padding: 12px 14px;
+    background: rgba(0, 0, 0, .22);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.75;
+    color: var(--text);
+    /* 知识块原文：保留原始换行与缩进，别让 pre 换成等宽字体后中文行距变形 */
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 /* ===== 并行评审候选（AI 气泡内，正文是裁决者综合后的答案） ===== */
 /* 与「引用来源」共用同一套折叠外壳（head/body/caret/hint），只是内容形态不同 */
 .msg-review {
@@ -3554,7 +3626,7 @@ button {
 .eval-batch-stat { color: var(--text); }
 .eval-batch-extra { color: var(--text-soft); }
 
-/* ===== 消息重做（重新生成 / 编辑重发）=====
+/* ===== 消息重做（重新生成 / 编辑重发）与版本切换 =====
    操作条默认透明、悬停整条消息才浮现：每条消息常驻两个按钮会把阅读区变成工具栏。 */
 .msg-actions {
     display: flex;
@@ -3580,6 +3652,38 @@ button {
     color: var(--primary-text);
     border-color: var(--border-strong);
     background: var(--primary-soft);
+}
+
+/* 版本切换器「‹ 1 / 2 ›」：同一轮提问的多个版本原地翻看。与操作按钮同排、靠最右。
+   外层带边框做成一个整体，避免两个箭头和数字在悬停时各亮各的、看着像三个独立按钮。 */
+.turn-switch {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0 1px;
+    flex: none;
+}
+.turn-nav {
+    background: transparent;
+    border: 0;
+    color: var(--text-soft);
+    font-size: 14px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+}
+.turn-nav:hover:not(:disabled) { color: var(--primary-text); background: var(--primary-soft); }
+.turn-nav:disabled { opacity: .3; cursor: default; }
+.turn-pos {
+    font-size: 12px;
+    color: var(--text-soft);
+    /* 定宽居中：从 1/2 翻到 1/10 时数字变宽，靠它挡住两侧箭头不左右跳 */
+    min-width: 34px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
 }
 
 /* ===== 编辑重发态提示条（输入区顶部）===== */

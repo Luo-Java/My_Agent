@@ -30,10 +30,15 @@ CREATE TABLE IF NOT EXISTS chat_message (
     content         TEXT                                 COMMENT '消息内容（用户提问或AI回复文本）',
     attachments_json TEXT        DEFAULT NULL            COMMENT '本轮附件元数据（JSON数组：type/filename/storedName/size）；仅用于历史展示，不参与记忆读取（DbChatMemory.get 不读此列，零 token 开销）',
     citations_json   TEXT        DEFAULT NULL            COMMENT '本轮 RAG 引用来源（JSON数组：index/kbName/source/chunkId/score）；仅 assistant 消息、仅用于历史展示与前端角标，不参与记忆读取',
-    created_at      DATETIME                             COMMENT '消息写入时间；同一轮消息的先后顺序由自增主键 id 兜底（查询统一 ORDER BY created_at, id）',
+    turn_group_id   VARCHAR(64)  DEFAULT NULL            COMMENT '对话分支组ID（UUID）：同一轮提问的多个「版本」（编辑重发 / 重新生成）共用；NULL=从未分叉，该轮只有一个版本。刻意不做回填——NULL 即旧语义',
+    turn_version    INT          DEFAULT NULL            COMMENT '该分支组内的版本序号，从 1 开始递增；版本号连续，故前端可直接令 versionCount = 当前 version',
+    turn_active     TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '该版本是否为当前生效版本：1=生效（会被读取、会注入记忆）；同一组内至多一个版本为 1。未分叉的行恒为 1',
+    created_at      DATETIME                             COMMENT '消息写入时间；同一轮消息的先后顺序由自增主键 id 兜底（查询统一 ORDER BY created_at, id）。分叉出的新版本沿用被替换版本首条的 created_at，以占回原来的位置——否则它会带着更晚的时间排到后面几轮之后',
     PRIMARY KEY (id),
     -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
-    INDEX idx_conv_created (conversation_id, created_at)
+    INDEX idx_conv_created (conversation_id, created_at),
+    -- 分支读取（按组筛当前版本）与版本计数（GROUP BY turn_group_id）共用该索引
+    INDEX idx_conv_turn (conversation_id, turn_group_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE=utf8mb4_general_ci COMMENT = '会话消息表：存储每个会话下的多轮对话明细';
 
 -- 智能体表：可在页面创建的各类 AI 角色，绑定到会话后决定对话人设与模型参数

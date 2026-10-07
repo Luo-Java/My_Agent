@@ -323,7 +323,8 @@
                                 </div>
                                 <span v-if="m.content">{{ m.content }}</span>
                             </div>
-                            <div v-else class="md-body" :key="m.version" v-html="m.html"></div>
+                            <div v-else class="md-body" :key="m.version" v-html="m.html"
+                                 @click="onCiteClick($event, m)"></div>
                             <!-- 并行评审候选（C1）：本轮由若干候选智能体「互相不可见地」独立作答，
                                  再由裁决者综合成最终回答。正文是综合后的答案，这里摊开每次候选答了什么，
                                  让「答案是怎么来的」可追溯。候选只作展示，不进正文、不进会话记忆。
@@ -375,7 +376,9 @@
                             </div>
                             <!-- RAG 引用来源（溯源）：回答正文里的 [n] 角标对应这里的第 n 条。
                                  数据来自当轮 SSE citations 事件或历史接口的 citations 字段；
-                                 与「执行过程」同理只作展示，不进正文、不进会话记忆。 -->
+                                 与「执行过程」同理只作展示，不进正文、不进会话记忆。
+                                 回链两个方向：正文角标点进来会高亮对应条目（m.citeHit）、
+                                 条目上的「原文」可拉出被引用的那段知识块正文。 -->
                             <div v-if="m.role !== 'user' && m.citations && m.citations.length" class="msg-citations">
                                 <div class="cites-head" @click="m.citesOpen = !m.citesOpen">
                                     <span class="cites-caret">{{ m.citesOpen ? '▾' : '▸' }}</span>
@@ -383,12 +386,15 @@
                                     <span class="cites-hint">来自知识库检索</span>
                                 </div>
                                 <div class="cites-body" v-show="m.citesOpen">
-                                    <div class="cite-line" v-for="c in m.citations" :key="c.index">
+                                    <div class="cite-line" v-for="c in m.citations" :key="c.index"
+                                         :class="{ 'cite-hit': m.citeHit === c.index }">
                                         <span class="cite-no">[{{ c.index }}]</span>
                                         <span class="cite-src">
                                             {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
                                         </span>
                                         <span class="cite-score" :title="'相关度 ' + c.score">{{ fmtScore(c.score) }}</span>
+                                        <button type="button" class="cite-open" title="查看这条来源的知识块原文"
+                                                @click.stop="openCite(c)">原文</button>
                                     </div>
                                 </div>
                             </div>
@@ -397,24 +403,35 @@
                             <span></span><span></span><span></span>
                         </span>
                         <!-- 消息重做：编辑重发（用户消息）/ 重新生成（AI 回复）。生成中一律不出现 ——
-                             此时截断历史会与正在写入的那一轮撞车。 -->
-                        <div class="msg-actions" v-if="canRedo(i)">
+                             那一轮尚未落库，此时既不能重发，也不该切版本。
+                             两条都是「给这一轮开一个新版本」：旧版本一条不删，可用右侧切换器翻回。 -->
+                        <div class="msg-actions"
+                             v-if="canRedo(i) || (m.role === 'user' && m.turn && m.turn.versionCount > 1)">
                             <button v-if="m.role === 'user'" type="button" class="msg-act"
-                                    title="修改这条提问并重新发送（发送时会删除它之后的内容）"
+                                    title="修改这条提问并重新发送（旧版本保留，可用「‹ ›」翻回）"
                                     @click="startEditMessage(m, i)">编辑重发</button>
                             <button v-else type="button" class="msg-act"
-                                    title="用它前面的提问重新生成一次（会删除这条回复及其后的内容）"
+                                    title="用它前面的提问再生成一个版本（旧回答保留，可用「‹ ›」翻回）"
                                     @click="regenerate(m, i)">重新生成</button>
+                            <!-- 版本切换器：同一轮提问的多个版本在此原地翻看。挂在提问上而不是回答上 ——
+                                 切换时提问与回答是一起换的，放两处只会让人以为是两件独立的事。 -->
+                            <span class="turn-switch" v-if="m.role === 'user' && m.turn && m.turn.versionCount > 1">
+                                <button type="button" class="turn-nav" :disabled="m.turn.version <= 1"
+                                        title="上一个版本" @click="switchTurn(m, -1)">‹</button>
+                                <span class="turn-pos">{{ m.turn.version }} / {{ m.turn.versionCount }}</span>
+                                <button type="button" class="turn-nav" :disabled="m.turn.version >= m.turn.versionCount"
+                                        title="下一个版本" @click="switchTurn(m, 1)">›</button>
+                            </span>
                         </div>
                     </div>
                 </div>
             </div>
             <div class="input-bar">
-                <!-- 编辑重发态提示条：发送时会先删除这条消息及其后的全部内容，再用输入框里的新文本重发。
+                <!-- 编辑重发态提示条：发送时会用输入框里的新文本给这一轮开一个新版本（旧版本保留可翻回）。
                      放在输入区而不是消息旁边，是因为「要改的是输入框里的这段文本」。 -->
                 <div v-if="editingIndex >= 0" class="edit-banner">
                     <span class="edit-banner-text">
-                        正在编辑第 {{ editingIndex + 1 }} 条消息 —— 发送后会删除它之后的内容并重新发送
+                        正在编辑第 {{ editingIndex + 1 }} 条消息 —— 发送后作为该轮的新版本，旧版本保留可翻回
                     </span>
                     <button type="button" class="edit-banner-cancel" @click="cancelEditMessage">取消编辑</button>
                 </div>
@@ -1360,6 +1377,36 @@
         </div>
     </div>
 
+    <!-- ===== 引用原文弹窗（引用回链的终点）=====
+         点「引用来源」里某条的「原文」打开：按 chunkId 拉取该知识块的正文。
+         块被删除 / 重新分片时后端返回 404 与原因，这里原样展示 —— 不渲染空白块，
+         否则看起来像「文档里本来就是空的」，把「取不到」误读成「文档没写」。
+         正文用 pre-wrap 原样呈现：知识块是纯文本片段，再过一遍 Markdown 渲染只会吃掉原有换行与空格。 -->
+    <div class="modal-mask" v-if="chunkModal.open" @click.self="closeCite">
+        <div class="modal modal-chunk">
+            <div class="modal-head">
+                <span>📄 引用原文</span>
+                <button class="modal-close" @click="closeCite">✕</button>
+            </div>
+            <div class="modal-body">
+                <div v-if="chunkModal.loading" class="trace-empty">加载中…</div>
+                <div v-else-if="chunkModal.error" class="trace-empty">{{ chunkModal.error }}</div>
+                <template v-else-if="chunkModal.chunk">
+                    <div class="chunk-meta">
+                        <span class="chunk-kb">{{ chunkModal.chunk.kbName || '未知知识库' }}</span>
+                        <span v-if="chunkModal.chunk.source" class="chunk-src">· {{ chunkModal.chunk.source }}</span>
+                        <span class="chunk-id">块 #{{ chunkModal.chunk.chunkId }}</span>
+                    </div>
+                    <pre class="chunk-text">{{ chunkModal.chunk.content }}</pre>
+                </template>
+            </div>
+            <div class="modal-foot">
+                <span class="field-hint">按知识块原样展示（保留分片边界，不做二次排版）。</span>
+                <button class="btn-primary" @click="closeCite">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-mask" v-if="traceModal.open" @click.self="traceModal.open = false">
         <div class="modal modal-trace">
             <div class="modal-head">
@@ -1434,6 +1481,8 @@
                                         {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
                                     </span>
                                     <span class="cite-score">{{ fmtScore(c.score) }}</span>
+                                    <button type="button" class="cite-open" title="查看这条来源的知识块原文"
+                                            @click.stop="openCite(c)">原文</button>
                                 </div>
                             </div>
                             <div class="trace-block" v-if="!t.planJson && (!t.toolCalls || !t.toolCalls.length)

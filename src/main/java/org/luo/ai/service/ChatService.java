@@ -3,6 +3,7 @@ package org.luo.ai.service;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.dto.StreamEvent;
+import org.luo.ai.dto.TurnBranch;
 import org.luo.ai.entity.Conversation;
 import org.luo.ai.entity.TaskTemplate;
 import org.luo.ai.agent.handler.AgentRoundHandler;
@@ -92,12 +93,12 @@ public class ChatService {
      * 补建都靠它，故必须由 HTTP 线程取出后传进来（异步线程读不到 {@code AuthContext}）。
      */
     public String chat(String conversationId, String message, String material, String attachmentsJson,
-                       Boolean planner, Long userId) {
+                       Boolean planner, Long userId, TurnBranch branch) {
         log.info("同步对话：会话={}，userId={}，planner={}，有附件={}", conversationId, userId, planner,
                 material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId, userId);
-        // 落库前水位：附件/引用只写本轮新增消息，避免误挂历史消息
-        Long watermark = needsWatermark(conv, attachmentsJson)
+        // 落库前水位：附件/引用/分支标记只写本轮新增消息，避免误挂历史消息
+        Long watermark = needsWatermark(conv, attachmentsJson, branch)
                 ? conversationService.maxMessageId(conversationId) : null;
         RoundTrace trace = startTrace(conversationId, message);
         RoundResult out;
@@ -112,6 +113,7 @@ public class ChatService {
         }
         persistAttachments(conversationId, watermark, attachmentsJson);
         persistCitations(conversationId, watermark, out.citations());
+        persistBranch(conversationId, watermark, branch);   // 同步接口无事件通道，失败只能落日志
         log.info("同步对话完成：回复长度={}，引用={}", out.reply() != null ? out.reply().length() : 0,
                 out.citations().size());
         afterReply(conversationId, message);
@@ -124,10 +126,10 @@ public class ChatService {
      * HTTP 线程立即返回、SSE 先建立，进度才能实时推送。<b>{@code userId}</b> 由调用方在 HTTP 线程取出后传入。
      */
     public Flux<StreamEvent> stream(String conversationId, String message, String material, String attachmentsJson,
-                                    Boolean planner, Long userId) {
+                                    Boolean planner, Long userId, TurnBranch branch) {
         return Flux.<StreamEvent>create(sink -> {
                     try {
-                        doStream(conversationId, message, material, attachmentsJson, sink, planner, userId);
+                        doStream(conversationId, message, material, attachmentsJson, sink, planner, userId, branch);
                     } catch (Exception e) {
                         log.error("流式对话失败：会话={}，错误={}", conversationId, e.getMessage(), e);
                         sink.next(StreamEvent.error("对话出错：" + e.getMessage()));
@@ -228,12 +230,12 @@ public class ChatService {
 
     /** 流式执行体（跑在弹性线程上，可阻塞调用 LLM），结果经 sink 推送。 */
     private void doStream(String conversationId, String message, String material, String attachmentsJson,
-                          FluxSink<StreamEvent> sink, Boolean planner, Long userId) {
+                          FluxSink<StreamEvent> sink, Boolean planner, Long userId, TurnBranch branch) {
         log.info("流式对话：会话={}，userId={}，planner={}，有附件={}", conversationId, userId, planner,
                 material != null && !material.isBlank());
         Conversation conv = conversationService.ensureConversation(conversationId, userId);
-        // 落库前水位：附件/引用只写本轮新增消息，避免误挂历史消息
-        Long watermark = needsWatermark(conv, attachmentsJson)
+        // 落库前水位：附件/引用/分支标记只写本轮新增消息，避免误挂历史消息
+        Long watermark = needsWatermark(conv, attachmentsJson, branch)
                 ? conversationService.maxMessageId(conversationId) : null;
         Consumer<String> progress = text -> sink.next(StreamEvent.progress(text));
         RoundTrace trace = startTrace(conversationId, message);
@@ -278,6 +280,11 @@ public class ChatService {
         // 附件元数据 / 引用写入本轮消息（仅历史回看，不进 LLM 上下文）
         persistAttachments(conversationId, watermark, attachmentsJson);
         persistCitations(conversationId, watermark, out.citations());
+        // 分支版本打标：本轮消息确实落库之后才让旧版本失效（失败要播报，不能静默——否则用户以为重发生效了）
+        String branchWarn = persistBranch(conversationId, watermark, branch);
+        if (branchWarn != null) {
+            sink.next(StreamEvent.progress(branchWarn));
+        }
         // 数据优先于记忆：正文推完再收尾（见 afterReply）
         afterReply(conversationId, message);
         traceService.saveAsync(trace);
@@ -288,9 +295,14 @@ public class ChatService {
         return attachmentsJson != null && !attachmentsJson.isBlank();
     }
 
-    /** 本轮是否需要「落库前水位」：只有会后补写的附件元数据与 RAG 引用才需要（后者以 {@code ragEnabled} 廉价预判）。 */
-    private static boolean needsWatermark(Conversation conv, String attachmentsJson) {
-        return hasAttachments(attachmentsJson) || (conv != null && Boolean.TRUE.equals(conv.getRagEnabled()));
+    /**
+     * 本轮是否需要「落库前水位」：凡是要按「本轮新增的那几条消息」定位的后补写操作都需要它 ——
+     * 附件元数据、RAG 引用，以及分支版本标记。RAG 那一项以 {@code ragEnabled} 廉价预判，
+     * 避免关着 RAG 也白查一次 max(id)。
+     */
+    private static boolean needsWatermark(Conversation conv, String attachmentsJson, TurnBranch branch) {
+        return hasAttachments(attachmentsJson) || branch != null
+                || (conv != null && Boolean.TRUE.equals(conv.getRagEnabled()));
     }
 
     /** 建本轮追踪上下文（纯内存对象，失败不影响对话）。 */
@@ -316,6 +328,27 @@ public class ChatService {
             conversationService.attachCitationsToLatestAssistantMessage(conversationId, watermark, json);
         } catch (Exception e) {
             log.error("引用来源写入失败：会话={}", conversationId, e);
+        }
+    }
+
+    /**
+     * 分支版本打标：把本轮新落库的消息记为 {@code branch} 指定的版本并置为生效，同组旧版本随之失效。
+     * <p>
+     * <b>不走「失败只记日志」那套</b>（附件/引用是纯展示元数据，坏了不影响对话本身；分支标记是结构性的）：
+     * 打标失败时旧版本仍是生效版本，用户以为「重发生效了」其实没有 —— 故返回一条提示文案，
+     * 由流式出口<b>播报</b>给用户。同步接口没有事件通道，只能落日志。
+     *
+     * @return 需要播报给用户的警告；一切正常返回 {@code null}
+     */
+    private String persistBranch(String conversationId, Long watermark, TurnBranch branch) {
+        if (branch == null) return null;
+        try {
+            int marked = conversationService.markRoundBranch(conversationId, watermark,
+                    branch.groupId(), branch.version());
+            return marked == 0 ? "⚠️ 本轮没有新消息落库，该轮保持原版本" : null;
+        } catch (Exception e) {
+            log.error("分支版本标记失败：会话={}，组={}，版本={}", conversationId, branch.groupId(), branch.version(), e);
+            return "⚠️ 新版本未能登记（本轮内容已保留为普通消息），详见服务日志";
         }
     }
 

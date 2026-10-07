@@ -49,7 +49,7 @@ public class RoundTraceAdvisor implements BaseAdvisor {
 
     @Override
     public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
-        RoundTrace trace = traceOf(request.context());
+        RoundTrace trace = RoundTrace.from(request.context());
         if (trace == null) {
             // 无 trace 的调用（如规划器内部裸调用）：必须主动清掉可能残留的上一轮引用——
             // 若上一次调用在 after 前抛异常，boundedElastic 复用的线程会残留旧 trace，
@@ -66,7 +66,7 @@ public class RoundTraceAdvisor implements BaseAdvisor {
     public ChatClientResponse after(ChatClientResponse response, AdvisorChain chain) {
         try {
             // 优先取响应上下文（Spring AI 会把请求上下文带到响应）；取不到则用 before 放下的同线程引用兜底
-            RoundTrace trace = traceOf(response.context());
+            RoundTrace trace = RoundTrace.from(response.context());
             if (trace == null) trace = CURRENT.get();
             if (trace == null) return response;
             Usage usage = (response.chatResponse() == null || response.chatResponse().getMetadata() == null)
@@ -78,13 +78,6 @@ public class RoundTraceAdvisor implements BaseAdvisor {
             CURRENT.remove();
         }
         return response;
-    }
-
-    /** 从 advisor 上下文取当轮 trace；不是本项目的上下文（如中间步骤裸调用）返回 null。 */
-    private static RoundTrace traceOf(java.util.Map<String, Object> context) {
-        if (context == null) return null;
-        Object value = context.get(RoundTrace.CONTEXT_KEY);
-        return (value instanceof RoundTrace t) ? t : null;
     }
 
     /**

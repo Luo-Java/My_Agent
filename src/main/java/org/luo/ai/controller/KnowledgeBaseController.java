@@ -2,10 +2,12 @@ package org.luo.ai.controller;
 
 import org.luo.ai.dto.AddChunksRequest;
 import org.luo.ai.dto.CreateKbRequest;
+import org.luo.ai.dto.KbChunkDetail;
 import org.luo.ai.dto.KbChunkPageResult;
 import org.luo.ai.dto.KbRechunkResult;
 import org.luo.ai.entity.KbFile;
 import org.luo.ai.entity.KnowledgeBase;
+import org.luo.ai.entity.KnowledgeChunk;
 import org.luo.ai.enums.ChunkStrategy;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.ai.infrastructure.document.DocumentParserService;
@@ -33,7 +35,7 @@ import org.luo.common.exception.AiErrorCode;
  * 知识库管理接口（RAG：全局库 + 每个智能体一个专属库）。
  * <p>
  * GET/POST /api/kb、GET /api/kb/global、PUT/DELETE /api/kb/{id}；
- * GET/POST /api/kb/{id}/chunks、DELETE /api/kb/{id}/chunks/{cid}；
+ * GET/POST /api/kb/{id}/chunks、DELETE /api/kb/{id}/chunks/{cid}、GET /api/kb/chunk/{cid}（引用回链原文）；
  * GET /api/kb/chunk-strategies；GET /api/kb/{id}/files、POST /api/kb/{id}/upload、
  * DELETE /api/kb/{id}/files/{fid}、POST /api/kb/{id}/files/{fid}/rechunk；
  * POST /api/kb/chroma/sync、GET /api/kb/chroma/status。
@@ -92,6 +94,27 @@ public class KnowledgeBaseController {
     @DeleteMapping("/{id}")
     public void delete(@PathVariable Long id) {
         kbService.deleteKb(id);
+    }
+
+    /**
+     * 单条知识块原文（引用回链「查看原文」的取数入口）。
+     * <p>
+     * 前端在助手气泡的「引用来源」里点某一条时调它：来源列表只有「库名 · 文件名 · 相关度」，
+     * 真正回答问题的原文段落此前无路可取，用户只能靠猜「这句话是文档里的还是模型编的」。
+     * <p>
+     * <b>块不存在一律 404 并说明原因</b>（可能已被删除或重新分片）——不返回空块假装成功，
+     * 否则前端会渲染出一段空白，看起来像「文档里本来就是空的」。
+     * <p>
+     * 路径不与 {@code /{id}/chunks} 冲突：后者第二段必须是字面量 {@code chunks}。
+     */
+    @GetMapping("/chunk/{chunkId}")
+    public KbChunkDetail chunk(@PathVariable Long chunkId) {
+        KnowledgeChunk c = kbService.findChunk(chunkId);
+        if (c == null) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "知识块不存在（可能已被删除或重新分片）");
+        }
+        return new KbChunkDetail(c.getId(), c.getKbId(), kbService.kbName(c.getKbId()), c.getSource(),
+                c.getContent());
     }
 
     /** 知识块分页（默认 offset=0，limit=20，最大 100）。 */

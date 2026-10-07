@@ -211,6 +211,21 @@ public class KbService {
     }
 
     /**
+     * 单块详情（引用回链「查看原文」用）。<b>不存在返回 null 而不抛错</b>：块可能已被删除或重新分片，
+     * 这是正常时序（用户几个月前看到的一条引用，块后来被重切了），由 Controller 决定怎么表达。
+     */
+    public KnowledgeChunk findChunk(Long chunkId) {
+        return chunkId == null ? null : chunkMapper.selectById(chunkId);
+    }
+
+    /** 知识库名称（引用回链展示用）；库不存在返回 null，由调用方兜底，不抛错。 */
+    public String kbName(Long kbId) {
+        if (kbId == null) return null;
+        KnowledgeBase kb = kbMapper.selectById(kbId);
+        return kb == null ? null : kb.getName();
+    }
+
+    /**
      * 批量添加知识（手动文本入口）：按该库默认分片策略切块 → 批量向量化 → 入库并刷新 doc_count。
      *
      * @return 实际新增的知识块数

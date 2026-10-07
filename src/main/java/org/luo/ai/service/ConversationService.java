@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.constant.AgentBindSource;
 import org.luo.ai.dto.AttachmentDto;
 import org.luo.ai.dto.KbCitation;
+import org.luo.ai.dto.TurnBranch;
 import org.luo.ai.entity.ChatMessage;
 import org.luo.ai.entity.Conversation;
 import org.luo.common.exception.AiBusinessException;
@@ -17,7 +18,10 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -311,18 +315,35 @@ public class ConversationService {
     }
 
     /**
-     * 读取会话全部历史，按时间正序。<b>排序必须带 id tiebreaker</b>：{@code created_at} 是秒级 DATETIME，
-     * 同一轮 user/assistant 时间相同，只按它排序时顺序取决于执行计划，改走 filesort 就会错序。
+     * 只保留「当前生效版本」的过滤条件：未分叉的行（{@code turn_group_id} 为 NULL）恒可见，
+     * 已分叉的轮只取 {@code turn_active = 1} 的那一版。
+     * <p>
+     * <b>四个读取口径必须共用它</b>——{@link #getHistory}（喂 prompt / 导出）、{@link #getRecentHistory}
+     * （记忆窗口）、{@link #countMessages} 与 {@link #getMessagesRange}（摘要水位）。它们描述的是同一段
+     * 历史：任一处漏掉，摘要水位就会按「含隐藏版本的物理行数」推进、而注入侧按「生效版本」取，两边错位
+     * 的结果是中间一段「既不摘要也不注入」的记忆空洞。
+     */
+    private static void activeOnly(QueryWrapper<ChatMessage> qw) {
+        qw.and(w -> w.isNull("turn_group_id").or().eq("turn_active", 1));
+    }
+
+    /**
+     * 读取会话全部历史（<b>只含当前生效的分支版本</b>），按时间正序。<b>排序必须带 id tiebreaker</b>：
+     * {@code created_at} 是秒级 DATETIME，同一轮 user/assistant 时间相同，只按它排序时顺序取决于执行计划，
+     * 改走 filesort 就会错序。
      */
     public List<ChatMessage> getHistory(String conversationId) {
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
-        qw.eq("conversation_id", conversationId).orderByAsc("created_at").orderByAsc("id");
+        qw.eq("conversation_id", conversationId);
+        activeOnly(qw);
+        qw.orderByAsc("created_at").orderByAsc("id");
         return chatMessageMapper.selectList(qw);
     }
 
     /**
-     * 读取最近 N 条历史（时间正序）：先按 {@code created_at, id} 倒序取 N 条再反转，供记忆窗口读取，
-     * 避免长会话每轮全量加载。走索引需 {@code (conversation_id, created_at)} 复合索引（schema.sql 已建）。
+     * 读取最近 N 条历史（时间正序，同样只含生效版本）：先按 {@code created_at, id} 倒序取 N 条再反转，
+     * 供记忆窗口读取，避免长会话每轮全量加载。走索引需 {@code (conversation_id, created_at)} 复合索引
+     * （schema.sql 已建）。
      *
      * @param limit &lt;= 0 时退化为全量查询
      */
@@ -331,8 +352,9 @@ public class ConversationService {
             return getHistory(conversationId);
         }
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
-        qw.eq("conversation_id", conversationId)
-                .orderByDesc("created_at").orderByDesc("id")
+        qw.eq("conversation_id", conversationId);
+        activeOnly(qw);
+        qw.orderByDesc("created_at").orderByDesc("id")
                 .last("LIMIT " + limit);   // limit 为受控 int 参数，无注入风险
         List<ChatMessage> list = chatMessageMapper.selectList(qw);
         java.util.Collections.reverse(list); // 倒序取回后恢复正序
@@ -340,18 +362,24 @@ public class ConversationService {
     }
 
     /**
-     * 统计消息总条数（只走 count）。供 {@code MemoryMergeService} 把窗口起点换算成绝对索引：
+     * 统计消息总条数（只走 count，同样只算生效版本）。供 {@code MemoryMergeService} 把窗口起点换算成绝对索引：
      * 摘要侧与注入侧必须基于同一段列表，否则会出现「既不摘要也不注入」的记忆空洞。
      */
     public int countMessages(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return 0;
-        Long n = chatMessageMapper.selectCount(
-                new QueryWrapper<ChatMessage>().eq("conversation_id", conversationId));
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId);
+        activeOnly(qw);
+        Long n = chatMessageMapper.selectCount(qw);
         return n == null ? 0 : n.intValue();
     }
 
     /**
-     * 取时间正序下的第 {@code [fromIndex, toIndex)} 条消息（只读「尚未摘要的那一段」）。
+     * 取时间正序下的第 {@code [fromIndex, toIndex)} 条消息（只读「尚未摘要的那一段」，同样只算生效版本）。
+     * <p>
+     * <b>索引口径与 {@link #countMessages} 必须一致</b>：两者一个给总数、一个给切片，用不同的过滤条件会让
+     * 水位指向错误的位置。过滤条件下 {@code LIMIT offset} 作用在过滤之后的结果集上，语义仍然成立。
+     * <p>
      * <b>依赖契约「chat_message 不做物理删除」</b>——有删除则索引区间漂移、摘要水位失准。排序同 {@link #getHistory}。
      */
     public List<ChatMessage> getMessagesRange(String conversationId, int fromIndex, int toIndex) {
@@ -359,8 +387,9 @@ public class ConversationService {
             return List.of();
         }
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
-        qw.eq("conversation_id", conversationId)
-                .orderByAsc("created_at").orderByAsc("id")
+        qw.eq("conversation_id", conversationId);
+        activeOnly(qw);
+        qw.orderByAsc("created_at").orderByAsc("id")
                 .last("LIMIT " + fromIndex + ", " + (toIndex - fromIndex));   // 受控 int 参数，无注入风险
         return chatMessageMapper.selectList(qw);
     }
@@ -405,60 +434,189 @@ public class ConversationService {
 
     /**
      * 清空会话全部消息（保留会话本身），用于 ChatMemory.clear。
-     * <b>必须与摘要水位一起归零</b>：否则 summary 指向不存在的历史，且打破 {@link #getMessagesRange} 的索引契约。
+     * <p>
+     * <b>必须与摘要水位一起归零</b>：否则 {@code summary} 指向不存在的历史，且打破
+     * {@link #getMessagesRange} 的索引契约。两步刻意写在一起——分开写迟早会漏掉一边。
+     * <p>
+     * 分支版本一并物理删除：消息都没了，留下「没有生效版本」的孤儿版本组只会让切换器指向不存在的内容。
      */
     @Transactional
     public void clearMessages(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
         log.info("清空会话消息并重置摘要水位：id={}", conversationId);
-        deleteMessagesAfter(conversationId, null);
+        chatMessageMapper.delete(new QueryWrapper<ChatMessage>().eq("conversation_id", conversationId));
+        resetMemoryWatermark(conversationId);
     }
 
+    // ===== 对话分支：同一轮提问的多个版本原地并存 =====
+
     /**
-     * 截断会话历史：<b>只保留正序前 {@code keepCount} 条消息</b>，其余删除，并把长期记忆水位一起归零。
-     * 服务前端「重新生成 / 编辑重发」——先截断到目标消息，再用既有 {@code /api/chat/stream} 通路重发，
-     * 因此不需要第二套执行逻辑。
+     * 「从第 {@code keepCount} 条消息处开一个新版本」的第一步（<b>无破坏性</b>）：给被改写的那一轮
+     * 分配或复用分支组，返回该组与<b>新版本应取的版本号</b>。
      * <p>
-     * 用「保留条数」而非消息 id 作为定位：截断点由前端决定，而<b>刚发出去那一轮的消息前端手里没有 id</b>
-     * （SSE 只回内容、不回主键），却天然知道它是第几条；id 单调递增保证两种表达完全等价，取更好拿的那个。
+     * 调用时机在前端把新文本交给 {@code /api/chat/stream} <b>之前</b>，所以这里只做不会改变现状的两件事：
+     * 目标轮尚未分组时补上 {@code turn_group_id}（仍旧 {@code turn_active = 1}），并算出下一个版本号。
+     * <b>绝不在这里把旧版本置为 inactive</b> —— 本轮有可能根本发不出去（附件处理失败、配额超限、
+     * 内容安全拒绝），那时旧版本必须原样可见。「旧版本失效」只在新版本确实落库之后才做，
+     * 见 {@link #markRoundBranch}。
      * <p>
-     * <b>水位必须同步归零</b>（见 {@link #deleteMessagesAfter}）：{@code summary} / {@code core_facts} /
-     * {@code summarized_count} 指的是「按时间正序的前 N 条消息已压缩」，消息被物理删除后该索引立即失效。
-     * 代价是下次记忆合并会从头重新摘要 —— 这正是截断后应有的语义（历史都变了，旧摘要在描述不存在的内容）。
-     * <p>
-     * 归属校验先做（不存在或非本人抛 404），与其余会话操作同一口径。
+     * 一轮 = 目标用户提问 + 其后连续的助手回复（直到下一条用户提问）。切换器挂在提问上、切换时提问与
+     * 回答一起换，故两者同属一组。
      *
-     * @param keepCount 保留的消息条数；{@code <=0} = 全部删除，{@code >=} 实际条数 = 什么都不做
-     * @return 实际删除的消息条数
+     * @param keepCount 「正序保留前 N 条」，第 N 条即分叉点，<b>必须是用户提问</b>
+     * @return 分支组 ID 与新版本应取的版本号
      */
     @Transactional
-    public long truncateTo(String conversationId, int keepCount, Long userId) {
-        if (conversationId == null || conversationId.isBlank()) return 0L;
+    public TurnBranch prepareBranch(String conversationId, int keepCount, Long userId) {
         requireOwned(conversationId, userId);
         List<ChatMessage> ordered = getHistory(conversationId);
-        if (keepCount >= ordered.size()) return 0L;   // 没有要删的：连水位也不动（历史没变，摘要依然有效）
-        Long keepUpToId = keepCount <= 0 ? null : ordered.get(keepCount - 1).getId();
-        return deleteMessagesAfter(conversationId, keepUpToId);
+        if (keepCount <= 0 || keepCount > ordered.size()) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "分叉位置超出会话范围");
+        }
+        ChatMessage target = ordered.get(keepCount - 1);
+        if (!"user".equals(target.getRole())) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "只能从用户提问处开启新版本");
+        }
+        // 该轮的行区间：目标提问 + 其后连续的助手回复（遇到下一条提问即止）
+        List<Long> turnIds = new ArrayList<>();
+        for (int i = keepCount - 1; i < ordered.size(); i++) {
+            ChatMessage m = ordered.get(i);
+            if (i > keepCount - 1 && "user".equals(m.getRole())) break;
+            turnIds.add(m.getId());
+        }
+        String groupId = target.getTurnGroupId();
+        if (groupId == null || groupId.isBlank()) {
+            groupId = UUID.randomUUID().toString();
+            // 旧轮记为第 1 版并保持生效：此刻新版本还不存在，它仍是唯一可见的那一版
+            chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                    .in(ChatMessage::getId, turnIds)
+                    .set(ChatMessage::getTurnGroupId, groupId)
+                    .set(ChatMessage::getTurnVersion, 1)
+                    .set(ChatMessage::getTurnActive, true));
+            log.info("开启分支组：会话={}，组={}，分叉点=第 {} 条，旧轮 {} 条消息记为第 1 版",
+                    conversationId, groupId, keepCount, turnIds.size());
+            return new TurnBranch(groupId, FIRST_BRANCH_VERSION);
+        }
+        int max = 0;
+        for (ChatMessage m : chatMessageMapper.selectList(new QueryWrapper<ChatMessage>()
+                .eq("conversation_id", conversationId).eq("turn_group_id", groupId))) {
+            if (m.getTurnVersion() != null) {
+                max = Math.max(max, m.getTurnVersion());
+            }
+        }
+        int next = max + 1;
+        log.info("复用分支组：会话={}，组={}，下一版本={}", conversationId, groupId, next);
+        return new TurnBranch(groupId, next);
     }
 
     /**
-     * 删除 id 大于 {@code keepUpToId} 的消息并重置记忆水位（{@code keepUpToId} 为 null 时删全部）。
-     * 这是「删消息」的唯一实现：{@link #clearMessages} 与 {@link #truncateTo} 都走它，
-     * 保证「删消息」与「水位归零」永远成对发生 —— 分开写迟早会漏掉一边。
+     * 「开新版本」的第二步：把本轮<b>新落库</b>的消息（{@code id > afterId}）打上分支标记并置为生效，
+     * 同组旧版本随之失效。必须在对话跑完、消息确实落库之后调用。
+     * <p>
+     * <b>先打标、再失效</b>，并以「打标是否命中」为闸门：本轮一条新消息都没落库（模型调用失败、
+     * 用户中途停止且未产生内容）时直接返回，<b>旧版本保持可见</b> —— 否则用户会看到那一轮凭空消失、
+     * 且没有任何报错。这正是 {@link #prepareBranch} 不提前失效的原因，两步合起来才是一次完整的分支。
+     * <p>
+     * <b>时间戳要锚回旧版本</b>：新版本行天然带更晚的 {@code created_at}，直接入库会排到后面几轮之后
+     * （读取一律 {@code ORDER BY created_at, id}）。故统一改成该组首条消息的时间，让它占回原来的位置。
+     * <p>
+     * 记忆水位一并归零：生效的历史整段换了一条，指向旧版本的摘要已失效。
+     *
+     * @return 实际打标的消息条数；0 表示本轮无消息落库、旧版本未被替换
      */
-    private long deleteMessagesAfter(String conversationId, Long keepUpToId) {
-        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
-        qw.eq("conversation_id", conversationId);
-        if (keepUpToId != null) qw.gt("id", keepUpToId);
-        Long removed = chatMessageMapper.selectCount(qw);
-        long n = removed == null ? 0L : removed;
-        if (n > 0) {
-            chatMessageMapper.delete(qw);
-            log.info("删除会话消息：id={}，保留至消息 {}，共删除 {} 条", conversationId, keepUpToId, n);
+    @Transactional
+    public int markRoundBranch(String conversationId, Long afterId, String groupId, int version) {
+        if (conversationId == null || conversationId.isBlank() || groupId == null || groupId.isBlank()) {
+            return 0;
         }
+        ChatMessage anchorRow = chatMessageMapper.selectOne(new QueryWrapper<ChatMessage>()
+                .eq("conversation_id", conversationId).eq("turn_group_id", groupId)
+                .orderByAsc("id").last("LIMIT 1"));
+        LocalDateTime anchor = (anchorRow == null || anchorRow.getCreatedAt() == null)
+                ? LocalDateTime.now() : anchorRow.getCreatedAt();
+
+        LambdaUpdateWrapper<ChatMessage> uw = new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .isNull(ChatMessage::getTurnGroupId)      // 只打本轮新落、尚未归组的行
+                .set(ChatMessage::getTurnGroupId, groupId)
+                .set(ChatMessage::getTurnVersion, version)
+                .set(ChatMessage::getTurnActive, true)
+                .set(ChatMessage::getCreatedAt, anchor);
+        if (afterId != null) {
+            uw.gt(ChatMessage::getId, afterId);
+        }
+        int marked = chatMessageMapper.update(null, uw);
+        if (marked == 0) {
+            log.warn("分支新版本无消息落库，旧版本保持生效：会话={}，组={}，版本={}", conversationId, groupId, version);
+            return 0;
+        }
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getTurnGroupId, groupId)
+                .ne(ChatMessage::getTurnVersion, version)
+                .set(ChatMessage::getTurnActive, false));
         resetMemoryWatermark(conversationId);
-        return n;
+        log.info("分支新版本生效：会话={}，组={}，版本={}，标记 {} 条消息", conversationId, groupId, version, marked);
+        return marked;
     }
+
+    /**
+     * 切换某一轮的生效版本（消息上「1/2 ‹ ›」点箭头）。
+     * <p>
+     * 两趟 UPDATE（先全灭、再点亮）而不用一条 {@code SET turn_active = (turn_version = ?)}：后者要靠字符串
+     * 拼 SQL，可读性换来的收益为零；同事务内外部看不到中间态。
+     * <p>
+     * 记忆水位一并归零：翻到另一版意味着注入模型的历史整段换了，此前按旧版本压缩出的摘要已不适用
+     * （现象上只表现为「模型记性变怪」，极难回溯）。
+     *
+     * @param version 目标版本号；该组内不存在此版本时抛 404
+     */
+    @Transactional
+    public void switchTurnVersion(String conversationId, String groupId, int version, Long userId) {
+        requireOwned(conversationId, userId);
+        if (groupId == null || groupId.isBlank() || version <= 0) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少分支组或版本号");
+        }
+        Long exists = chatMessageMapper.selectCount(new QueryWrapper<ChatMessage>()
+                .eq("conversation_id", conversationId).eq("turn_group_id", groupId)
+                .eq("turn_version", version));
+        if (exists == null || exists == 0) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "该版本不存在");
+        }
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getTurnGroupId, groupId)
+                .set(ChatMessage::getTurnActive, false));
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getConversationId, conversationId)
+                .eq(ChatMessage::getTurnGroupId, groupId)
+                .eq(ChatMessage::getTurnVersion, version)
+                .set(ChatMessage::getTurnActive, true));
+        resetMemoryWatermark(conversationId);
+        log.info("切换分支版本：会话={}，组={}，版本={}", conversationId, groupId, version);
+    }
+
+    /**
+     * 会话内每个分支组的<b>版本总数</b>（key = {@code turn_group_id}，value = 最大版本号）。
+     * <p>
+     * 写入侧保证版本号从 1 连续递增，故「最大版本号」即版本总数，不必再 {@code COUNT(DISTINCT)}。
+     * <b>必须查全量行</b>（含 inactive）：只统计可见版本的话每组永远只有 1 版，切换器根本不会出现。
+     */
+    public Map<String, Integer> turnVersionCounts(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return Map.of();
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId).isNotNull("turn_group_id")
+                .select("turn_group_id", "turn_version");
+        Map<String, Integer> counts = new HashMap<>();
+        for (ChatMessage m : chatMessageMapper.selectList(qw)) {
+            if (m.getTurnGroupId() == null || m.getTurnVersion() == null) continue;
+            counts.merge(m.getTurnGroupId(), m.getTurnVersion(), Math::max);
+        }
+        return counts;
+    }
+
+    /** 首次分叉时旧轮记为第 1 版，新版本顺延为第 2 版。 */
+    private static final int FIRST_BRANCH_VERSION = 2;
 
     /** 摘要 / 核心事实 / 已摘要条数三列一齐清零（消息不动）。「删消息」与「重置记忆」共用的一步。 */
     private void resetMemoryWatermark(String conversationId) {

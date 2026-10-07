@@ -15,7 +15,7 @@ import org.springframework.context.annotation.Configuration;
  * Spring AI 自动配置（{@code ChatClientAutoConfiguration}）默认提供一个
  * {@code @ConditionalOnMissingBean ToolCallingAdvisor.Builder<?>}（{@code toolCallingAdvisorBuilder}），
  * 其 build() 产出默认的 {@link ToolCallingAdvisor}（无迭代上限）。这里提供<b>同类型</b> bean 覆盖它：
- * build() 产出 {@link BoundedToolCallingAdvisor}（轮数上限 + 连续重复检测 + 软刹车），
+ * build() 产出 {@link BoundedToolCallingAdvisor}（轮数上限 + 连续重复检测 + 单轮 token 预算 + 软刹车），
  * {@code ChatClient.Builder} 经 {@code toolCallingAdvisorBuilder.getIfAvailable()} 拿到的是本 bean，
  * 于是普通对话与规划中间步骤两个 ChatClient 都会挂上有界循环（与默认行为一致的替换，无侵入）。
  * <p>

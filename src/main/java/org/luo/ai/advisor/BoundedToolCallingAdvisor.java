@@ -2,6 +2,7 @@ package org.luo.ai.advisor;
 
 import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.properties.ToolCallProperties;
+import org.luo.ai.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClientRequest;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.client.advisor.ToolCallingAdvisor;
@@ -23,15 +24,23 @@ import java.util.List;
  * <ul>
  *   <li><b>轮数上限</b>：累计往返轮数超过 {@code maxIterations} 即软刹车（不抛错，让模型用已有信息作答）；</li>
  *   <li><b>连续重复检测</b>：模型连续 {@code repeatThreshold} 次请求「同名工具且入参相同」判定原地打转，提前软刹车；</li>
- *   <li><b>软刹车</b>：把「已达工具调用上限，请基于已查到的信息作答、不要再调用工具」追加进 system，而非直接抛错中断。</li>
+ *   <li><b>单轮 token 预算</b>：读本轮累计用量（{@link RoundTrace#getTotalTokens()}，规划模式下跨步骤累加），
+ *       达到 {@code roundBudgetTokens} 即软刹车。轮数与重复检测拦的是「死循环」，这一道拦的是「每一步都合规、
+ *       合起来烧穿一轮」——多步规划 + 长工具链可以完全绕过前两道而不违反其中任何一条。</li>
  * </ul>
+ * <p>
+ * <b>软刹车为什么不是硬中断</b>：见 {@link ToolCallProperties} 的类注释——已跑出的中间结果是花过钱的，
+ * 硬中断等于全丢并只回一条错误；软刹车让本轮以「不完整但基于事实、且明确说明不完整」收场。
+ * 代价是<b>它不是硬上限</b>：刹车后模型仍会被调用一次来产出最终答案（规划模式下每个被刹住的步骤各一次），
+ * 真实用量可能高出上限一到两次调用。
  * <p>
  * <b>计数为何用 ThreadLocal</b>：工具循环的 {@code doBeforeCall} 在同一条执行链上反复触发，但每次都可能跨
  * advisor 调用（{@code adviseCall} 内部 {@code do...while} 同线程推进）；同时 ChatClient 是单例、被并发请求
  * 复用，成员变量计数会串号。ThreadLocal 保证每个请求各自计数，用完即清，避免线程池复用残留。
  * <p>
- * <b>可见性</b>：工具调用本身的进度播报已由 {@code RoundTraceAdvisor}（经 RoundTrace.syncToolCalls）完成，
- * 本类只补「刹车」这一条播报，与既有进度通道一致。
+ * <b>可见性</b>：工具调用本身的进度播报已由 {@code RoundTraceAdvisor}（经 RoundTrace.syncToolCalls）完成；
+ * 本类补「刹车」这条播报（含触发原因与用量），并在 WARN 日志里带上 traceId —— 进度只当轮可见，
+ * 日志才是事后能检索到的那一份。<b>不落库</b>：为一项默认关闭的治理能力新增 {@code agent_trace} 列不划算。
  */
 @Slf4j
 public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {
@@ -42,8 +51,17 @@ public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {
                     + "直接基于目前已获取的信息，用中文给用户一个完整、诚实的回答；"
                     + "若信息仍不完整，请如实说明还缺什么，而不是继续尝试调用工具。";
 
+    /** 预算用尽时的软刹车指令：与轮数/重复刹车分开，因为它必须让模型把「答案不完整」这件事说出来。 */
+    static final String BUDGET_STOP_INSTRUCTION =
+            "\n\n[本轮 token 预算已用尽] 请不要再调用任何工具，直接基于目前已获取的信息，"
+                    + "用中文给用户一个完整、诚实的回答，并在结尾明确说明："
+                    + "本轮因 token 预算上限而提前收尾，结果可能不完整、还需要哪些信息。"
+                    + "不要继续尝试调用工具，也不要假装信息已经查全。";
+
     private final int maxIterations;
     private final int repeatThreshold;
+    /** 单轮累计 token 上限；<=0 表示不启用（见 {@link ToolCallProperties#roundBudgetOn()}）。 */
+    private final long roundBudgetTokens;
 
     /** 单次 adviseCall 的循环状态：迭代计数 + 上一轮请求的工具指纹（工具名 + 入参）。 */
     private static final ThreadLocal<LoopState> LOOP = new ThreadLocal<>();
@@ -60,7 +78,7 @@ public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {
      * @param toolCallingManager 工具执行管理器（由自动配置注入）
      * @param toolExecutionEligibilityChecker 判定「是否工具调用」的检查器
      * @param advisorOrder Advisor 顺序（沿用默认 {@link ToolCallingAdvisor#DEFAULT_ORDER}）
-     * @param props 工具循环上限配置（max-iterations / repeat-threshold）
+     * @param props 失控刹车配置（max-iterations / repeat-threshold / round-budget-tokens）
      */
     public BoundedToolCallingAdvisor(ToolCallingManager toolCallingManager,
                                      ToolExecutionEligibilityChecker toolExecutionEligibilityChecker,
@@ -68,6 +86,7 @@ public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {
         super(toolCallingManager, toolExecutionEligibilityChecker, advisorOrder, true);
         this.maxIterations = props.maxIterations();
         this.repeatThreshold = props.repeatThreshold();
+        this.roundBudgetTokens = props.roundBudgetTokens();
     }
 
     @Override
@@ -88,21 +107,45 @@ public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {
             state.lastToolKey = toolKey;
         }
 
-        boolean overIterations = state.iterations > maxIterations;
-        boolean overRepeat = state.repeatCount >= repeatThreshold;
         // 已软刹车则不再重复追加指令/告警：软刹车后模型再被调用时（产出最终答案的那一轮），
         // 历史里仍留有上一条 toolCalls，fingerprint 会继续命中，但无需二次追加。
-        if (state.braked || (!overIterations && !overRepeat)) {
+        if (state.braked) {
+            return chatClientRequest;
+        }
+
+        boolean overIterations = state.iterations > maxIterations;
+        boolean overRepeat = state.repeatCount >= repeatThreshold;
+        // 单轮 token 预算：取本轮累计值（RoundTrace 在每次模型返回后累加；取不到 trace 的裸调用不受管辖）
+        RoundTrace trace = RoundTrace.from(chatClientRequest.context());
+        long usedTokens = trace == null ? 0L : trace.getTotalTokens();
+        boolean overBudget = roundBudgetTokens > 0 && trace != null && usedTokens >= roundBudgetTokens;
+        if (!overIterations && !overRepeat && !overBudget) {
             return chatClientRequest;
         }
         state.braked = true;
 
         // 软刹车：追加「停止调工具」指令，让模型基于已有信息作答，而非抛错中断整轮
-        String reason = overRepeat ? "连续重复调用同一工具" : "工具调用轮数已达上限";
-        log.warn("工具循环软刹车：{}（第 {} 轮，重复 {} 次）", reason, state.iterations, state.repeatCount);
+        String reason;
+        String instruction;
+        if (overBudget) {
+            reason = "单轮 token 预算已用尽（已用 " + usedTokens + " / 上限 " + roundBudgetTokens + "）";
+            instruction = BUDGET_STOP_INSTRUCTION;
+        } else if (overRepeat) {
+            reason = "连续重复调用同一工具";
+            instruction = SOFT_STOP_INSTRUCTION;
+        } else {
+            reason = "工具调用轮数已达上限";
+            instruction = SOFT_STOP_INSTRUCTION;
+        }
+        // 日志带 traceId：进度只在当轮可见，日志才是事后检索整轮链路的那一份
+        log.warn("工具循环软刹车：{}（第 {} 轮，重复 {} 次，traceId={}）", reason, state.iterations,
+                state.repeatCount, trace == null ? "-" : trace.getTraceId());
+        if (trace != null) {
+            trace.reportProgress("⚠️ " + reason + "，本轮提前收尾：将基于已有信息作答，结果可能不完整");
+        }
         var prompt = chatClientRequest.prompt().augmentSystemMessage(systemMessage -> {
             String existing = systemMessage.getText();
-            String text = (existing == null ? "" : existing) + SOFT_STOP_INSTRUCTION;
+            String text = (existing == null ? "" : existing) + instruction;
             return systemMessage.mutate().text(text).build();
         });
         return chatClientRequest.mutate().prompt(prompt).build();

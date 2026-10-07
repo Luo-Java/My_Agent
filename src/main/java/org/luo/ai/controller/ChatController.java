@@ -142,7 +142,7 @@ public class ChatController {
         // 一次遍历同时抽出「当轮材料」与「展示元数据」：纯提问走记忆/路由，两者分别注入 system / 落库，互不影响
         AttachmentBundle bundle = extractAttachments(request.attachments());
         String reply = chatService.chat(conversationId, request.message(),
-                bundle.material(), bundle.metaJson(), request.planner(), userId);
+                bundle.material(), bundle.metaJson(), request.planner(), userId, request.branch());
         // Map.of 拒绝 null 值：出口再兜一道，避免上游漏判空把一次 200 变成 500
         return Map.of("content", reply == null ? "" : reply);
     }
@@ -151,6 +151,10 @@ public class ChatController {
      * 流式对话：以 SSE 推送事件，前端逐字渲染。每条事件 data 为 JSON，字段名即事件类型：
      * {@code {"token":"..."}} 正文分片（唯一写入会话记忆的内容）；{@code {"progress":"..."}} 执行过程
      * （规划步骤与进展，不写入记忆、刷新后消失）。
+     * <p>
+     * 请求体可带 {@code branchGroupId} / {@code branchVersion}（来自 {@code POST …/{id}/branch}），
+     * 表示本轮要落成某一轮的新版本：服务端在消息确实落库之后才打标并让旧版本失效，
+     * 打标失败会补推一条 {@code progress} 明说 —— 不让用户以为「重发生效了」其实没有。
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@RequestBody ChatRequest request) {
@@ -170,7 +174,7 @@ public class ChatController {
                 ? Flux.just(StreamEvent.error(blocked))
                 : guarded(quotaService.status(userId, isAdmin(user)),
                         chatService.stream(conversationId, request.message(),
-                                bundle.material(), bundle.metaJson(), request.planner(), userId));
+                                bundle.material(), bundle.metaJson(), request.planner(), userId, request.branch()));
 
         // 流结束标记：心跳任务据此自停；同时保证「流结束后不再往已完成的 emitter 写」
         AtomicBoolean finished = new AtomicBoolean(false);

@@ -91,3 +91,19 @@ ALTER TABLE conversation ADD COLUMN review_enabled TINYINT(1) NOT NULL DEFAULT 0
 -- 跨会话搜索：开启后本轮用 LLM 抽取关键词，在本用户「其他会话」的历史消息里做关键词召回并注入上下文。
 -- 归属隔离靠 JOIN conversation 判定（chat_message 没有 user_id 列），且天然排除当前会话。
 ALTER TABLE conversation ADD COLUMN cross_session TINYINT(1) NOT NULL DEFAULT 0 COMMENT '跨会话搜索开关：1=检索本用户其他会话的历史消息并注入；0=不检索（默认）';
+
+-- ---------------------------------------------------------------------------
+-- chat_message 补充「对话分支版本」三列（功能扩展，非新表）：存量库执行这一段即可。
+-- 用途：编辑重发 / 重新生成不再「删掉旧的那一轮」，而是把同一轮提问的多个版本都留下，
+-- 消息上挂「1/2 ‹ ›」切换器原地翻看 —— 旧思路不再当场消失。
+-- 三列的关系：turn_group_id 标识「这是同一轮的哪几个版本」，turn_version 是组内序号，turn_active 标记当前生效的那一版。
+-- 读取侧（getHistory / 记忆窗口 / 消息计数 / 摘要切片）统一只认「turn_group_id IS NULL OR turn_active = 1」，
+-- 因此未分叉的行（turn_group_id 为 NULL）行为与改造前完全一致 —— 这也是刻意不做数据回填的原因。
+-- 注：MySQL 不支持 ADD COLUMN IF NOT EXISTS，重复执行会报 `Duplicate column name`（错误码 1060），可忽略。
+-- ---------------------------------------------------------------------------
+ALTER TABLE chat_message ADD COLUMN turn_group_id VARCHAR(64) DEFAULT NULL COMMENT '对话分支组ID（UUID）：同一轮提问的多个「版本」（编辑重发 / 重新生成）共用；NULL=从未分叉，该轮只有一个版本。刻意不做回填——NULL 即旧语义';
+ALTER TABLE chat_message ADD COLUMN turn_version INT DEFAULT NULL COMMENT '该分支组内的版本序号，从 1 开始递增；版本号连续，故前端可直接令 versionCount = 当前 version';
+ALTER TABLE chat_message ADD COLUMN turn_active TINYINT(1) NOT NULL DEFAULT 1 COMMENT '该版本是否为当前生效版本：1=生效（会被读取、会注入记忆）；同一组内至多一个版本为 1。未分叉的行恒为 1';
+-- 分支读取（按组筛当前版本）与版本计数（GROUP BY turn_group_id）共用该索引（索引已存在时被忽略）
+ALTER TABLE chat_message ADD INDEX idx_conv_turn (conversation_id, turn_group_id);
+-- ---------------------------------------------------------------------------

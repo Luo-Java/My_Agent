@@ -99,6 +99,18 @@ public class RoundTrace {
         this.userMessage = chop(userMessage, USER_MESSAGE_LIMIT);
     }
 
+    /**
+     * 从 Spring AI advisor 上下文里取当轮追踪对象；不是本项目的上下文（如规划器内部的裸调用）返回 null。
+     * <p>
+     * 收在本类而不是各 Advisor 各写一份：键 {@link #CONTEXT_KEY} 与取值类型都是本类的私有约定，
+     * 复制一份就多一处「键改了但那边没改」的静默失配——表现是追踪/预算悄悄失效且不报错。
+     */
+    public static RoundTrace from(Map<String, Object> context) {
+        if (context == null) return null;
+        Object value = context.get(CONTEXT_KEY);
+        return (value instanceof RoundTrace t) ? t : null;
+    }
+
     // ==================== 各环节写入 ====================
 
     /** 记录本轮形态（agent / planner），由编排层选定策略后设置。 */

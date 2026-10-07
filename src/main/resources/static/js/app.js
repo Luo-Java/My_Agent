@@ -71,6 +71,36 @@ function sanitizeHtml(html) {
     return doc.body.innerHTML;
 }
 
+/** 引用回链：把正文里的 [n] 角标标记为可点击的 data-idx 元素，供点击时定位到下方「引用来源」的第 n 条。
+ *  <p>为什么不用 DOMParser：renderMd 在流式期间每来一片 token 就跑一次，再解析一遍 DOM 等于把每次渲染
+ *  的开销翻倍。这里按标签切分字符串，只改「标签之外」的文本段；并跳过 <pre>/<code>/<a> 的内容——
+ *  那三处出现的 [n] 分别是代码、数组下标与链接文字，改了就是错的。
+ *  <p>注意：必须在 echarts 占位还原<b>之后</b>调用，否则 data-option 里的 JSON 数组会被误判成角标。 */
+const CITE_REF_RE = /\[(\d{1,3})\]/g;
+function linkifyCitations(html) {
+    if (!html || html.indexOf('[') < 0) return html;
+    const parts = html.split(/(<[^>]*>)/);
+    let inPre = 0, inCode = 0, inA = 0;
+    for (let i = 0; i < parts.length; i++) {
+        const seg = parts[i];
+        if (!seg) continue;
+        if (seg.charCodeAt(0) === 60) {          // 60 = '<'：本段是标签
+            const t = seg.toLowerCase();
+            if (t.startsWith('<pre')) inPre++;
+            else if (t.startsWith('</pre')) inPre = Math.max(0, inPre - 1);
+            else if (t.startsWith('<code')) inCode++;
+            else if (t.startsWith('</code')) inCode = Math.max(0, inCode - 1);
+            else if (t.startsWith('<a ')) inA++;
+            else if (t.startsWith('</a')) inA = Math.max(0, inA - 1);
+            continue;
+        }
+        if (inPre || inCode || inA) continue;
+        parts[i] = seg.replace(CITE_REF_RE, (m, n) =>
+            '<sup class="cite-ref" data-idx="' + n + '" title="定位到引用来源第 ' + n + ' 条">[' + n + ']</sup>');
+    }
+    return parts.join('');
+}
+
 /** 将 Markdown 文本转为 HTML（先转义 HTML 标签 → marked 渲染 → 再对产物做一次 URL 协议白名单清理）。
  *  ```echarts 代码块会被识别并替换为图表容器 div（.echarts-box，data-option 存 JSON），
  *  由 renderCharts() 用 ECharts 渲染成真正的图表；JSON 未完整时保留为代码块。 */
@@ -108,7 +138,8 @@ function renderMd(text) {
             return '<pre><code class="language-echarts">' + escapeHtml(c.json) + '</code></pre>';
         }
     });
-    return html;
+    // 5) 引用回链：正文里的 [n] 变成可点击角标（点击定位到「引用来源」里的第 n 条）
+    return linkifyCitations(html);
 }
 
 /** ECharts 深色主题：页面已改为深色科技风，ECharts 默认浅色主题的深色文字在暗底上看不清。
@@ -199,12 +230,14 @@ function escapeHtml(text) {
  *  version：每次内容更新自增，用作 v-html 所在 DOM 的 :key，强制 Vue 重建节点，
  *  规避流式高频更新下 v-html 未刷新（DOM 停留在中间态）导致的 Markdown 未渲染问题。
  *  citations：AI 消息的 RAG 引用来源（[{index,kbName,source,score}]），来自历史接口或当轮 SSE citations 事件。 */
-function toMsg(role, content, attachments, citations) {
+function toMsg(role, content, attachments, citations, turn) {
     return {
         role, content: content || '', html: renderMd(content || ''), version: 0,
         attachments: (attachments && attachments.length) ? attachments : undefined,
         citations: (citations && citations.length) ? citations : undefined,
-        citesOpen: true
+        citesOpen: true,
+        // 对话分支版本（同一轮提问的第几版 / 共几版）：只有分过叉的轮才有，切换器据此显隐
+        turn: turn || null
     };
 }
 
@@ -408,9 +441,9 @@ const app = createApp({
         // 局部重规划请求进行中（按钮态）：一次模型往返、几秒量级，期间禁用按钮防重复提交。
         const replanning = ref(false);
 
-        // ===== 消息重做（重新生成 / 编辑重发）=====
+        // ===== 对话分支（编辑重发 / 重新生成）=====
         // 正在「编辑重发」的用户消息下标；-1 = 不在编辑态。
-        // 编辑态下 send() 会先把历史截断到该下标（删除它及其后的全部消息），再用输入框里的新文本重发，
+        // 编辑态下 send() 会先为这一轮开一个新版本（旧版本一条不删、随时可翻回），再用输入框里的新文本重发，
         // 因此重发走的仍是同一条 /api/chat/stream 通路，不需要第二套发送逻辑。
         const editingIndex = ref(-1);
 
@@ -421,6 +454,65 @@ const app = createApp({
             open: false, loading: false, saving: false, error: '',
             summary: '', coreFacts: '', summarizedCount: 0, messageCount: 0
         });
+
+        // ===== 引用回链：查看被引用的那段原文 =====
+        // 气泡里的「引用来源」此前只有「库名 · 文件名 · 相关度」，看不到真正回答问题的原文段落，
+        // 用户无法判断「这句话是文档里写的还是模型编的」。点引用条目上的「原文」按 chunkId 取块。
+        // 块可能已被删除或重新分片（几个月前看到的引用，块后来被重切了），此时后端 404 + 原因，
+        // 本弹窗把它原样显示出来 —— 不渲染一段空白，那看起来像「文档里本来就是空的」。
+        const chunkModal = reactive({ open: false, loading: false, error: '', chunk: null });
+
+        /** 打开某条引用来源的原文。c 为 KbCitation（含 chunkId / kbId / kbName / source / score）。 */
+        async function openCite(c) {
+            if (!c || c.chunkId == null) {
+                alert('这条来源没有可定位的知识块（可能是早期数据，未记录 chunkId）。');
+                return;
+            }
+            chunkModal.open = true;
+            chunkModal.loading = true;
+            chunkModal.error = '';
+            chunkModal.chunk = null;
+            try {
+                const resp = await apiFetch('/api/kb/chunk/' + encodeURIComponent(c.chunkId));
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try {
+                        const d = await resp.json();
+                        if (d && d.message) msg = d.message;
+                    } catch (ignore) { /* 非 JSON 响应体：沿用状态码 */ }
+                    throw new Error(msg);
+                }
+                chunkModal.chunk = await resp.json();
+            } catch (e) {
+                chunkModal.error = '读取原文失败：' + e.message;
+            } finally {
+                chunkModal.loading = false;
+            }
+        }
+
+        function closeCite() {
+            chunkModal.open = false;
+        }
+
+        /** 点击正文里的 [n] 角标：展开该条消息的「引用来源」并高亮第 n 条。
+         *  找不到对应序号时明确告知 —— 模型偶尔会自行标注角标，静默无反应会让人以为链接坏了。 */
+        function onCiteClick(ev, m) {
+            const el = ev.target;
+            if (!el || !el.classList || !el.classList.contains('cite-ref')) return;
+            const idx = parseInt(el.dataset.idx, 10);
+            const hit = (m.citations || []).find(x => Number(x.index) === idx);
+            if (!hit) {
+                alert('正文里的 [' + idx + '] 在本轮引用来源里没有对应条目（可能是模型自行标注的角标）。');
+                return;
+            }
+            m.citesOpen = true;
+            m.citeHit = idx;
+            nextTick(() => {
+                const line = document.querySelector('.cite-line.cite-hit');
+                if (line && line.scrollIntoView) line.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            });
+            setTimeout(() => { if (m.citeHit === idx) m.citeHit = null; }, 2000);
+        }
 
         // 智能体导入用的隐藏文件选择器（与附件选择器同样走「点击按钮 → 触发 input」的方式）
         const agentImportInput = ref(null);
@@ -889,7 +981,7 @@ const app = createApp({
                 // 竞态守卫：resp.json() 也是 await，期间可能又切走了，所以拿到数据后要再判一次
                 if (seq !== historySeq) return;
                 if (data) {
-                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations));
+                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations, m.turn));
                 }
             } catch (e) { /* 忽略 */ }
             if (seq !== historySeq) return;   // 结果已过期：不写 messages，也不滚动/渲染图表
@@ -947,42 +1039,50 @@ const app = createApp({
             }
         }
 
-        // ===== 消息重做（重新生成 / 编辑重发）=====
-        // 两者都是「先截断、再复用 send() 重发」：截断端点只负责删除，重发完全走既有流式通路。
-        // 所以这里不复制任何发送逻辑，只把历史裁到该裁的位置、把文本送回输入框。
+        // ===== 对话分支：同一轮提问的多个版本原地并存 =====
+        // 编辑重发与重新生成是同一件事的两个入口：都先给那一轮开一个新版本，再走既有流式通路重发。
+        // 旧版本留在库里不删，消息上的「1/2 ‹ ›」可以随时翻回去 —— 与「先看计划」「局部重规划」
+        // 同一思路：能复用现成通路就不另起一条，这里也就不复制任何发送逻辑。
 
-        /** 截断历史到「只保留前 keepCount 条」。失败抛错，由调用方中止本次重发。 */
-        async function truncateHistory(keepCount) {
-            const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/truncate', {
+        /**
+         * 给第 keepCount 条消息所在的那一轮开一个新版本，返回 { groupId, version }。
+         * <p>此刻后端不会动任何已有消息：旧版本要等本轮确实发出去、消息真的落库之后才失效
+         * （否则附件处理失败 / 配额超限 / 内容安全拒绝时，旧版本会凭空消失且没有任何报错）。
+         * 所以这里失败直接中止重发 —— 历史没被改过，用户可以重试。
+         */
+        async function prepareBranch(keepCount) {
+            const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/branch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ keepCount })
             });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            if (!resp.ok) {
+                let msg = 'HTTP ' + resp.status;
+                try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch (ignore) { /* 非 JSON 响应体：沿用状态码 */ }
+                throw new Error(msg);
+            }
+            return await resp.json();
         }
 
-        /** 重新生成第 i 条 AI 回复：删除该回复及其之后，用它前面那条用户消息原样重发。 */
+        /**
+         * 重新生成第 i 条 AI 回复：把它前面那条提问当作新版本重发一次。
+         * <p>与「编辑重发」走完全相同的通路（只是文本原样、不打断用户去改），所以这里不自己调流式接口，
+         * 而是设好 editingIndex 后交给 send() —— 两条入口若各写一份发送逻辑，迟早会走偏。
+         */
         async function regenerate(m, i) {
             if (loading.value) return;
-            const ask = messages.value[i - 1];
+            const askIndex = i - 1;
+            const ask = messages.value[askIndex];
             if (!ask || ask.role !== 'user') { alert('找不到这条回复对应的提问，无法重新生成'); return; }
             // 历史消息的附件只存了元数据、没有解析出的正文，重发无法还原 —— 说清楚再降级，不静默丢内容
             if (ask.attachments && ask.attachments.length
                 && !confirm('重新生成不会重新上传当时的附件（只保留文字），继续吗？')) return;
-            if (!confirm('将删除这条回复及其之后的内容并重新生成，继续吗？')) return;
-            try {
-                await truncateHistory(i);   // 保留前 i 条 = 删除第 i 条（这条回复）及其后
-            } catch (e) {
-                alert('重新生成失败：' + e.message);
-                return;
-            }
-            messages.value = messages.value.slice(0, i);
-            attachments.value = [];
+            editingIndex.value = askIndex;
             input.value = ask.content || '';
             await send();
         }
 
-        /** 进入「编辑重发」态：文本放回输入框，发送时先截断到它之前再用新文本重发。 */
+        /** 进入「编辑重发」态：文本放回输入框；发送时会给这一轮开新版本，旧版本保留可翻回。 */
         function startEditMessage(m, i) {
             if (loading.value) return;
             editingIndex.value = i;
@@ -996,6 +1096,34 @@ const app = createApp({
         /** 退出「编辑重发」态（只还原输入区，不动历史）。 */
         function cancelEditMessage() {
             editingIndex.value = -1;
+        }
+
+        /**
+         * 切换某一轮的生效版本（消息上「1/2 ‹ ›」）。
+         * <p>切完重新拉一次历史：变的是「整轮消息长什么样」而不是某一条的字段，重拉比在本地逐条改
+         * 更不容易漏（附件、引用、图表占位都在那一轮里）。切换会让长期记忆水位归零（注入模型的历史整段
+         * 换了），所以记忆面板也一并刷新。
+         */
+        async function switchTurn(m, delta) {
+            const turn = m && m.turn;
+            if (!turn || loading.value) return;
+            const target = turn.version + delta;
+            if (target < 1 || target > turn.versionCount) return;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/turn', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ groupId: turn.groupId, version: target })
+                });
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch (ignore) { /* 同上 */ }
+                    throw new Error(msg);
+                }
+                await selectConversation(currentId.value);
+            } catch (e) {
+                alert('切换版本失败：' + e.message);
+            }
         }
 
         // ===== 会话导出 =====
@@ -2333,20 +2461,26 @@ const app = createApp({
             if (pendingReview && !reviewEnabled.value) { reviewEnabled.value = true; await onReviewChange(); }
             if (pendingCrossSession && !crossSession.value) { crossSession.value = true; await onCrossSessionChange(); }
 
-            // 编辑重发：先把历史截断到目标消息之前，再用输入框里的新文本走下面同一条流式通路。
-            // 截断失败则中止本轮（保留编辑态，用户可重试或取消）—— 不能在历史没裁干净的情况下重发，
-            // 否则新旧两条提问会同时留在会话里。
+            // 编辑重发 / 重新生成：先给这一轮开一个新版本（旧版本一条不删，留在库里可翻回），
+            // 再用输入框里的文本走下面同一条流式通路。开版本本身不改任何已有消息，失败就中止本轮
+            // （保留编辑态，用户可重试或取消）—— 不能在半途状态下重发，否则新旧两条提问会同时挂在这一轮里。
+            let branch = null;
             if (editingIndex.value >= 0) {
                 const keep = editingIndex.value;
                 try {
-                    await truncateHistory(keep);
+                    branch = await prepareBranch(keep + 1);   // 第 keep+1 条 = 被改写的那条提问
                 } catch (e) {
                     alert('重发失败：' + e.message);
                     return;
                 }
                 editingIndex.value = -1;
+                // 本地视图裁掉这一轮及其后，紧接着下面会把新版本推上来；服务端的旧版本仍在，可切回
                 messages.value = messages.value.slice(0, keep);
             }
+            // 新版本号连续递增（后端保证），故「总版本数」就等于本次的版本号 —— 不必再回查一次
+            const branchTurn = branch
+                ? { groupId: branch.groupId, version: branch.version, versionCount: branch.version }
+                : null;
 
             // 发起新一轮：此前留下的待确认计划卡片一律失效。
             // 新的一轮规划会把旧 RUNNING 任务结为 CANCELLED（TaskService.cancelRunning），
@@ -2401,12 +2535,13 @@ const app = createApp({
 
             messages.value.push({
                 role: 'user', content: displayContent, html: '', version: 0,
-                attachments: attMeta.length ? attMeta : undefined
+                attachments: attMeta.length ? attMeta : undefined,
+                turn: branchTurn
             });
             // steps：本次运行的执行过程（规划与逐步进展）。仅前端临时展示，后端不写入会话记忆，
             // 因此刷新页面或重新打开会话时不会出现（历史消息只有最终结果）。
             // citesOpen：引用来源列表默认展开（有引用时才是视觉焦点）。
-            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true });
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true, turn: branchTurn });
             input.value = '';
             loading.value = true;
             scrollToBottom();
@@ -2428,7 +2563,11 @@ const app = createApp({
                         attachments: attMeta.length ? attMeta.map(a => ({
                             type: a.type, content: a.content, filename: a.filename,
                             storedName: a.storedName, size: a.size
-                        })) : undefined
+                        })) : undefined,
+                        // 分叉时带上分支组与版本号：服务端在本轮消息确实落库之后才打标，
+                        // 并让同组旧版本失效（失败会补推一条 progress 明说，不是静默无反应）
+                        branchGroupId: branch ? branch.groupId : undefined,
+                        branchVersion: branch ? branch.version : undefined
                     })
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -2613,7 +2752,7 @@ const app = createApp({
             if (loading.value || !currentId.value) return;
             const convId = currentId.value;
             // 推一条空的 assistant 消息承接续跑输出（无用户气泡；续跑是对既有任务的延续）
-            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true });
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true, turn: branchTurn });
             const lastIndex = messages.value.length - 1;
             const signal = beginStream();   // 续跑同样可中断（与 send 共用一套中断控制）
             loading.value = true;
@@ -3168,8 +3307,10 @@ const app = createApp({
             kbs, kbModal, kbDetail, availableAgents, kbFileInput, chroma, loadChromaStatus, syncChroma,
             send, stopGeneration, newConversation, startAgentChat, selectConversation,
             startEdit, commitEdit, deleteConversation,
-            // 消息重做（重新生成 / 编辑重发）、会话导出、长期记忆面板
-            editingIndex, regenerate, startEditMessage, cancelEditMessage, truncateHistory, canRedo,
+            // 消息重做（重新生成 / 编辑重发）、消息分叉、会话导出、长期记忆面板
+            editingIndex, regenerate, startEditMessage, cancelEditMessage, switchTurn, canRedo,
+            // 引用回链：正文 [n] 角标点击 → 定位来源；来源条目「原文」→ 取知识块详情
+            chunkModal, openCite, closeCite, onCiteClick,
             exportConversation, memoryModal, openMemory, saveMemory, resetMemory, memoryCoverage,
             // 智能体导入 / 导出
             exportAgents, triggerAgentImport, onAgentImportFile, agentImportInput,

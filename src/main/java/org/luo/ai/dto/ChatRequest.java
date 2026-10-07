@@ -12,11 +12,20 @@ import java.util.List;
  * @param attachments    可选附件列表（图片由 VisionService 识别、文档由 DocumentParserService 解析，
  *                       统一产出 content 文本）。非空时由 ChatController 把 content 拼到 message 后注入上下文，
  *                       原始二进制不入会话记忆（保证存储与后续检索的轻量）。
+ * @param branchGroupId  可选：本轮要落的对话分支组 ID（编辑重发 / 重新生成时由前端带 {@code /branch} 的结果）。
+ *                       为空 = 普通追加一轮，不涉及版本。
+ * @param branchVersion  可选：本轮要落的版本号，与 {@code branchGroupId} 成对出现。
  */
-public record ChatRequest(String conversationId, String message, Boolean planner, List<ChatAttachment> attachments) {
+public record ChatRequest(String conversationId, String message, Boolean planner, List<ChatAttachment> attachments,
+                          String branchGroupId, Integer branchVersion) {
 
-    /** 兼容旧调用点（无 attachments）的便捷构造。 */
+    /** 兼容旧调用点（无 attachments、无分支）的便捷构造。 */
     public ChatRequest(String conversationId, String message, Boolean planner) {
-        this(conversationId, message, planner, null);
+        this(conversationId, message, planner, null, null, null);
+    }
+
+    /** 本轮的分支信息；非分叉轮返回 {@code null}（调用方据此整个跳过打标）。 */
+    public TurnBranch branch() {
+        return TurnBranch.of(branchGroupId, branchVersion);
     }
 }

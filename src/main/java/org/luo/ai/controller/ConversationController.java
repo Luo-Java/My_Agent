@@ -1,6 +1,7 @@
 package org.luo.ai.controller;
 
 import org.luo.ai.dto.AttachmentDto;
+import org.luo.ai.dto.BranchTurnRequest;
 import org.luo.ai.dto.ConversationExport;
 import org.luo.ai.dto.ConversationMemory;
 import org.luo.ai.dto.ConversationSummary;
@@ -14,13 +15,17 @@ import org.luo.ai.dto.PlannerConfirmRequest;
 import org.luo.ai.dto.PlannerEnabledRequest;
 import org.luo.ai.dto.RagEnabledRequest;
 import org.luo.ai.dto.RenameConversationRequest;
+import org.luo.ai.dto.SwitchTurnRequest;
+import org.luo.ai.dto.TurnBranch;
 import org.luo.ai.dto.ReviewEnabledRequest;
-import org.luo.ai.dto.TruncateMessagesRequest;
 import org.luo.ai.dto.UpdateMemoryRequest;
 import org.luo.ai.entity.Agent;
+import org.luo.ai.entity.ChatMessage;
 import org.luo.ai.entity.Conversation;
 import org.luo.ai.service.AgentService;
 import org.luo.ai.service.ConversationService;
+import org.luo.common.exception.AiBusinessException;
+import org.luo.common.exception.AiErrorCode;
 import org.luo.system.security.AuthContext;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -46,8 +51,9 @@ import java.util.Map;
  * <p>
  * 扩展三组：
  * <ul>
- *   <li><b>消息重做</b>：POST …/{id}/truncate —— 只做「截断」，重发仍走 {@code /api/chat/stream}，
- *       故不需要第二套执行逻辑；</li>
+ *   <li><b>消息重做</b>：POST …/{id}/branch 开新版本 + POST …/{id}/turn 切换版本 —— 编辑重发 / 重新生成
+ *       不再删掉旧的那一轮，而是让多个版本原地并存（消息上「1/2 ‹ ›」）。重发本身仍走
+ *       {@code /api/chat/stream}，故不需要第二套执行逻辑；</li>
  *   <li><b>导出</b>：GET …/{id}/export —— 回 Markdown 文本，由前端拼 Blob 下载（裸链接带不上
  *       {@code Authorization}）；</li>
  *   <li><b>长期记忆</b>：GET/PUT/DELETE …/{id}/memory —— 把此前全黑盒的摘要 / 核心事实摊开给用户看与改。</li>
@@ -169,42 +175,78 @@ public class ConversationController {
     }
 
     /**
-     * 读取某会话的历史消息（按时间正序）。用户消息附带本轮附件展示元数据，助手消息附带本轮 RAG 引用来源；
-     * 两者都不参与记忆读取，仅供前端渲染，对 LLM 上下文与 token 零影响。<b>仅本人会话可读</b>，他人会话 404。
+     * 读取某会话的历史消息（按时间正序，<b>只含当前生效的分支版本</b>）。用户消息附带本轮附件展示元数据，
+     * 助手消息附带本轮 RAG 引用来源；两者都不参与记忆读取，仅供前端渲染，对 LLM 上下文与 token 零影响。
+     * 每条消息另带 {@code turn}（分支组 / 版本号 / 总版本数），前端据此在提问上渲染「1/2 ‹ ›」切换器。
+     * <b>仅本人会话可读</b>，他人会话 404。
      */
     @GetMapping("/history")
     public HistoryResponse history(@RequestParam String conversationId) {
         conversationService.requireOwned(conversationId, AuthContext.require().id());
+        // 版本总数必须单独查全量行：历史本身已过滤掉未生效版本，只看它每组永远只有 1 版、切换器根本不出现
+        Map<String, Integer> versionCounts = conversationService.turnVersionCounts(conversationId);
         List<MessageDto> messages = conversationService.getHistory(conversationId).stream()
                 .map(m -> new MessageDto(m.getRole(), m.getContent(),
                         AttachmentDto.parse(m.getAttachmentsJson()),
-                        KbCitation.parse(m.getCitationsJson())))
+                        KbCitation.parse(m.getCitationsJson()),
+                        turnOf(m, versionCounts)))
                 .toList();
         return new HistoryResponse(conversationId, messages);
     }
 
-    // ===== 消息重做：只截断，重发仍走 /api/chat/stream =====
+    /** 组装某条消息的分支版本信息；该轮从未分叉（无组）时返回 {@code null}，前端据此不渲染切换器。 */
+    private static MessageDto.Turn turnOf(ChatMessage m, Map<String, Integer> versionCounts) {
+        String groupId = m.getTurnGroupId();
+        if (groupId == null || groupId.isBlank()) return null;
+        int version = m.getTurnVersion() == null ? 1 : m.getTurnVersion();
+        int total = versionCounts.getOrDefault(groupId, version);
+        return new MessageDto.Turn(groupId, version, Math.max(total, version));
+    }
+
+    // ===== 对话分支：同一轮提问的多个版本原地并存 =====
 
     /**
-     * 截断会话历史：只保留正序前 {@code keepCount} 条消息，返回删除条数。
+     * 开启新版本的第一步：给目标轮分配（或复用）分支组，返回该组与<b>新版本应取的版本号</b>。
      * <p>
-     * <b>刻意只截断、不重发</b>：前端拿到结果后把待重发的文本交给既有的 {@code /api/chat/stream} ——
-     * 与「先看计划」「局部重规划」同一思路，能复用现成通路就不另起一条，也就不需要在这里关心
+     * <b>刻意只做这一步、不在这里改任何已有消息的状态</b>：前端拿到结果后把新文本 / 新提问交给既有的
+     * {@code /api/chat/stream}（带上 {@code branchGroupId} 与 {@code branchVersion}），由服务端在消息
+     * 确实落库之后才让旧版本失效。本轮有可能根本发不出去（附件处理失败、配额超限、内容安全拒绝），
+     * 那时旧版本必须原样可见 —— 提前失效会让那一轮凭空消失且没有任何报错。
+     * <p>
+     * 与「先看计划」「局部重规划」「模板套用」同一思路：能复用现成通路就不另起一条，这里也就不需要关心
      * 规划 / RAG / 附件的组装逻辑。
      * <p>
-     * 缺请求体时<b>什么都不删</b>（破坏性操作取最保守的默认），而不是当成「全删」。
-     * 副作用是长期记忆水位一并归零（历史都不存在了，指向它的摘要即失效），前端应在返回后刷新记忆面板。
+     * 缺请求体时<b>不猜位置</b>、直接 400 —— 「从哪一条分」没有安全的默认值：猜小了等于截掉大半会话，
+     * 猜大了等于什么都没做，两种都可能被误当成操作成功。
      */
-    @PostMapping("/conversation/{conversationId}/truncate")
-    public Map<String, Object> truncate(@PathVariable String conversationId,
-                                        @RequestBody(required = false) TruncateMessagesRequest request) {
+    @PostMapping("/conversation/{conversationId}/branch")
+    public Map<String, Object> branch(@PathVariable String conversationId,
+                                      @RequestBody(required = false) BranchTurnRequest request) {
         if (request == null) {
-            return Map.of("ok", true, "removed", 0);
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少分叉位置（keepCount）");
         }
-        long removed = conversationService.truncateTo(conversationId, request.keepCount(),
+        TurnBranch b = conversationService.prepareBranch(conversationId, request.keepCount(),
                 AuthContext.require().id());
-        return Map.of("ok", true, "removed", removed);
+        return Map.of("groupId", b.groupId(), "version", b.version());
     }
+
+    /**
+     * 切换某一轮的生效版本（消息上「1/2 ‹ ›」点箭头）。
+     * <p>
+     * 同步接口：改完落库即可，前端重新拉一次历史渲染。切换会让长期记忆水位归零（注入模型的历史整段换了），
+     * 故前端还应顺手刷新记忆面板 —— 否则面板上显示的还是按旧版本压缩出的摘要。
+     */
+    @PostMapping("/conversation/{conversationId}/turn")
+    public Map<String, Object> switchTurn(@PathVariable String conversationId,
+                                          @RequestBody(required = false) SwitchTurnRequest request) {
+        if (request == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少分支组（groupId）与版本号（version）");
+        }
+        conversationService.switchTurnVersion(conversationId, request.groupId(), request.version(),
+                AuthContext.require().id());
+        return Map.of("ok", true, "version", request.version());
+    }
+
 
     // ===== 导出 =====
 

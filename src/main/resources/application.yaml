@@ -140,10 +140,17 @@ agent:
     max-keywords: 5            # 从当前问题抽取的关键词个数上限
     snippet-chars: 300         # 单条召回内容注入与展示的截断长度
 
-  # 工具循环控制(ToolCallProperties)：给 Spring AI 默认无限工具循环装刹车，防死循环/重复调用拖垮 token
+  # 失控刹车(ToolCallProperties)：给 Spring AI 默认无限工具循环装三道刹车，防死循环/重复调用/单轮烧穿。
+  # 三道都是「软刹车」——不抛错，而是把「停止调工具、基于已有信息作答」追加进 system，让模型用已查到的
+  # 中间结果给结论。硬中断会把这轮已花掉的调用结果全丢掉，还得从头再问一遍（且下一轮仍撞同一个上限）。
+  # 代价：软刹车不是硬上限，刹车后仍会多一次模型调用（规划模式下每个被刹住的步骤各一次）。
+  # 触发会写 WARN 日志（含 traceId，可在服务端日志检索整轮链路）并经进度通道播报，不静默；暂不落库。
   tool-call:
     max-iterations: 10        # 模型往返轮数硬顶，覆盖「查表→查数→画图」这类合理长链，只兜底真死循环
     repeat-threshold: 3       # 连续 N 次调同名工具同参即判原地打转、软刹车(基于已有信息作答)
+    round-budget-tokens: 0    # 单轮累计 token 上限(0=不启用)。口径=agent_trace.total_tokens(工具循环内每次
+                              # 调用 + 规划模式跨步骤累加)；与 agent.quota(用户×自然日)是两个维度：
+                              # 配额拦「一天烧太多」，这里拦「一轮烧太多」——多步规划可一轮烧穿当日额度。
 
   # RAG 检索与精排(RagProperties)：粗排召回→精排→编号注入。精排走 DashScope 原生 text-rerank，复用 openai.api-key
   rag:

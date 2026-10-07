@@ -33,7 +33,9 @@
 - **双层记忆**：短期窗口（`chat_message` 原文，受 token 预算与条数下限约束）+ 长期滚动摘要（`conversation.summary` / `core_facts`）；超窗历史异步压缩合并，**先推回复、后处理记忆**。
 - **长期记忆可视化与编辑**：双层记忆此前是纯黑盒 —— 压缩由后端异步完成，用户既看不到「它记住了什么」，也无法纠正记错的内容。顶栏 🧠 记忆把摘要与核心事实摊开可改，并给出「已压缩 N / M 条」的覆盖度（直接回答「它为什么还记着那么早的事」）。**水位 `summarized_count` 只读不可改**：它是「压缩到第几条」的执行游标，手改会让下次合并从错误位置继续；要重置得走「重置全部记忆」（三列一起归零、历史消息保留，下次超窗从头重新摘要）。
 - **流式输出**：SSE 推送 `token`（正文，进记忆）、`progress`（执行过程，不进记忆）、`citations`（引用来源）、`plan`（待确认计划，见「先看计划」）、`approval`（触到审批关卡，见「步骤审批点」）、`review`（并行评审候选，见上）、`recall`（跨会话回忆命中，见上）、`ping`（心跳）、`error` 等事件，前端逐字渲染。**前置链也有实时反馈**：发送后到首个 token 之间，路由判定 / 参数抽取 / 检索问句改写各环节都会先推一条 `progress`，不再是一片空白干等。`review` / `recall` 都排在正文之前：它们是「结论怎么来的 / 用了什么素材」，先给依据再给结论。
-- **消息重做（重新生成 / 编辑重发）**：不必为一句打错的话重开一轮 —— AI 回复可「重新生成」，用户消息可「编辑重发」。两者都是**先把历史截断到目标位置、再交给现成的流式通路重发**，因此没有第二套发送逻辑；截断按「保留前 N 条」定位（刚发出去那一轮前端手里没有主键，却天然知道它是第几条，而 id 单调递增保证两者等价）。**截断会连带把长期记忆水位归零**（历史都不在了，指向它的摘要即失效），代价是下次压缩从头再来 —— 这正是该有的语义。
+- **对话分支（编辑重发 / 重新生成不删历史）**：与 DeepSeek 一致的形态——对某一轮「重新生成」、或对某条用户消息「编辑重发」，**不删旧版本**，而是给这一轮**再开一个版本**；那条**提问**气泡上出现「n / m ‹ ›」版本切换器，点箭头原地翻看同一轮提问的多个版本（提问与其后的助手回复作为一个「分支组」一起换）。这与早前「先截断再重发」只差一个取舍：截断是「旧答案当场消失、原思路回不去」，分支是「旧版本留在库里可翻回」。**开新版本发生在消息确实落库之后**（流式之前只分组、算版本号，绝不提前失效旧版本）——否则附件失败 / 配额拦截 / 发送中断都会让那一轮凭空消失。
+- **分支的落库口径**：`chat_message` 上用三列刻画 —— `turn_group_id`（同轮多版本共用，UUID）、`turn_version`（组内序号，从 1 连续递增，故前端可直接令 `versionCount = version`）、`turn_active`（当前生效版本，同组至多一个为 1）。**`turn_group_id IS NULL` 即「从未分叉」**，存量数据零回填、无需迁移。**读取侧四处共用同一过滤**（`turn_group_id IS NULL OR turn_active = 1`）：喂 prompt 的历史、记忆窗口、消息总数、摘要切片——任一处漏掉都会让「摘要水位按物理行数推进」与「注入侧按生效版本取」错位，裂出既不摘要也不注入的记忆空洞。新版本行还会**把 `created_at` 锚回该组首条的时间**，否则按 `created_at, id` 排序时它会掉到后面几轮之后。
+- **切版本 / 开新版本会重置长期记忆水位**：注入模型的历史整段换了，旧摘要即失效（与「截断重发」同一语义）；切换只改 `turn_active`（先全灭同组、再点亮目标），不动作答内容。
 - **会话导出**：顶栏 ⬇ 导出把当前会话导出为 Markdown（消息全文 + 附件文件名 + RAG 引用来源与相关度）。后端只回文本、由前端拼 Blob 下载 —— 下载必须带 `Authorization`，而浏览器对裸链接的导航请求带不上这个头，走文件通道只会 401。附件刻意只留文件名不留 URL：导出文件要自包含，指向本机 `/files/**` 的链接换台机器就是死链。
 - **链路追踪**：每轮对话的路由来源、规划步骤、改写后检索问句、RAG 命中、工具调用（参数/结果/token/耗时）异步落库 `agent_trace`；页面 🔍 追踪弹窗按**每页 10 条**分页查看本会话最近 50 轮，**只显示自己名下会话的记录**（管理员可切到「全部会话」看全站）。
 - **可观测面板（仅 ADMIN）**：跨会话聚合 `agent_trace` 回答「整体运行得怎么样」——成功率 / 平均耗时 / 平均 token、按天·按形态·按处理方来源·按智能体拆解、以及最慢的 N 轮（定位瓶颈）。独立页 `/observability.html`，与成本看板（讲「花了多少钱」）互补：本面板讲「跑得多快、成不成」。接口与入口都限 ADMIN（跨会话全站聚合口径）。
@@ -45,6 +47,7 @@
 - **以「文件」为管理单元**：上传 → 解析 → 分片 → 向量化入库并登记（`kb_file`）；支持 4 种分片策略（fixed / paragraph / recursive / markdown）与重叠字数、**重新分片**（不重传换策略）、**同名重传=替换**。
 - **向量存储双写**：MySQL 留档（源，向量以 JSON 文本存 `kb_chunk`）+ Chroma 加速副本。检索优先 Chroma（余弦 TopK），不可用/无命中自动降级 MySQL 余弦（有界扫描，防 OOM）；`POST /api/kb/chroma/sync` 幂等回填副本。Chroma 写入统一延后到**事务提交之后**，避免 MySQL 回滚后副本失配。
 - **多模态图片理解**：输入框 🖼 支持多选图片（≤5 张 / 单张 ≤10MB），由视觉模型（默认 `qwen-image-2.0-pro-2026-06-22`，可配）识别成中文 caption 拼入本轮上下文；走 Spring AI 原生多模态（裸 `ChatModel` + `UserMessage.media`，per-request 覆盖模型、多图并发识别）。**原始二进制不进会话存储**——caption 仅当轮可见。
+- **引用回链（从角标一路点回原文）**：回答正文里的 `[n]` 是**可点击角标**，点一下会展开该轮的「引用来源」并高亮第 n 条；来源条目上的「原文」再进一步，按 `chunkId` 拉出**被引用的那段知识块正文**。此前只有「库名 · 文件名 · 相关度」，用户无法判断一句话是文档里写的还是模型编的。取块失败（块被删或重新分片，这在几个月前的老引用上很正常）**明确 404 并说明原因**，不返回空白块——空白块会被读成「文档里本来就是空的」。角标处理只改正文文本段，`<pre>`/`<code>`/`<a>` 内的 `[n]`（代码、数组下标、链接文字）与图表 JSON 一律不动。
 - **文档解析**：附件与知识库支持 txt / md / markdown / csv / json / xml / yml / properties / log / sql 文本，以及 pdf（PDFBox）、docx / xlsx（POI）。
 
 ### 工具调用
@@ -54,7 +57,7 @@
   - **白名单专属**：`tools_json` 为 `NULL`（=挂全量）时**不会**带上它 —— 转交是策略性能力，让翻译/闲聊类智能体凭空获得「可以把活推给别人」的选项容易被误用，且会一次性改变所有既有智能体的行为。要用就在`tools_json` 里显式写 `["call_agent", ...]`。
   - **只做一层**：子智能体执行时挂的是它自己的静态工具，不含 `call_agent`，因此「A 转给 B、B 再转给 C」不会发生，天然无递归与调用环。代价是子智能体不能继续向下转交。
   - 每次转交是一次真实模型往返，按 `SUBAGENT` 用途计入成本看板。
-- **有界工具循环**：Spring AI 默认的「模型调工具」循环是无上限的，模型反复调同一个工具会死循环拖垮 token。已用自定义 Advisor 装上双刹车——**轮数上限**（默认 10 轮，覆盖「查表→查数→画图」合理长链）+ **连续重复检测**（默认连续 3 次同名同参即停），超限走**软刹车**（追加「基于已有信息作答」指令，不抛错中断），配置见 `application.yaml` 的 `agent.tool-call.*`。
+- **有界工具循环**：Spring AI 默认的「模型调工具」循环是无上限的，模型反复调同一个工具会死循环拖垮 token。已用自定义 Advisor 装上三道刹车——**轮数上限**（默认 10 轮，覆盖「查表→查数→画图」合理长链）+ **连续重复检测**（默认连续 3 次同名同参即停）+ **单轮 token 预算**（`round-budget-tokens`，默认 0 = 不启用；读本轮累计用量，规划模式下跨步骤累加）。前两道拦的是「死循环」，第三道拦的是「每一步都合规、合起来烧穿一轮」——多步规划 + 长工具链可以完全绕过前两道而不违反其中任何一条；它与成本配额（用户 × 自然日）是两个维度：配额拦「一天烧太多」，这里拦「一轮烧太多」。三道都走**软刹车**（追加「基于已有信息作答」指令，不抛错中断），因为硬中断会把这一轮已花掉的调用结果全丢掉、还得从头再问（且下一轮仍撞同一个上限），代价是**它不是硬上限**（刹车后仍会多一次模型调用，规划模式下每个被刹住的步骤各一次）。触发写 WARN 日志（含 `traceId`，可在服务端日志检索整轮链路）并经进度通道播报，不静默。配置见 `application.yaml` 的 `agent.tool-call.*`。
 - **按智能体装配**：`agent.tools_json` 控制白名单 —— `NULL`/空 = 挂全量、`[]` = 不挂、`["名"]` = 白名单（按 `@Tool` 名匹配，未指定 name 时即方法名）。未知名忽略、非法 JSON 回退全量。唯一例外是 `call_agent`：它是**动态工具**（实例依赖「调用方是谁」，候选清单随库变化，无法在启动期注册），只认白名单显式声明，`NULL` 全量下不挂。
 - **安全护栏**：SQL 工具仅允许只读 `SELECT`/`WITH`，白名单表名（`SqlSafety.ALLOWED_TABLES` 的 10 张业务表：student / class / teacher / subject / course / score / semester / exam / period / course_arrangement）、拒绝多语句与可执行注释、结果行数上限。业务表与 agent 系统表**同库**，故必须用白名单**显式放行**（黑名单挡不住新表），`conversation`/`chat_message`/`agent` 等系统表一律不可读。
 - **MCP 远端工具**：官方 `spring-ai-starter-mcp-client` 接入的 MCP server 工具经 `McpToolSource` 收进**同一个能力池**（前端分组显示为 `MCP`），与本地工具一样按 `tools_json` 装配。默认**不声明任何 server**，即「不接入」——启动行为与未引入 MCP 时一致。
@@ -329,7 +332,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 智能路由 | 裸 ChatModel 三态 JSON 决策（`{"route":true,"agentCode":"..."}` / `{"route":false}` / `{"route":false,"continue":true}`），Hutool 解析 |
 | 参数追问 | `paramSchema` 声明参数；LLM 从有界历史抽取已确认取值；缺失必填生成 `🔎 还需补充信息`，上限 3 次；**状态每轮重放推导，不落库** |
 | 记忆体系 | 窗口 = 原文预算 + **条数下限**（防单条超预算导致窗口塌缩）+ 单条截断；`DbChatMemory` 与 `MemoryMergeService` 共用同一 `MemoryProperties` 口径。**记忆可视化编辑**（`GET/PUT/DELETE /api/chat/conversation/{id}/memory`）：可查看与订正 `summary` / `core_facts`；手改**只覆盖内容列、不动水位**（`summarized_count` 是执行游标不是展示字段，跟着手改会让下次自动压缩从错位继续），要回退水位只能走「重置全部记忆」（三列归零、消息保留） |
-| 消息重做 | 「重新生成」= 删掉该轮 assistant 回复 → 重发；「编辑重发」= 从该条 user 消息起（连同其后全部消息）截断 → 重发。重发**完全复用 `POST /api/chat/stream`**，不复制任何发送逻辑。**删消息必须同步归零记忆水位**（`summary`/`core_facts`/`summarized_count`），否则摘要指向已不存在的历史 —— 故 `clearMessages` 与 `truncateTo` 共用 `deleteMessagesAfter`（唯一删消息实现），成对关系不可能遗漏。截断按「**保留前 K 条**」定位而非 message id：刚发出的消息前端没有落库主键（SSE 只回内容），用 id 就得每次多查一次库 |
+| 对话分支 | 「重新生成」/「编辑重发」不再删历史，而是给该轮**再开一个版本**，旧版本留库可翻回。`chat_message` 三列：`turn_group_id` / `turn_version` / `turn_active`；`turn_group_id IS NULL` 即从未分叉（存量零回填）。**两段式**：`prepareBranch`（流式前只分组 + 算版本号，**不失效旧版本**）→ `markRoundBranch`（消息落库后打标，`marked == 0` 则旧版本保持生效）。**读取侧四处同口径**（`turn_group_id IS NULL OR turn_active = 1`）：`getHistory` / `getRecentHistory` / `countMessages` / `getMessagesRange`，漏一处即裂出记忆空洞。新版本 `created_at` 锚回该组首条时间以占回原位；切换 / 开版本重置记忆水位。重发**完全复用 `POST /api/chat/stream`**，不复制任何发送逻辑 |
 | 步骤间产物传递 | 前驱产出注入下一步输入时按配额截断（`min(upstream-max-chars, upstream-total-chars / 前驱个数)`），超额保留前段 + 显式省略标注 + WARN；只作用于**注入**，不影响 `task_step.output` 落库与最终回复 |
 | 规划模板 | 跑顺的规划可存成模板（`task_template.steps_json`）。**存快照 JSON、不引用 `task_step`**：那张表带 `status`/`output`/`retry_count` 等运行态列，且局部重规划（`replanTail`）会删改甚至重排行，引用式模板会被连带破坏。步骤只记 `agentCode` 不记展示名（智能体改名不该让模板失效），依赖落库前经 `TaskStep#strictPriorDeps` 净化 —— 只留严格前序，同时天然杜绝依赖环（所以不需要单独的环检测） |
 | 子智能体上下文隔离 | 规划步骤的 system 分三档拼装：**首层**吃「已确认参数」、**末层（汇总步）**追加近期窗口历史、**中间步骤**默认不注入会话长期记忆（`conversation.summary` / `core_facts`）。中间步的活是「拿前驱产物做自己那一段」，会话级摘要往往是别的话题、反而把这一步带偏；开关 `agent.planner.isolate-middle-steps`（**RAG 资料不参与隔离**——每步 query 不同、按各自需要检索，与「会话记忆」不是一回事） |
@@ -408,7 +411,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | DELETE | `/api/chat/conversation/{id}` | 删除会话及全部消息（仅本人） |
 | GET | `/api/chat/conversations` | **当前用户**的会话列表（按最近更新倒序） |
 | GET | `/api/chat/history?conversationId=` | 读取会话历史消息（仅本人） |
-| POST | `/api/chat/conversation/{id}/truncate` | 截断历史：只保留正序前 N 条（body `{keepCount}`），支撑「重新生成 / 编辑重发」；缺请求体时不删任何东西（仅本人） |
+| POST | `/api/chat/conversation/{id}/branch` | **开新版本**：为第 `keepCount` 条（1 基，必须是 user 提问）那一轮分组并返回 `{groupId, version}`；未分组则新建组、旧轮记第 1 版、返回 `version=2`，已分组则 `max(turn_version)+1`。**只分组、不改生效版本**（失效延后到落库后）；缺请求体 400（分支位置没有安全默认值；仅本人） |
+| POST | `/api/chat/conversation/{id}/turn` | **切换版本**：body `{groupId, version}`，把该组其余版本 `turn_active` 置 0、目标置 1，并重置记忆水位；版本不存在 404（仅本人） |
 | GET | `/api/chat/conversation/{id}/export` | 导出会话为 Markdown，返回 `{filename, content}` 由前端拼 Blob 下载（仅本人） |
 | GET | `/api/chat/conversation/{id}/memory` | 读取长期记忆快照：摘要 / 核心事实 / 已压缩条数 / 消息总数（仅本人） |
 | PUT | `/api/chat/conversation/{id}/memory` | 覆写摘要与核心事实（body `{summary, coreFacts}`，**不动水位**；空白即清空该字段；仅本人） |
@@ -455,6 +459,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | PUT | `/api/kb/{id}` | 更新知识库 |
 | DELETE | `/api/kb/{id}` | 删除知识库（级联删块、文件与向量副本） |
 | GET | `/api/kb/{id}/chunks` | 分页查看知识块 |
+| GET | `/api/kb/chunk/{chunkId}` | **单块原文**（引用回链「查看原文」用）→ `{chunkId, kbId, kbName, source, content}`，**不含 embedding**；块不存在 → 404 + 原因 |
 | POST | `/api/kb/{id}/chunks` | 手动追加知识块 |
 | DELETE | `/api/kb/{id}/chunks/{chunkId}` | 删除单个知识块（校验块归属） |
 | POST | `/api/kb/{id}/upload` | 上传文件（multipart `files` + `chunkStrategy` + `overlap`），同名重传=替换 |
@@ -546,7 +551,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 表 | 关键列 | 说明 |
 |---|---|---|
 | `conversation` | id, **user_id**, title, agent_id, planner, **planner_confirm**, agent_bind_source, rag_enabled, **review_enabled**, **cross_session**, summary, summarized_count, core_facts | 会话：**归属用户（按 user_id 隔离，仅本人可见）**、绑定智能体、规划开关 / 规划「先看计划」开关、RAG 开关、并行评审开关、跨会话搜索开关、滚动摘要与核心事实。**规划与评审互斥**（都是编排形态，开启任一方会自动关掉另一方） |
-| `chat_message` | id, conversation_id, role, content, attachments_json, citations_json, created_at | 消息明细；附件元数据与引用来源**独立列**，不进记忆、不占 token |
+| `chat_message` | id, conversation_id, role, content, attachments_json, citations_json, **turn_group_id**, **turn_version**, **turn_active**, created_at | 消息明细；附件元数据与引用来源**独立列**，不进记忆、不占 token。**分支版本三列**：`turn_group_id`（同轮多版本共用 UUID，NULL=从未分叉）/ `turn_version`（组内序号，从 1 连续递增）/ `turn_active`（当前生效版本，同组至多一个为 1）；读取侧统一 `turn_group_id IS NULL OR turn_active = 1`，存量数据零回填 |
 | `agent` | id, name, agent_code, icon, description, system_prompt, param_schema, tools_json, model, temperature, avatar_color | 智能体：人设、参数清单、工具白名单、模型/温度覆盖 |
 | `kb` | id, name, agent_id, description, doc_count, chunk_strategy, chunk_overlap | 知识库；`agent_id` 为空即通用全局库 |
 | `kb_chunk` | id, kb_id, content, source, embedding, created_at | 知识块；`embedding` 为向量 JSON 文本（MySQL 源） |
@@ -580,7 +585,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 - **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）；右侧动作区**整体靠最右**，依次为 ⬇ 导出（无会话时不显示）、🧠 记忆（无会话时不显示）、🔍 追踪（无会话时不显示）、💰 成本（仅 ADMIN）、🧪 评测（仅 ADMIN）、📊 可观测（仅 ADMIN，跳 `/observability.html`）、🎓 教务系统（跳 `/edu.html`，与 edu 页的「前往 AI 对话」互为对称入口）、以及**登录用户区**。靠右由容器 `.header-actions` 统一负责（`margin-left:auto` + `gap`），各按钮不自带 `margin-left` —— 否则「追踪」这类条件渲染的按钮一缺席，整组就会塌回标题旁边。按角色显隐的入口读页面级 `isAdmin`（setup 时从 `Auth.hasRole('ADMIN')` 取一次存进 `ref`）—— `Auth.getUser()` 读 localStorage、不是响应式的，模板里直接调它只会求值一次。
 - **登录用户区（四页统一，只有一个用户名）**：顶栏不再出现裸露的「退出」按钮 —— 点击用户名展开下拉：**个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录**。四页（index / chat / edu / user）都是 `js/auth.js` 渲染到 `data-auth-nav` 挂载点的**同一份实现**，页面自身不含登录逻辑；细节见「登录」一节。
 - **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）、以及规划开关开启时出现的 **「先看计划」开关**（规划只产出计划并暂停，确认后才执行）。处于「编辑重发」态时，输入区顶部会出现**编辑提示条**（原消息已填回输入框，右侧一间取消按钮），发送即先截断再重发。输入区底部另有**配额刻度**（`v-if="quota.enabled && !quota.exempt"`）：显示「已用 / 上限」，用量到 90% 时整条转警示色 —— 只在配额开关打开且本人不豁免时出现，平时不占位置。
-- **消息级重做**：鼠标悬停任一消息气泡浮现动作区（默认 `opacity:0`，`.msg:hover` 才显示）—— assistant 消息给「重新生成」，user 消息给「编辑重发」。**重新生成**从该轮回复处截断后立刻原样重发；**编辑重发**把原 user 消息填回输入框、进入编辑态，改完发送时先截断到该条再发。两条路都复用现成的流式通路，截断失败会中止并保留编辑态（不静默丢掉用户已改的内容）。
+- **对话分支（版本切换器）**：鼠标悬停任一消息气泡浮现动作区（默认 `opacity:0`，`.msg:hover` 才显示）—— assistant 消息给「重新生成」，user 消息给「编辑重发」，以及**该轮已有多版本时挂在提问上的「n / m ‹ ›」切换器**（切一次提问与回答一起换）。**重新生成** / **编辑重发**都先调 `POST …/branch` 开新版本，再走现成的流式通路发送（不复制发送逻辑）；开版本失败会中止并保留编辑态（不静默丢掉用户已改的内容）。**切换器只在 `versionCount > 1` 时出现**（未分叉的轮不挂），首 / 末版本对应的箭头置灰。生成中这些按钮一律不出现——正在写入的那一轮尚未落库，此时切换只能拿到一份对不上眼前所见的历史。
+- **引用回链（气泡内）**：正文里的 `[n]` 是蓝色可点角标，点一下展开该轮「引用来源」并把第 n 条高亮（2 秒后自动褪去，用背景闪烁而非描边 —— 不改行高就不会让列表滚动位置跳动）；找不到对应序号会明确提示「可能是模型自行标注的角标」，而不是点了没反应。来源条目右侧的「原文」按钮打开**引用原文弹窗**（库名 / 文件名 / 块号 + 知识块正文按原样 `pre-wrap` 展示），取块失败时弹窗内显示后端给的原因；追踪弹窗的引用来源同样带这个入口。
 - **计划卡片（「先看计划」开启时）**：规划暂停后，AI 气泡内呈现计划卡片 —— 步骤清单（序号 / 智能体 / 指令 + 每步一个「需审批」勾选框）+ 「执行计划」按钮，右上角标 `待确认 / 执行中… / 已执行`。点按钮走的就是断点续跑通路。刷新后卡片消失（`plan` 事件不落库），但**顶部「执行计划」提示条仍在** —— 它是计划卡片之外的第二入口，保证刷新后仍能接着执行。**勾选「需审批」的步骤执行到时会停下来**，页面弹出**审批卡片**（刻意的琥珀色调，与蓝色计划卡片区分「等你决定」）：显示第几步 / 共几步、智能体名与指令，并提供「批准并继续」与「终止计划」两个动作。勾选状态**失败会回滚到原值**（不让界面显示成已生效）。
 - **记忆面板（🧠 记忆）**：把此前完全黑盒的双层记忆摊开 —— 显示滚动摘要、核心事实、覆盖度（`summarized_count` / 消息总数）与两个可编辑文本框（摘要在上、核心事实在下）。可**订正内容**（保存只覆盖这两个字段、不动水位），也可**重置全部记忆**（三列归零、历史消息保留）。面板内向用户明说：改内容不影响历史消息、重置后记忆会从头重新压缩。
 - **会话导出（⬇ 导出）**：把当前会话导出为 Markdown（含每轮的 user/assistant 正文、附件文件名、RAG 引用来源）。**不走 `/files/**` 文件通道** —— 下载要带 `Authorization`，而浏览器对 `<a href>` 导航带不上该头，走文件通道必 401；故后端只回 `{filename, content}`，前端拼 `Blob` 下载。
