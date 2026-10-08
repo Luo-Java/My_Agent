@@ -479,6 +479,30 @@ header {
     border-color: rgba(148, 163, 184, .5);
 }
 
+/* 卡住的那一步（失败且重试用尽）的提示文字：琥珀色，与下方「跳过」按钮成对出现 ——
+   只报问题不给出口，用户只能干看着。单行省略，避免长智能体名把提示条撑成两行。 */
+.resume-bar-stuck {
+    flex: none;
+    max-width: 42%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #fbbf24;
+    font-size: 12px;
+}
+
+/* 暂停按钮：琥珀描边，与蓝色的「继续执行」明确区分——它是中断类动作，不该被当成主路径。
+   与 .resume-bar-btn 同特异性，靠源顺序覆盖（见上方 ghost 的同类说明）。 */
+.resume-bar-btn-warn {
+    border-color: rgba(251, 191, 36, .45);
+    background: rgba(251, 191, 36, .12);
+    color: #fcd34d;
+}
+.resume-bar-btn-warn:hover:not(:disabled) {
+    background: rgba(251, 191, 36, .22);
+    border-color: rgba(251, 191, 36, .7);
+}
+
 /* ===== 待确认计划卡片（规划模式「先看计划」开关开启时，AI 气泡内） =====
    规划暂停后展示步骤清单与「执行计划」按钮；配色沿用规划主题的蓝色（与 .resume-bar 同族）。
    点按钮走的就是断点续跑通路，因此按钮的禁用条件与续跑一致（loading）。 */
@@ -2074,6 +2098,9 @@ button {
     background: var(--primary-soft);
     padding: 3px 10px;
     border-radius: 999px;
+    /* 胶囊里换行会把「⏳ 参数补全 2/3」拆成「参数补 / 全 2/3」—— 顶部一挤就发生，且只有截图看得出来。
+       徽标一律不折行：挤不下时应当整体换位 / 溢出，而不是把文字劈成两半。 */
+    white-space: nowrap;
 }
 
 /* 顶部规划模式徽标（与智能体徽标区分色） */
@@ -2092,6 +2119,13 @@ button {
 .cross-badge {
     color: #7dd3fc;
     background: rgba(56, 189, 248, .16);
+}
+
+/* 参数补全（澄清追问）进行中的提示：与 `.input-hint` 同槽位（本轮行为说明），但用玫红强调「等你补信息」。
+   刻意不做成顶部徽标 —— 顶部那排是会话级开关，澄清是交互态；且顶部行已满，硬加会把标题挤到折行。 */
+.clarify-hint {
+    color: #fda4af;
+    font-weight: 500;
 }
 
 .empty-sub {
@@ -3316,6 +3350,8 @@ button {
     color: var(--text);
     margin-right: 6px;
 }
+/* 「本轮未自评」这类说明性短句：比正文再淡一档，避免与真实的自评结果抢注意力 */
+.trace-kv-muted { color: var(--text-soft); opacity: .85; }
 
 .trace-block { margin-top: 8px; }
 
@@ -3626,6 +3662,20 @@ button {
 .eval-batch-stat { color: var(--text); }
 .eval-batch-extra { color: var(--text-soft); }
 
+/* 库内用例（来自反馈）：与种子用例的视觉区分只体现在左边框色上 —— 它是同一个池子里的东西，
+   不该被当成另一类功能。左侧色条复用 .eval-item 的 border-left 机制，改个色即可。 */
+.eval-item.eval-src-db { border-left-color: var(--primary-text); }
+.eval-src-note { margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--text-soft); opacity: .8; }
+.eval-src-db .eval-item-head { justify-content: flex-start; gap: 8px; }
+.eval-src-db .eval-item-tag { margin-left: auto; }
+.eval-del {
+    flex: none; margin-left: 8px;
+    background: transparent; border: 1px solid var(--border); color: var(--text-soft);
+    font-size: 11px; padding: 2px 8px; border-radius: 6px; cursor: pointer; font-family: inherit;
+}
+.eval-del:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+.eval-del:disabled { opacity: .4; cursor: default; }
+
 /* ===== 消息重做（重新生成 / 编辑重发）与版本切换 =====
    操作条默认透明、悬停整条消息才浮现：每条消息常驻两个按钮会把阅读区变成工具栏。 */
 .msg-actions {
@@ -3637,6 +3687,8 @@ button {
 }
 .msg:hover .msg-actions { opacity: 1; }
 .msg.user .msg-actions { justify-content: flex-end; }
+/* 面板展开时把动作条钉住：鼠标移到下方的表单上时，触发按钮不该跟着隐形 —— 否则「展开的是哪一条」看不出来。 */
+.msg-actions.actions-pinned { opacity: 1; }
 
 .msg-act {
     background: transparent;
@@ -3752,6 +3804,45 @@ button {
 .mem-reset:hover:not(:disabled) { background: rgba(248, 113, 113, .1); }
 .mem-spacer { flex: 1; }
 
+/* ===== 长期事实条目（逐条可改可删，记忆面板内）=====
+   与上面的「当前窗口」列表同处一个弹窗，故用同一套视觉语言（行、角色、字数标签），
+   只在「来源标签」上做区分：手动=青色、自动=灰 —— 用户据此判断哪条不会被自动整理动到。 */
+.mem-facts { margin-bottom: 16px; }
+.mem-fact-count { margin-left: 6px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.mem-fact-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.mem-fact-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 8px; font-size: 12.5px;
+}
+.mem-fact-item:hover { background: var(--surface); }
+.mem-fact-text { flex: 1; color: var(--text); word-break: break-word; }
+.mem-fact-tag {
+    flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px;
+    background: var(--surface); color: var(--text-soft);
+}
+.mem-fact-src { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px; }
+.mem-fact-src.is-user { color: var(--cyan); background: rgba(34, 211, 238, .12); }
+.mem-fact-src.is-merge { color: var(--text-soft); background: var(--surface); }
+/* 行内编辑：主题下拉与输入框在同一行，避免展开成一块表单把列表挤散 */
+.mem-fact-add { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.mem-fact-topic {
+    flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); font-size: 12.5px; padding: 5px 6px;
+}
+.mem-fact-input {
+    flex: 1; min-width: 0; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-family: inherit; font-size: 12.5px; padding: 6px 10px;
+}
+.mem-fact-input:focus { outline: none; border-color: var(--border-strong); }
+.mem-mini {
+    flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text-soft); cursor: pointer; font-size: 12px; padding: 4px 10px;
+}
+.mem-mini:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.mem-mini:disabled { opacity: .5; cursor: not-allowed; }
+.mem-mini.is-primary { color: var(--primary-text); border-color: rgba(99, 102, 241, .35); }
+.mem-mini.is-danger { color: var(--danger); border-color: rgba(248, 113, 113, .3); }
+
 /* ===== 智能体导入 / 导出（管理页工具条）===== */
 .ag-io-btn { padding: 8px 14px; font-size: 13px; }
 
@@ -3864,3 +3955,138 @@ button {
     opacity: .75;
 }
 .quota-hint.warn { color: #fbbf24; opacity: 1; }
+
+
+/* ===== 记忆透明化：单条排除开关 / 当前窗口 / 本轮注入 ===== */
+/* 单条「不参与记忆」开关（消息动作区）。与其它动作按钮同排，但要能表达「已排除」这个持续状态 ——
+   故用主色弱底而不是悬停才变色：一眼能看出哪几条模型看不到。 */
+.mem-act { flex: none; }
+.mem-act:disabled { opacity: .35; cursor: default; }
+.mem-act:disabled:hover { color: var(--text-soft); border-color: var(--border); background: transparent; }
+.mem-act-on {
+    color: var(--primary-text);
+    border-color: var(--border-strong);
+    background: var(--primary-soft);
+}
+
+/* ===== 消息反馈（👎 → 回归用例）===== */
+/* 反馈按钮与其它动作按钮同排。已反馈要能一眼看出（点踩用 danger 弱底），因为它是个持续状态而不是一次动作；
+   未反馈时保持中性 —— 不给「还没评价」加任何视觉权重，否则整屏消息都在催你点踩。 */
+.fb-act { flex: none; }
+.fb-act:disabled { opacity: .35; cursor: default; }
+.fb-act:disabled:hover { color: var(--text-soft); border-color: var(--border); background: transparent; }
+.fb-act-on {
+    color: var(--primary-text);
+    border-color: var(--border-strong);
+    background: var(--primary-soft);
+}
+.fb-act.fb-act-down {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: rgba(248, 113, 113, .12);
+}
+
+/* 反馈表单：展开在消息下方（评价对象就在眼前，弹窗会把它挡掉）。
+   表单自身没有淡入规则，但它上面那一行动作按钮挂了 .actions-pinned —— 否则鼠标一移开按钮就隐形，
+   用户会以为面板是个孤儿块（见 .msg-actions.actions-pinned）。 */
+.fb-panel {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+}
+.fb-row { display: flex; align-items: center; gap: 8px; }
+.fb-row-end { justify-content: flex-end; margin-top: 8px; }
+.fb-label { font-size: 12px; color: var(--text-soft); flex: none; }
+.fb-spacer { flex: 1; }
+.fb-comment {
+    width: 100%;
+    margin-top: 8px;
+    box-sizing: border-box;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12.5px;
+    line-height: 1.5;
+    resize: vertical;
+}
+.fb-comment:focus { outline: none; border-color: var(--border-strong); }
+.fb-comment:disabled { opacity: .6; }
+.fb-hint { margin-top: 6px; font-size: 11.5px; line-height: 1.55; color: var(--text-soft); }
+.fb-hint-ok { color: var(--online); }
+.fb-error { margin-top: 6px; font-size: 12px; color: var(--danger); }
+.fb-btn {
+    flex: none; font-family: inherit; font-size: 12px;
+    padding: 4px 12px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--text-soft);
+}
+.fb-btn:disabled { opacity: .45; cursor: default; }
+.fb-btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.fb-btn-primary {
+    border-color: var(--border-strong); background: var(--primary-soft); color: var(--primary-text);
+}
+.fb-btn-primary:hover:not(:disabled) { background: var(--primary-soft); filter: brightness(1.15); }
+/* 「这条其实没问题」：改票入口。做成文字链而不是按钮 —— 它不该和「提交」抢注意力。 */
+.fb-link {
+    flex: none; background: transparent; border: 0; padding: 0;
+    font-family: inherit; font-size: 12px; color: var(--text-soft);
+    text-decoration: underline; text-underline-offset: 3px; cursor: pointer;
+}
+.fb-link:hover:not(:disabled) { color: var(--text); }
+.fb-link:disabled { opacity: .45; cursor: default; }
+
+/* 当前记忆窗口（记忆面板）：本轮会注入的那几条历史。列表限高滚动 —— 长会话窗口可能有十几条，
+   不限高会把弹窗撑到屏幕外，摘要输入框就被挤没了。 */
+.mem-win { margin-bottom: 16px; }
+.mem-win-count { margin-left: 6px; font-variant-numeric: tabular-nums; }
+.mem-win-list {
+    list-style: none;
+    margin: 0;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    max-height: 180px;
+    overflow-y: auto;
+}
+.mem-win-list li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--border);
+}
+.mem-win-list li:last-child { border-bottom: 0; }
+.mem-win-role { flex: none; font-size: 11.5px; color: var(--text-soft); }
+.mem-win-user .mem-win-role { color: var(--primary-text); }
+/* 单行省略：预览本来就是「认出是哪条」，不是「读完它」；换行会让列表高度随内容乱跳 */
+.mem-win-text {
+    flex: 1;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.mem-win-chars { flex: none; font-size: 11.5px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.mem-win-empty { padding: 8px 2px; font-size: 12.5px; color: var(--text-soft); }
+.mem-win-hint { margin-top: 6px; font-size: 12px; color: var(--text-soft); }
+
+/* 本轮注入记忆（追踪详情）。与记忆面板的窗口列表同构，但一行更紧凑 —— 追踪里要跟
+   规划 / 工具 / 引用几段并排，行高不收敛会显得很散。 */
+.trace-mem { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12.5px; }
+.trace-mem-role { flex: none; font-size: 11.5px; color: var(--text-soft); }
+.mem-role-user { color: var(--primary-text); }
+.trace-mem-text {
+    flex: 1;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.trace-mem-chars { flex: none; font-size: 11.5px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.trace-mem-none { padding: 4px 0; font-size: 12.5px; color: var(--text-soft); }

@@ -3,13 +3,18 @@ package org.luo.ai.controller;
 import org.luo.ai.dto.AttachmentDto;
 import org.luo.ai.dto.BranchTurnRequest;
 import org.luo.ai.dto.ConversationExport;
+import org.luo.ai.dto.ConversationFactDto;
+import org.luo.ai.dto.ConversationFactRequest;
 import org.luo.ai.dto.ConversationMemory;
 import org.luo.ai.dto.ConversationSummary;
 import org.luo.ai.dto.CreateConversationRequest;
 import org.luo.ai.dto.CrossSessionRequest;
+import org.luo.ai.dto.FeedbackRequest;
 import org.luo.ai.dto.HistoryResponse;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.dto.MessageDto;
+import org.luo.ai.dto.MessageFeedbackDto;
+import org.luo.ai.dto.MemoryExcludedRequest;
 import org.luo.ai.dto.NewConversationResponse;
 import org.luo.ai.dto.PlannerConfirmRequest;
 import org.luo.ai.dto.PlannerEnabledRequest;
@@ -22,8 +27,11 @@ import org.luo.ai.dto.UpdateMemoryRequest;
 import org.luo.ai.entity.Agent;
 import org.luo.ai.entity.ChatMessage;
 import org.luo.ai.entity.Conversation;
+import org.luo.ai.memory.MemoryViewService;
 import org.luo.ai.service.AgentService;
+import org.luo.ai.service.ConversationFactService;
 import org.luo.ai.service.ConversationService;
+import org.luo.ai.service.FeedbackService;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.system.security.AuthContext;
@@ -56,7 +64,11 @@ import java.util.Map;
  *       {@code /api/chat/stream}，故不需要第二套执行逻辑；</li>
  *   <li><b>导出</b>：GET …/{id}/export —— 回 Markdown 文本，由前端拼 Blob 下载（裸链接带不上
  *       {@code Authorization}）；</li>
- *   <li><b>长期记忆</b>：GET/PUT/DELETE …/{id}/memory —— 把此前全黑盒的摘要 / 核心事实摊开给用户看与改。</li>
+ *   <li><b>长期记忆</b>：GET/PUT/DELETE …/{id}/memory —— 把此前全黑盒的逐条事实 / 归档 / 摘要摊开给用户看与改；
+ *       同一个 GET 还回「当前记忆窗口构成」（哪些历史会被注入），与追踪弹窗的「本轮注入」互为印证；
+ *       逐条事实另有 POST / PUT / DELETE …/{id}/facts[/{factId}] 三个端点（功能 E）；</li>
+ *   <li><b>记忆参与</b>：PUT …/message/{messageId}/memory-excluded —— 单条开关「不参与记忆」：不进上下文、
+ *       不进摘要，但<b>历史里照常可见</b>（「不进记忆」不等于「删掉」）。</li>
  * </ul>
  * <p>
  * <b>会话按用户隔离</b>：每个端点先经 {@link AuthContext#require()} 取当前登录用户，所有读写都带该用户；
@@ -68,10 +80,21 @@ public class ConversationController {
 
     private final ConversationService conversationService;
     private final AgentService agentService;
+    /** 记忆窗口视图（只读）：给记忆面板列出「当前会注入哪些历史」。 */
+    private final MemoryViewService memoryViewService;
+    /** 长期事实条目：逐条增删改（功能 E）；会话归属由本类先校验，见各端点注释。 */
+    private final ConversationFactService factService;
+    /** 消息反馈：点踩落库与回显（转用例在 EvalController，那边限 ADMIN）。 */
+    private final FeedbackService feedbackService;
 
-    public ConversationController(ConversationService conversationService, AgentService agentService) {
+    public ConversationController(ConversationService conversationService, AgentService agentService,
+                                  MemoryViewService memoryViewService, ConversationFactService factService,
+                                  FeedbackService feedbackService) {
         this.conversationService = conversationService;
         this.agentService = agentService;
+        this.memoryViewService = memoryViewService;
+        this.factService = factService;
+        this.feedbackService = feedbackService;
     }
 
     /** 开启新会话并返回会话 ID；绑定智能体与规划模式互斥（绑定时以其名称作为会话初始标题）。会话归属当前登录用户。 */
@@ -170,7 +193,7 @@ public class ConversationController {
         return conversationService.listConversations(AuthContext.require().id()).stream()
                 .map(c -> new ConversationSummary(c.getId(), c.getTitle(), c.getUpdatedAt(),
                         c.getAgentId(), c.getPlanner(), c.getRagEnabled(), c.getPlannerConfirm(),
-                        c.getReviewEnabled(), c.getCrossSession()))
+                        c.getReviewEnabled(), c.getCrossSession(), c.getClarifyAsked(), c.getClarifyMax()))
                 .toList();
     }
 
@@ -186,10 +209,11 @@ public class ConversationController {
         // 版本总数必须单独查全量行：历史本身已过滤掉未生效版本，只看它每组永远只有 1 版、切换器根本不出现
         Map<String, Integer> versionCounts = conversationService.turnVersionCounts(conversationId);
         List<MessageDto> messages = conversationService.getHistory(conversationId).stream()
-                .map(m -> new MessageDto(m.getRole(), m.getContent(),
+                .map(m -> new MessageDto(m.getId(), m.getRole(), m.getContent(),
                         AttachmentDto.parse(m.getAttachmentsJson()),
                         KbCitation.parse(m.getCitationsJson()),
-                        turnOf(m, versionCounts)))
+                        turnOf(m, versionCounts),
+                        Boolean.TRUE.equals(m.getMemoryExcluded())))
                 .toList();
         return new HistoryResponse(conversationId, messages);
     }
@@ -262,22 +286,88 @@ public class ConversationController {
                 conversationService.exportMarkdown(c));
     }
 
+    // ===== 记忆参与：单条开关（不进上下文、不进摘要，但历史仍可见）=====
+
+    /**
+     * 把某条消息标记为「不参与记忆」，或取消该标记。
+     * <p>
+     * <b>副作用必须说清</b>：这会重置该会话的摘要<b>游标</b>（{@code summarized_count} 归零）—— 可见消息的
+     * 构成刚变了，游标指向的那段历史不再是原来那段。摘要与记忆内容的<b>内容保留</b>，下次超窗时会连它们
+     * 一起重新压一遍，故不丢信息，只多一次合并开销。响应里的 {@code memoryCursorReset} 就是给前端提示
+     * 这件事用的（前端据此告诉用户「记忆已重新整理」，而不是让这次重置悄悄发生）。
+     * <p>
+     * 缺请求体（或没带 {@code excluded}）直接 400：这个开关没有安全的默认值 —— 猜 {@code true} 会把用户
+     * 没想排除的消息排出上下文，猜 {@code false} 会让一次「排除」静默变成空操作，两种都会被当成操作成功。
+     */
+    @PutMapping("/message/{messageId}/memory-excluded")
+    public Map<String, Object> updateMemoryExcluded(@PathVariable Long messageId,
+                                                   @RequestBody(required = false) MemoryExcludedRequest request) {
+        if (request == null || request.excluded() == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST,
+                    "缺少 excluded（true=不参与记忆，false=恢复参与）");
+        }
+        boolean changed = conversationService.setMessageMemoryExcluded(messageId, request.excluded(),
+                AuthContext.require().id());
+        return Map.of("excluded", request.excluded(), "memoryCursorReset", changed);
+    }
+
+    // ===== 消息反馈（点踩 → 回归用例的第一步）=====
+
+    /**
+     * 提交 / 更新对某条助手回复的反馈（👍 / 👎）。
+     * <p>
+     * <b>一人对一条消息一票</b>：重复提交是<b>改票</b>（原地覆盖），不追加历史 —— 否则「先踩后赞」会留下两条
+     * 互相矛盾的记录，转回归用例时不知道该信哪条。首次提交时快照那一轮的用户输入，供后续转用例当输入用。
+     * <p>
+     * 归属按「消息所属会话」判定：他人的消息与不存在的消息统一 404，避免 {@code messageId} 变成存在性探针。
+     * 只接受助手回复（给自己的提问点踩没有意义）。
+     */
+    @PutMapping("/message/{messageId}/feedback")
+    public MessageFeedbackDto feedback(@PathVariable Long messageId,
+                                       @RequestBody(required = false) FeedbackRequest request) {
+        if (request == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少反馈内容（rating）");
+        }
+        return feedbackService.submit(messageId, AuthContext.require().id(), request);
+    }
+
+    /**
+     * 某会话下的全部反馈：前端按 {@code messageId} 合并到消息上，用于回显「已反馈」与预填原因 / 备注。
+     * <p>
+     * 刻意<b>不做进 history 响应</b>：历史是「说了什么」，反馈是「怎么看这句话」，两者变化频率与读取时机都
+     * 不同 —— 合成一个响应会让每次翻历史都白拉一遍反馈，也让 {@code MessageDto} 多一个只有前端标记用途的字段。
+     */
+    @GetMapping("/conversation/{conversationId}/feedback")
+    public List<MessageFeedbackDto> feedbackList(@PathVariable String conversationId) {
+        return feedbackService.listByConversation(conversationId, AuthContext.require().id());
+    }
+
     // ===== 长期记忆（把黑盒摊开给用户看与改）=====
 
     /**
-     * 读取会话的长期记忆：滚动摘要、核心事实、已摘要条数（游标）、消息总数。
-     * 这是「模型为什么突然提到某件旧事」的唯一解释入口。仅本人会话可读。
+     * 读取会话的长期记忆：逐条长期事实、旧版事实归档、滚动摘要、已摘要条数（游标）、消息总数，以及
+     * <b>当前记忆窗口构成</b>（哪些历史会被注入）与被排除条数。这是「模型为什么突然提到某件旧事 /
+     * 为什么忘了某件事」的唯一解释入口。
+     * <p>
+     * 窗口用的是与真实注入完全相同的窗口算法（见 {@code MemoryViewService}），故这里列出的就是模型能看到的那些条；
+     * 不含本轮提问（提问在读取之后才被追加进上下文）。仅本人会话可读。
+     * <p>
+     * <b>事实的注入规则要照实显示</b>：条目非空时注入条目，只有一条条目都没有时才回退注入旧归档
+     * （见 {@code ConversationFactService#injectableFactsText}）—— 归档与条目同时存在时归档<b>不生效</b>。
      */
     @GetMapping("/conversation/{conversationId}/memory")
     public ConversationMemory memory(@PathVariable String conversationId) {
         Conversation c = conversationService.requireOwned(conversationId, AuthContext.require().id());
         return new ConversationMemory(c.getSummary(), c.getCoreFacts(),
                 c.getSummarizedCount() == null ? 0 : c.getSummarizedCount(),
-                conversationService.countMessages(conversationId));
+                conversationService.countMessages(conversationId),
+                conversationService.countExcluded(conversationId),
+                memoryViewService.window(conversationId),
+                factService.listDto(conversationId));
     }
 
     /**
-     * 覆写摘要与核心事实。<b>水位不在请求范围内</b>（它是执行游标，手改会让下次自动压缩从错位继续）；
+     * 覆写摘要与旧版事实归档。<b>水位不在请求范围内</b>（它是执行游标，手改会让下次自动压缩从错位继续）；
      * 两个字段都传空即「清空内容、保留游标」，要连游标一起清零请走 DELETE。
      */
     @PutMapping("/conversation/{conversationId}/memory")
@@ -289,9 +379,62 @@ public class ConversationController {
                 AuthContext.require().id());
     }
 
-    /** 重置长期记忆：摘要 / 核心事实 / 水位三列归零，<b>消息保留</b>（下次超窗会从头重新摘要）。 */
+    /** 重置长期记忆：摘要 / 旧版归档 / 水位归零，<b>并作废自动整理出来的事实条目</b>，消息保留
+     *（下次超窗会从头重新摘要）。用户手加的事实条目不受影响。 */
     @DeleteMapping("/conversation/{conversationId}/memory")
     public void resetMemory(@PathVariable String conversationId) {
         conversationService.resetMemory(conversationId, AuthContext.require().id());
+    }
+
+    // ===== 长期事实条目：逐条增删改（功能 E）=====
+
+    /**
+     * 新增一条长期事实。
+     * <p>
+     * <b>手加的条目永远不会被自动合并覆盖或删除</b>（来源记为 USER，与模型整理出的 MERGE 分开待遇）；
+     * 若内容与某条自动整理出来的条目完全重合，则把它<b>转成手动</b>而不是报重复 —— 用户再写一遍的意图
+     * 就是「这条我要留着」。只有与已有手动条目重复才报 400。
+     * <p>
+     * 归属校验走 {@code requireOwned}（与 GET /memory 同一形状）：{@code ConversationFactService} 刻意
+     * 不做校验，为的是不让它反向依赖 {@code ConversationService}（那边要用它来清理条目，依赖成环）。
+     */
+    @PostMapping("/conversation/{conversationId}/facts")
+    public ConversationFactDto addFact(@PathVariable String conversationId,
+                                       @RequestBody(required = false) ConversationFactRequest request) {
+        conversationService.requireOwned(conversationId, AuthContext.require().id());
+        if (request == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少事实内容（fact）");
+        }
+        return ConversationFactDto.of(factService.add(conversationId, request.topic(), request.fact()));
+    }
+
+    /**
+     * 修改一条长期事实（主题与内容都可改）。
+     * <p>
+     * <b>改过的条目会从「自动整理」转为「手动」</b>：用户改它是因为模型记错了，那它就不该再被下一次
+     * 自动整理覆盖或淘汰。这一位变化前端要在保存后立刻体现（条目标签从「自动」变「手动」）。
+     */
+    @PutMapping("/conversation/{conversationId}/facts/{factId}")
+    public ConversationFactDto updateFact(@PathVariable String conversationId, @PathVariable Long factId,
+                                          @RequestBody(required = false) ConversationFactRequest request) {
+        conversationService.requireOwned(conversationId, AuthContext.require().id());
+        if (request == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少事实内容（fact）");
+        }
+        return ConversationFactDto.of(
+                factService.update(factId, conversationId, request.topic(), request.fact()));
+    }
+
+    /**
+     * 删除一条长期事实（自动 / 手动都可删）。
+     * <p>
+     * 删自动条目后它<b>不会被下一次合并自动加回来</b>，除非新对话里又提到了它 —— 合并的输入是
+     * 「当前条目 + 新增溢出内容」，被删的行模型看不到。前端提示要写成「已删除；若后续对话再次提到，
+     * 可能会重新整理出类似条目」，而不是含糊的「已删除」。
+     */
+    @DeleteMapping("/conversation/{conversationId}/facts/{factId}")
+    public void deleteFact(@PathVariable String conversationId, @PathVariable Long factId) {
+        conversationService.requireOwned(conversationId, AuthContext.require().id());
+        factService.delete(factId, conversationId);
     }
 }

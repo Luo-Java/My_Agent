@@ -63,6 +63,14 @@ public class PlannerRoundHandler implements RoundHandler {
     private static final String SRC_NONE = "NONE";
 
     /**
+     * 暂停原因 · 用户中途喊停（{@code task.pause_requested}）。
+     * <p>
+     * 只有这一个值：{@code pausedAt >= 0} 时若原因不是它，就必然是「审批闸门拦下」（另一处暂停点）。
+     * 刻意不给审批也造一个常量 —— 用不上的对称常量只会让人以为还有第三种暂停原因。
+     */
+    private static final String PAUSE_USER = "USER";
+
+    /**
      * 局部重规划时，喂给模型的「上游已完成步骤产出」摘要长度上限（每步）。
      * <p>
      * 重规划只需要知道上游「做到了什么」才能决定下一步，不需要原文；不设限会让「已完成步骤数 × 产出长度」
@@ -185,10 +193,17 @@ public class PlannerRoundHandler implements RoundHandler {
         }
         StepsOutcome executed = executeSteps(specs, task.getId(), message, conversationId, conv, null, material,
                 progress, trace);
-        // 审批关卡暂停：本轮到此为止，task 保持 RUNNING、剩余步骤保持 PENDING，等用户批准后走续跑通路继续。
+        // 暂停：本轮到此为止，task 保持 RUNNING、剩余步骤保持 PENDING，等用户处理完后走续跑通路继续。
         // 注意这里<b>不能</b> finish 任务，也不能当作失败——尚未执行的步骤没有任何执行事实，只是被闸门挡住。
+        // 两种暂停的后续动作不同：审批要等用户批准（推 approval 事件渲染审批卡片），用户喊停只需说明状态。
         if (executed.pausedAt() >= 0) {
             int idx = executed.pausedAt();
+            if (PAUSE_USER.equals(executed.pauseReason())) {
+                log.info("动态规划被用户暂停：会话={}，任务={}，下一步={}/{}",
+                        conversationId, task.getId(), idx + 1, specs.size());
+                progress.accept("⏸ 已暂停（第 " + (idx + 1) + " 步及之后未执行）");
+                return new PlannerOutcome(userPausedReply(idx + 1, specs.size()), true, List.of());
+            }
             log.info("动态规划暂停于审批关卡：会话={}，任务={}，步骤={}/{}",
                     conversationId, task.getId(), idx + 1, specs.size());
             progress.accept("⏸ 第 " + (idx + 1) + " 步需要审批，已暂停（剩余步骤未执行）");
@@ -225,6 +240,9 @@ public class PlannerRoundHandler implements RoundHandler {
         if (task == null) {
             return RoundResult.fallback();
         }
+        // 走到这里 = 用户明确要跑（点「继续执行」/「执行计划」/ 批准后继续）⇒ 先清掉暂停位。
+        // 不清的话：① 点了继续会立刻又被自己的暂停请求拦住；② 标志留着，之后每一轮都一进去就停。
+        taskService.clearPause(task.getId());
         List<TaskStep> rows = taskService.listSteps(task.getId());
         log.info("续跑任务：会话={}，任务={}，步骤={}", conversationId, task.getId(), rows.size());
         // 文案按进度分流：确认执行（一步未跑）与真正的中断续跑（跑过一半）是两种场景，措辞不该混用
@@ -299,11 +317,18 @@ public class PlannerRoundHandler implements RoundHandler {
         StepsOutcome executed = executeStepsWithState(specs, task.getId(), task.getUserGoal(), conversationId, conv,
                 null, null, progress, trace, preOutputs, preDone, preCitations,
                 ApprovalGate.of(approvalRequired, approvedFlags));
-        // 审批关卡暂停：任务不 finish（RUNNING 保持）、剩余步骤保持 PENDING，用户批准后再走本方法继续。
+        // 暂停：任务不 finish（RUNNING 保持）、剩余步骤保持 PENDING，用户处理后再走本方法继续。
         // 暂停提示按「真实助手回复」落记忆（与「先看计划」同一口径）：用户确实收到了这条回复，不落库刷新就没了。
         if (executed.pausedAt() >= 0) {
             int idx = executed.pausedAt();
             int stepIndex = specStepIndex.get(idx);
+            if (PAUSE_USER.equals(executed.pauseReason())) {
+                log.info("续跑被用户暂停：会话={}，任务={}，下一步={}", conversationId, task.getId(), stepIndex + 1);
+                progress.accept("⏸ 已暂停（第 " + (stepIndex + 1) + " 步及之后未执行）");
+                String txt = userPausedReply(stepIndex + 1, task.getTotalSteps());
+                savePlannerExchange(conversationId, task.getUserGoal(), txt);
+                return RoundResult.answer(txt, List.of());
+            }
             StepSpec s = specs.get(idx);
             log.info("续跑暂停于审批关卡：会话={}，任务={}，步骤={}",
                     conversationId, task.getId(), stepIndex + 1);
@@ -530,7 +555,7 @@ public class PlannerRoundHandler implements RoundHandler {
                                                String material, Consumer<String> progress, RoundTrace trace,
                                                String[] preOutputs, boolean[] preDone,
                                                List<KbCitation>[] preCitations, ApprovalGate gate) {
-        if (steps == null || steps.isEmpty()) return new StepsOutcome(null, List.of(), -1);
+        if (steps == null || steps.isEmpty()) return new StepsOutcome(null, List.of(), -1, null);
         // 近期窗口历史（替代记忆 Advisor 的读取）：仅注入到最后一层，避免合成输入被误写入记忆。
         String historyContext = composer.buildHistoryContextText(conversationId, 0,
                 "\n\n[近期对话] 以下为本轮之前同一会话的近期上下文（仅供参考，请勿复述）：\n");
@@ -542,7 +567,8 @@ public class PlannerRoundHandler implements RoundHandler {
         String last = null;                      // 最后成功步骤的输出（即最终结果）
         List<KbCitation> lastCitations = List.of();
         int executed = 0;                        // 已执行/已完成的步骤数（防御依赖环导致死循环）
-        int pausedAt = -1;                       // 审批闸门拦下的步骤下标（specs 连续下标）；-1=未暂停
+        int pausedAt = -1;                       // 暂停点（specs 连续下标）：审批闸门拦下 或 用户喊停；-1=未暂停
+        String pauseReason = null;               // 非 null 时恒为 PAUSE_USER；null + pausedAt>=0 = 审批闸门拦下
         for (boolean d : done) if (d) executed++;
         while (executed < n) {
             // 找出本轮可执行的步骤：依赖均已满足（前驱已 done 且产出可用）
@@ -558,6 +584,14 @@ public class PlannerRoundHandler implements RoundHandler {
             if (ready.isEmpty()) {
                 // 依赖环或前驱永远无法满足：断环，沿用已产出结果（若有），避免死循环
                 log.warn("动态规划：剩余 {} 步依赖无法满足（疑似依赖环），终止执行", n - executed);
+                break;
+            }
+            // 用户中途喊停：与审批闸门落在同一处（层边界）—— 同层是并行 join，硬中断只会留下半截产出、
+            // 还得从头再问，所以只停「还没开跑的层」，正在跑的那一层照常跑完。
+            // 放在审批检查之前：用户明确要求停，优先于「本层恰好有一步要审批」。
+            if (taskService.isPauseRequested(taskId)) {
+                pausedAt = ready.get(0);
+                pauseReason = PAUSE_USER;
                 break;
             }
             // 审批闸门：本层若含未批准的审批步，整条流水线在此暂停（不推进本层任何步骤，含未受管制的兄弟步）。
@@ -620,7 +654,7 @@ public class PlannerRoundHandler implements RoundHandler {
         }
         // 同步任务完成步数（done_steps）：供续跑提示条展示「已完成 N/M 步」；异常中断时也把已落库终态步数写准
         if (taskId != null) taskService.refreshDoneCount(taskId);
-        return new StepsOutcome(last, lastCitations, pausedAt);
+        return new StepsOutcome(last, lastCitations, pausedAt, pauseReason);
     }
 
     /** 归一化依赖下标：只保留 [0, n) 内的合法前驱下标（dependsOn 在构造 StepSpec 时已重映射为连续下标并过滤掉被跳过的前驱）。 */
@@ -799,6 +833,20 @@ public class PlannerRoundHandler implements RoundHandler {
     }
 
     /**
+     * 用户中途喊停时的回复文案：说清「停在哪、已跑完的还在、下一步怎么继续」。
+     * <p>
+     * 刻意不提「本层还要跑完」：那句话在暂停时点是过去式（执行循环已经在层边界 break 了），写在回复里
+     * 反而让人以为还在跑。真正需要它是 {@code /task/pause} 的即时回执 —— 那一刻本层确实可能还没跑完。
+     */
+    private static String userPausedReply(int nextStepNo, int totalSteps) {
+        return "⏸ 已按你的要求暂停。\n\n"
+                + "第 " + nextStepNo + " 步及之后（共 " + totalSteps + " 步）尚未执行；前面已完成的步骤产出都保留着，"
+                + "本轮不算失败。\n\n"
+                + "你可以调整剩余步骤（改智能体 / 指令 / 依赖前驱，或跳过某一步），改完点「继续执行」接着跑 —— "
+                + "走的仍是断点续跑，不会重新规划。";
+    }
+
+    /**
      * 待审批步骤事件体（推给前端渲染审批卡片）：
      * {@code {"taskId":"...","stepIndex":2,"index":3,"totalSteps":5,"agentCode":"...","agentName":"...","instruction":"..."}}。
      * <p>
@@ -910,7 +958,7 @@ public class PlannerRoundHandler implements RoundHandler {
      *
      * @param pausedAt 被审批闸门拦下的步骤下标（specs 连续下标）；-1 表示未暂停（全部可执行步骤已跑完）
      */
-    private record StepsOutcome(String reply, List<KbCitation> citations, int pausedAt) {
+    private record StepsOutcome(String reply, List<KbCitation> citations, int pausedAt, String pauseReason) {
     }
 
     /**

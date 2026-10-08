@@ -3,7 +3,9 @@ package org.luo.ai.trace;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import lombok.extern.slf4j.Slf4j;
+import org.luo.ai.dto.InjectedMessage;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.entity.AgentTrace;
 import org.luo.ai.mapper.AgentTraceMapper;
@@ -12,6 +14,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 /**
@@ -41,17 +44,25 @@ public class TraceService {
     /**
      * 异步落库一轮追踪（调用方在回复产出<b>之后</b>调用，本方法立即返回）。会先调
      * {@link RoundTrace#finish()} 收口总耗时——必须在此刻定格，不能等异步线程里再算，否则耗时混进排队等待时间。
+     * <p>
+     * <b>返回的是「这一行真的写进库了」的凭证</b>，不是可选的观察量：自评等「回写追踪行」的旁路任务必须先等它
+     * 完成，否则 UPDATE 会打到一行还不存在的记录上（表现是自评随机丢失，且日志只留一句「未命中」）。
+     * 追踪被丢弃时该 future 也会正常完成 —— 那种情况下自评写不进去是预期结果，无需重试。
      *
      * @param trace 本轮追踪上下文；null 直接忽略（如异常早退路径）
+     * @return 落库完成的凭证（提交失败时返回一个已完成的 future，调用方无需区分）
      */
-    public void saveAsync(RoundTrace trace) {
-        if (trace == null) return;
+    public CompletableFuture<Void> saveAsync(RoundTrace trace) {
+        if (trace == null) return CompletableFuture.completedFuture(null);
         trace.finish();
         try {
-            traceExecutor.execute(() -> persist(trace));
+            // 用 runAsync 而不是 execute：需要一个「完成信号」，供自评等回写方串在后面。
+            // 注意 persist 内部已吞掉所有异常，故这个 future 不会以异常完成。
+            return CompletableFuture.runAsync(() -> persist(trace), traceExecutor);
         } catch (Exception e) {
             // 队列满 / 线程池已关：追踪数据可丢，绝不影响对话
             log.debug("追踪任务提交失败（忽略本轮追踪）：traceId={}，原因={}", trace.getTraceId(), e.getMessage());
+            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -67,6 +78,7 @@ public class TraceService {
             t.setUserMessage(trace.getUserMessage());
             t.setRetrievalQuery(trace.getRetrievalQuery());
             t.setPlanJson(trace.getPlanJson());
+            t.setMemoryJson(memoryJson(trace));
             t.setToolCalls(toolCallsJson(trace));
             t.setKbHitCount(trace.citationCount());
             t.setCitationsJson(KbCitation.toJson(trace.getCitations()));
@@ -84,6 +96,30 @@ public class TraceService {
         } catch (Exception e) {
             log.warn("追踪落库失败（忽略）：traceId={}，原因={}", trace.getTraceId(), e.getMessage());
         }
+    }
+
+    /**
+     * 本轮注入的记忆构成 → JSON；<b>未采集返回 null</b>，让列保持 NULL —— 「没采到」与「注入为空」
+     * 对排查是两件事（前者是规划模式/采集失败，后者是首轮对话），不能都写成一个空对象。
+     * 窗口逐条只留预览，长期记忆两段只留长度：追踪表是旁路留痕，不是第二份对话历史。
+     */
+    private static String memoryJson(RoundTrace trace) {
+        RoundTrace.MemoryInjection mi = trace.getMemoryInjection();
+        if (mi == null) return null;
+        JSONArray items = new JSONArray(mi.window().size());
+        for (InjectedMessage it : mi.window()) {
+            JSONObject o = new JSONObject();
+            o.set("role", it.role());
+            o.set("preview", it.preview());
+            o.set("chars", it.chars());
+            items.add(o);
+        }
+        JSONObject o = new JSONObject();
+        o.set("windowChars", mi.windowChars());
+        o.set("summaryChars", mi.summaryChars());
+        o.set("factsChars", mi.factsChars());
+        o.set("window", items);
+        return o.toString();
     }
 
     /** 工具调用明细 → JSON 数组字符串；无调用返回 null（让列保持 NULL，便于「有没有调工具」直接判空）。 */
@@ -144,5 +180,59 @@ public class TraceService {
     private static int clamp(Integer limit) {
         if (limit == null || limit <= 0) return DEFAULT_LIMIT;
         return Math.min(limit, MAX_LIMIT);
+    }
+
+    /**
+     * 按「会话 + 用户输入原文」定位<b>最近一条</b>追踪记录。
+     * <p>
+     * 这是「从一条消息倒推它是哪一轮跑出来的」的<b>唯一匹配口径</b>，两个调用方共用：
+     * 反馈转回归用例（要读那一轮的路由/计划结论）与点踩强制自评。
+     * <p>
+     * <b>匹配是近似的，必须当成可能失败来看</b>：{@code agent_trace.user_message} 落库时截断到 1000 字，
+     * 而反馈里的 {@code user_input} 是消息原文 —— 超长输入会导致两者不相等。故调用方一致按
+     * 「取不到就不做」处理（转用例报 400、自评记 WARN 后放过），而不是在这里做模糊匹配：
+     * 模糊匹配可能把另一轮的事实挂到这条反馈上，那比匹配不上糟得多。
+     *
+     * @return 匹配不到返回 {@code null}
+     */
+    public AgentTrace findLatestByUserMessage(String conversationId, String userMessage) {
+        if (conversationId == null || conversationId.isBlank() || userMessage == null || userMessage.isBlank()) {
+            return null;
+        }
+        return mapper.selectOne(new QueryWrapper<AgentTrace>()
+                .eq("conversation_id", conversationId)
+                .eq("user_message", userMessage)
+                .orderByDesc("id")
+                .last("LIMIT 1"));
+    }
+
+    /**
+     * 把自评结果<b>补写</b>到已落库的那一轮追踪上。
+     * <p>
+     * <b>为什么是 UPDATE 而不是塞进 INSERT</b>：自评是一次秒级模型往返，而 {@link #saveAsync} 的整条设计
+     * 前提是「追踪尽快可见」。让 INSERT 等自评，等于把每一轮的追踪记录都推迟几秒才出现在页面上；
+     * 自评本身又是可以缺席的旁路数据（采样未命中、调用失败都不会有结果），不该拖住主记录。
+     * <p>
+     * 命中 0 行只记 WARN，<b>不抛错</b>：可能这一轮因队列满被丢弃过、或记录已被清理。自评是纯旁路，
+     * 写不进去不该影响任何东西 —— 但必须出声，否则表现是「自评功能时灵时不灵」而日志里什么都没有。
+     *
+     * @param score 1~5 的自评分
+     * @param json  自评明细 JSON（与 score 同生共死）
+     */
+    public void updateSelfEval(String traceId, int score, String json) {
+        if (traceId == null || traceId.isBlank()) return;
+        try {
+            int n = mapper.update(null, new LambdaUpdateWrapper<AgentTrace>()
+                    .eq(AgentTrace::getTraceId, traceId)
+                    .set(AgentTrace::getSelfEvalScore, score)
+                    .set(AgentTrace::getSelfEvalJson, json));
+            if (n == 0) {
+                log.warn("自评写入未命中任何追踪记录（该轮追踪可能被丢弃或已清理）：traceId={}", traceId);
+            } else {
+                log.debug("自评写入完成：traceId={}，score={}", traceId, score);
+            }
+        } catch (Exception e) {
+            log.warn("自评写入失败（忽略）：traceId={}，原因={}", traceId, e.getMessage());
+        }
     }
 }

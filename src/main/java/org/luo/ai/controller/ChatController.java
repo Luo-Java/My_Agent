@@ -8,12 +8,17 @@ import org.luo.ai.dto.ApproveStepRequest;
 import org.luo.ai.dto.ChatAttachment;
 import org.luo.ai.dto.ChatRequest;
 import org.luo.ai.dto.ResumeTaskRequest;
+import org.luo.ai.dto.RunningTaskView;
 import org.luo.ai.dto.SaveTaskTemplateRequest;
+import org.luo.ai.dto.SkipStepRequest;
 import org.luo.ai.dto.StreamEvent;
 import org.luo.ai.dto.TaskTemplateSummary;
 import org.luo.ai.dto.UpdateTaskStepRequest;
+import org.luo.ai.entity.Agent;
 import org.luo.ai.entity.Task;
+import org.luo.ai.entity.TaskStep;
 import org.luo.ai.entity.TaskTemplate;
+import org.luo.ai.service.AgentService;
 import org.luo.ai.service.ChatService;
 import org.luo.ai.service.ContentSafetyService;
 import org.luo.ai.service.ConversationService;
@@ -42,6 +47,8 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
@@ -57,6 +64,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * PUT  /api/chat/task/step   - 就地编辑待确认计划中尚未执行的某一步（智能体 / 指令 / 依赖 / 审批标记）；
  * POST /api/chat/task/approve - 批准「待审批步骤」（写标记，随后由前端走 resume 继续执行）；
  * POST /api/chat/task/cancel - 终止当前会话未完成的任务（RUNNING → CANCELLED，剩余步骤不再执行）；
+ * POST /api/chat/task/pause  - 请求暂停正在执行的计划（执行循环在下一个层边界停止推进；任务仍 RUNNING）；
+ * POST /api/chat/task/step/skip - 人工跳过某一步（PENDING / FAILED → SKIPPED），越过反复失败的步骤继续跑；
  * POST /api/chat/task/replan - 局部重规划：只重排第一个未成功步骤及其之后的一段；
  * GET/POST/DELETE /api/chat/task/template/** - 规划模板：列表 / 存为模板 / 套用 / 删除（按用户隔离）。
  * <p>
@@ -83,6 +92,8 @@ public class ChatController {
 
     private final ChatService chatService;
     private final ConversationService conversationService;
+    /** 智能体表：仅用于把步骤的 {@code agentCode} 翻成可读名（{@code /task/running}）。 */
+    private final AgentService agentService;
     private final TaskService taskService;
     private final TaskTemplateService templateService;
     /** 成本配额闸门：/send、/stream、/task/resume 三个花 token 的入口在开跑前查一次。 */
@@ -106,6 +117,7 @@ public class ChatController {
     private final ScheduledExecutorService heartbeatScheduler;
 
     public ChatController(ChatService chatService, ConversationService conversationService,
+                          AgentService agentService,
                           TaskService taskService, TaskTemplateService templateService, QuotaService quotaService,
                           ContentSafetyService safetyService,
                           @Value("${app.sse.timeout-seconds:300}") long sseTimeoutSeconds,
@@ -113,6 +125,7 @@ public class ChatController {
                           @Qualifier("sseHeartbeatScheduler") ScheduledExecutorService heartbeatScheduler) {
         this.chatService = chatService;
         this.conversationService = conversationService;
+        this.agentService = agentService;
         this.taskService = taskService;
         this.templateService = templateService;
         this.quotaService = quotaService;
@@ -289,13 +302,39 @@ public class ChatController {
         return emitter;
     }
 
-    /** 查询当前会话的未完成任务（前端「继续执行」提示条用）；无 RUNNING 任务返回 null。仅本人会话可查。 */
+    /**
+     * 查询当前会话的未完成任务（前端「继续执行」提示条用）；无 RUNNING 任务返回 null。仅本人会话可查。
+     * <p>
+     * 带步骤明细：提示条不仅要显示进度，还要指出<b>哪一步卡住了</b>并提供「跳过该步」入口（见
+     * {@link RunningTaskView}）。智能体名现查、不落库快照。
+     */
     @GetMapping("/task/running")
-    public Task running(@RequestParam String conversationId) {
+    public RunningTaskView running(@RequestParam String conversationId) {
         Long userId = AuthContext.require().id();
         String scopedId = resolveConversationId(conversationId, userId);
         conversationService.checkAccess(scopedId, userId);
-        return taskService.findRunning(scopedId);
+        Task task = taskService.findRunning(scopedId);
+        if (task == null) return null;
+        // 一次查全 agent 表建映射，不逐步骤查库：该端点在每轮对话结束后都会被调用
+        Map<String, String> names = new HashMap<>();
+        for (Agent a : agentService.listAgents()) {
+            names.put(a.getAgentCode(), a.getName());
+        }
+        List<RunningTaskView.StepView> steps = new ArrayList<>();
+        for (TaskStep s : taskService.listSteps(task.getId())) {
+            String st = s.getStatus();
+            boolean exhausted = TaskStep.STATUS_FAILED.equals(st)
+                    && s.getRetryCount() != null && s.getRetryCount() >= TaskStep.MAX_RETRY;
+            steps.add(new RunningTaskView.StepView(
+                    s.getStepIndex() == null ? 0 : s.getStepIndex(),
+                    s.getAgentCode(),
+                    names.getOrDefault(s.getAgentCode(), s.getAgentCode()),
+                    st, s.getError(), exhausted));
+        }
+        return new RunningTaskView(task.getId(), task.getConversationId(), task.getUserGoal(), task.getStatus(),
+                task.getTotalSteps() == null ? 0 : task.getTotalSteps(),
+                task.getDoneSteps() == null ? 0 : task.getDoneSteps(),
+                Boolean.TRUE.equals(task.getPauseRequested()), steps);
     }
 
     /**
@@ -374,6 +413,57 @@ public class ChatController {
         requireRunning(scopedId);   // 没有 RUNNING 任务时明确 404，不静默成功
         taskService.cancelRunning(scopedId);
         return Map.of("ok", true);
+    }
+
+    /**
+     * 请求暂停正在执行的计划：置 {@code task.pause_requested=1}，执行循环在下一个「层边界」停止推进。
+     * <p>
+     * <b>措辞刻意不说「已暂停」</b>：这一层可能还在跑（同层是并行 join，硬中断只会留下半截产出），
+     * 真正停下要等执行循环在层边界读到该标志。回执里把这点写进 {@code message}，前端原样展示 ——
+     * 说「已暂停」而后台还在跑，是比不提供暂停更糟的体验。
+     * <p>
+     * 停止后任务仍是 RUNNING、剩余步骤仍是 PENDING，用户可改步 / 跳步，再点「继续执行」走续跑通路；
+     * 暂停位由续跑入口负责清零，所以不会把用户永久挡在门外。
+     */
+    @PostMapping("/task/pause")
+    public Map<String, Object> pauseTask(@RequestBody ResumeTaskRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        Task task = requireRunning(scopedId);   // 没有在跑的任务时明确 404：暂停一个不存在的执行没有意义
+        boolean recorded = taskService.requestPause(task.getId());
+        return Map.of("ok", true,
+                "pauseRequested", recorded,
+                "message", "已请求暂停：当前正在执行的那一层跑完后停止推进，已完成的步骤产出都会保留");
+    }
+
+    /**
+     * 人工跳过某一步：{@code PENDING / FAILED → SKIPPED}，随后可点「继续执行」越过它往下跑。
+     * <p>
+     * 没有这个入口时，一个反复失败的步骤会把整个任务<b>永久卡死</b>：重试次数一旦用尽，执行侧只把它当作
+     * 「前驱失败」，而后续依赖它的步骤永远凑不齐前驱、每一轮续跑都在同一处空转。
+     * <p>
+     * 同样只改库、<b>不自动开跑</b>（与局部重规划、步骤编辑同节奏）：改完由用户决定何时继续。
+     * 回执带上跳过后重新统计的进度，前端据此更新提示条。
+     */
+    @PostMapping("/task/step/skip")
+    public Map<String, Object> skipStep(@RequestBody SkipStepRequest request) {
+        Long userId = AuthContext.require().id();
+        String scopedId = resolveConversationId(request.conversationId(), userId);
+        conversationService.checkAccess(scopedId, userId);
+        Task task = requireRunning(scopedId);
+        if (request.stepIndex() == null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少步骤下标");
+        }
+        String rejected = taskService.skipStep(task.getId(), request.stepIndex());
+        if (rejected != null) {
+            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, rejected);
+        }
+        Task fresh = taskService.findById(task.getId());
+        return Map.of("ok", true,
+                "stepIndex", request.stepIndex(),
+                "doneSteps", fresh == null || fresh.getDoneSteps() == null ? 0 : fresh.getDoneSteps(),
+                "totalSteps", fresh == null || fresh.getTotalSteps() == null ? 0 : fresh.getTotalSteps());
     }
 
     /** 取当前会话的 RUNNING 任务；不存在则 404（计划已被执行完 / 已取消）。 */

@@ -21,17 +21,29 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import org.luo.ai.service.ConversationFactService;
 import org.luo.ai.service.ConversationService;
 
 /**
  * 会话记忆合并服务：对话结束后把「溢出窗口的旧消息」与已有摘要/关键事实合并，一次 LLM 调用同时产出
- * 更新后的滚动摘要与用户核心信息，回写 conversation 表。
+ * 更新后的滚动摘要与用户核心信息，回写 conversation 表与 {@code conversation_fact} 表。
  * <p>
  * 用裸 {@link ChatModel} 直接调用（不走 advisor，否则摘要指令会被当作对话消息写入记忆）；失败一律回退
  * 已有记忆，不打断主流程。
  * <p>
+ * <b>产出去向分成两处，语义不同</b>：
+ * <ul>
+ *   <li>摘要 → {@code conversation.summary}（覆盖写，附水位）；</li>
+ *   <li>事实 → {@code conversation_fact} <b>逐条 diff</b>（{@link ConversationFactService#merge}）：模型
+ *       这次没列出的自动条目即视为过时并删除，用户手加的条目不动。{@code conversation.core_facts}
+ *       退化为「旧版文本归档」，本类<b>不再写它</b>（见 {@code ConversationService#updateSummary}）。</li>
+ * </ul>
+ * 首次合并（条目表为空）会把旧 {@code core_facts} 文本当输入喂给模型拆成条目，从而自动完成迁移。
+ * <p>
  * <b>数据保留契约</b>：只把窗口外消息<b>排除出主模型上下文</b>，<b>不删除 chat_message 行</b>。
- * {@link ParamFillingService} 的澄清重放依赖该语义——若改为物理归档旧消息，需同步其实现。
+ * {@link ParamFillingService} 的参数抽取与澄清兜底路径依赖该语义——若改为物理归档旧消息，需同步其实现。
+ * （澄清次数 / 原始请求 / 已确认参数已改为显式落库 {@code conversation.clarify_state}，不再受摘要压缩影响；
+ * 但抽取范围仍读历史，故这条契约依然成立。）
  */
 @Slf4j
 @Service
@@ -41,6 +53,8 @@ public class MemoryMergeService {
     private static final int SUMMARY_BATCH_SIZE = 6;
 
     private final ConversationService conversationService;
+    /** 长期事实条目：合并的输入取它、产出写它（见类注释的「产出去向分成两处」）。 */
+    private final ConversationFactService factService;
     private final ChatModel chatModel;
     /** 记忆合并提示词（纯静态，外置）。 */
     private final String memoryMergeSystem;
@@ -54,12 +68,14 @@ public class MemoryMergeService {
     /** 合并中的会话：同一会话互斥，避免连发消息时并发触发多次合并相互覆盖（跳过的那次下一轮会重查）。 */
     private final Set<String> merging = ConcurrentHashMap.newKeySet();
 
-    public MemoryMergeService(ConversationService conversationService, ChatModel chatModel,
+    public MemoryMergeService(ConversationService conversationService, ConversationFactService factService,
+                              ChatModel chatModel,
                               @Qualifier("memoryMergeExecutor") Executor memoryMergeExecutor,
                               PromptProperties promptProperties,
                               MemoryProperties memoryProperties,
                               LlmUsageService llmUsageService) {
         this.conversationService = conversationService;
+        this.factService = factService;
         this.chatModel = chatModel;
         this.memoryMergeExecutor = memoryMergeExecutor;
         this.memoryMergeSystem = promptProperties.memoryMergeSystem();
@@ -128,8 +144,14 @@ public class MemoryMergeService {
             // 只取「尚未摘要的那一段」（按全量索引区间开窗），长会话下不再整段历史读进内存
             List<ChatMessage> delta = conversationService.getMessagesRange(
                     conversationId, alreadySummarized, windowStart);
-            SummaryResult sr = summarize(conversationId, conv.getSummary(), conv.getCoreFacts(), delta);
-            conversationService.updateMemory(conversationId, sr.summary, sr.coreFacts, windowStart);
+            MergeResult mr = summarize(conversationId, conv.getSummary(),
+                    existingFacts(conversationId, conv), delta);
+            conversationService.updateSummary(conversationId, mr.summary, windowStart);
+            // facts 为 null = 本轮没解析出结果（LLM 失败 / 格式不可读）：一律不动条目库 ——
+            // 把「解析失败」当成「一条事实都不剩」会把用户的长期记忆整批清空，这是本类最不能出的错。
+            if (mr.facts != null) {
+                factService.merge(conversationId, mr.facts);
+            }
             log.info("记忆合并完成：合并 {} 条，已覆盖条数={}", delta.size(), windowStart);
         } catch (Exception e) {
             log.error("记忆合并失败：会话={}", conversationId, e);
@@ -137,15 +159,23 @@ public class MemoryMergeService {
     }
 
     /**
-     * 把「新增溢出的历史」与「已有摘要/关键事实」合并，一次 LLM 调用同时产出新摘要与新核心信息；
-     * LLM 失败时两者均回退原值。
+     * 合并用的「已有关键事实」输入：条目优先、旧归档兜底 —— 判据与块头处理都封装在
+     * {@link ConversationFactService#mergeInputText} 里（注入侧用的是它的兄弟方法，别在这里另写一份）。
      */
-    private SummaryResult summarize(String conversationId, String existingSummary, String existingCoreFacts,
-                                    List<ChatMessage> newMessages) {
+    private String existingFacts(String conversationId, Conversation conv) {
+        return factService.mergeInputText(conversationId, conv.getCoreFacts());
+    }
+
+    /**
+     * 把「新增溢出的历史」与「已有摘要/关键事实」合并，一次 LLM 调用同时产出新摘要与新事实条目；
+     * LLM 失败时摘要回退原值、<b>事实返回 {@code null}</b>（表示「没产出」，调用方不得据此清库）。
+     */
+    private MergeResult summarize(String conversationId, String existingSummary, String existingFacts,
+                                  List<ChatMessage> newMessages) {
         try {
             StringBuilder sb = new StringBuilder();
             sb.append("【已有摘要】\n").append(existingSummary == null || existingSummary.isBlank() ? "（无）" : existingSummary).append("\n\n");
-            sb.append("【已有关键事实】\n").append(existingCoreFacts == null || existingCoreFacts.isBlank() ? "（无）" : existingCoreFacts).append("\n\n");
+            sb.append("【已有关键事实】\n").append(existingFacts == null || existingFacts.isBlank() ? "（无）" : existingFacts).append("\n\n");
             sb.append("【新增对话内容】\n");
             for (ChatMessage m : newMessages) {
                 sb.append(m.getRole()).append("：").append(m.getContent()).append("\n");
@@ -160,47 +190,46 @@ public class MemoryMergeService {
             String reply = assistantMessage != null ? assistantMessage.getText() : null;
             if (reply == null || reply.isBlank()) {
                 log.warn("生成摘要：LLM 返回为空，回退到已有记忆");
-                return new SummaryResult(existingSummary, existingCoreFacts);
+                return new MergeResult(existingSummary, null);
             }
-            SummaryResult sr = parseSummaryResult(reply, existingSummary, existingCoreFacts);
-            log.info("生成摘要完成：摘要长度={}，关键事实长度={}",
-                    sr.summary != null ? sr.summary.length() : 0,
-                    sr.coreFacts != null ? sr.coreFacts.length() : 0);
-            return sr;
+            MergeResult mr = parseMergeResult(reply, existingSummary);
+            log.info("生成摘要完成：摘要长度={}，事实条目={}",
+                    mr.summary != null ? mr.summary.length() : 0,
+                    mr.facts == null ? "未产出（保留原条目）" : mr.facts.size() + " 条");
+            return mr;
         } catch (Exception e) {
             log.error("生成摘要失败：LLM 调用异常", e);
-            return new SummaryResult(existingSummary, existingCoreFacts);   // 失败：保留旧记忆，不阻断对话
+            return new MergeResult(existingSummary, null);   // 失败：保留旧记忆，不阻断对话
         }
     }
 
-    /** 解析「摘要 + 关键事实」两段式文本：找不到分隔符则整段视为摘要、关键事实保留旧值；"无" 置 null。 */
-    private SummaryResult parseSummaryResult(String reply, String existingSummary, String existingCoreFacts) {
+    /**
+     * 解析「摘要 + 关键事实」两段式文本。
+     * <p>
+     * 找不到分隔符时整段视为摘要、<b>事实返回 {@code null}</b>（格式不可读 ⇒ 不动条目库）；
+     * 找到分隔符但事实段为空 / 为「无」时返回<b>空表</b>（这是明确的「一条都不剩」，会清空自动条目）。
+     * 这两种情况必须分开：混在一起会让一次格式漂移把用户的长期事实整批删掉。
+     */
+    private MergeResult parseMergeResult(String reply, String existingSummary) {
         String text = reply.trim();
         int idx = text.indexOf("## 关键事实");
         if (idx < 0) idx = text.indexOf("关键事实");
         if (idx < 0) {
-            return new SummaryResult(text, existingCoreFacts);
+            return new MergeResult(text, null);
         }
         String summaryPart = text.substring(0, idx).replaceAll("^##?\\s*摘要\\s*", "").trim();
         String factsPart = text.substring(idx).replaceFirst("^##?\\s*关键事实\\s*", "").trim();
         String summary = summaryPart.isBlank() ? existingSummary : summaryPart;
-        String coreFacts;
-        if (factsPart.isBlank() || "无".equals(factsPart)) {
-            coreFacts = null;
-        } else {
-            coreFacts = factsPart;
-        }
-        return new SummaryResult(summary, coreFacts);
+        // 解析口径唯一在 ConversationFactService（前缀符号 / 主题白名单 / 「无」的归一都在那里）
+        return new MergeResult(summary, ConversationFactService.parseLines(factsPart));
     }
 
-    /** LLM 一次记忆合并的产出：更新后的滚动摘要 + 用户核心信息。 */
-    private static final class SummaryResult {
-        final String summary;
-        final String coreFacts;
-
-        SummaryResult(String summary, String coreFacts) {
-            this.summary = summary;
-            this.coreFacts = coreFacts;
-        }
+    /**
+     * LLM 一次记忆合并的产出。
+     * <p>
+     * {@code facts} 的 <b>null 与空表是两件事</b>：null = 本轮没产出事实（调用失败 / 格式不可读），
+     * 调用方<b>不得</b>据此改库；空表 = 模型明确说「没有事实了」，调用方应清空自动条目。
+     */
+    private record MergeResult(String summary, List<ConversationFactService.FactLine> facts) {
     }
 }

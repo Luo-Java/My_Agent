@@ -10,7 +10,7 @@ import org.luo.ai.entity.KnowledgeBase;
 import org.luo.ai.entity.KnowledgeChunk;
 import org.luo.ai.enums.ChunkStrategy;
 import org.luo.common.exception.AiBusinessException;
-import org.luo.ai.infrastructure.document.DocumentParserService;
+import org.luo.ai.infrastructure.document.KbTextExtractor;
 import org.luo.ai.service.ChunkingService;
 import org.luo.ai.service.KbService;
 import org.springframework.http.MediaType;
@@ -45,11 +45,12 @@ import org.luo.common.exception.AiErrorCode;
 public class KnowledgeBaseController {
 
     private final KbService kbService;
-    private final DocumentParserService documentParser;
+    /** 「文件 → 文本」的统一入口：图片走多模态识别、文档走本地解析（见 {@link KbTextExtractor}）。 */
+    private final KbTextExtractor textExtractor;
 
-    public KnowledgeBaseController(KbService kbService, DocumentParserService documentParser) {
+    public KnowledgeBaseController(KbService kbService, KbTextExtractor textExtractor) {
         this.kbService = kbService;
-        this.documentParser = documentParser;
+        this.textExtractor = textExtractor;
     }
 
     /** 全部知识库列表（调用前确保全局库存在，全局库恒在首位）。 */
@@ -137,6 +138,10 @@ public class KnowledgeBaseController {
      * 向量化入库 → 登记文件列表。单文件失败不影响其它，逐条返回
      * {@code [{fileName, status: ok|error, added, fileId?, chunkStrategy?, chunkOverlap?, message?}]}。
      * 同库内同名文件 = 替换重传。
+     * <p>
+     * <b>支持图片</b>（png/jpg/jpeg/gif/webp/bmp/tif/tiff/heic/avif）：走多模态识别转成描述文本再切块入库，
+     * 描述文字成为该文件的知识块内容。<b>识别失败即该文件失败</b>（不落占位文本，见
+     * {@code KbTextExtractor}）—— 占位文本入库会污染后续检索。
      *
      * @param chunkStrategy 策略 key：fixed/paragraph/recursive/markdown；缺省继承库默认，未知回退 recursive
      * @param overlap       重叠字数；缺省继承库默认，0 = 不重叠，上限 {@link ChunkingService#MAX_OVERLAP}
@@ -157,7 +162,7 @@ public class KnowledgeBaseController {
             Map<String, Object> r = new HashMap<>();
             r.put("fileName", fileName);
             try {
-                String text = documentParser.parse(file);
+                String text = textExtractor.extract(file);
                 KbFile saved = kbService.registerFile(id, fileName, file.getSize(), text, chunkStrategy, overlap);
                 r.put("status", "ok");
                 r.put("fileId", saved.getId());

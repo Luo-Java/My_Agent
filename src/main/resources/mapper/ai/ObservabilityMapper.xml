@@ -97,4 +97,38 @@
         LIMIT #{limit}
     </select>
 
+    <!-- 回答自评聚合。两个要点：
+         ① 「未自评」与「低分」分开计数 —— 混成一个数会把「抽样没覆盖到」读成「质量差」；
+         ② self_eval_score &lt;= #{threshold} 对 NULL 求值为 NULL（不为 true），故未自评的轮次天然
+            不会被算进低分 —— 不需要额外写 IS NOT NULL。
+         均值只对已自评的轮次求（CASE 把 NULL 挡在外面）：AVG 会忽略 NULL，但把所有轮次都算进分母
+         就等于把「没评过」当成「0 分」。 -->
+    <select id="aggregateSelfEval" resultType="org.luo.ai.dto.ObservabilitySummary$SelfEvalSummary">
+        SELECT COUNT(CASE WHEN self_eval_score IS NOT NULL THEN 1 END) AS evaluated,
+               COUNT(CASE WHEN self_eval_score IS NULL THEN 1 END) AS unevaluated,
+               COUNT(CASE WHEN self_eval_score &lt;= #{threshold} THEN 1 END) AS lowScore,
+               ROUND(COALESCE(AVG(CASE WHEN self_eval_score IS NOT NULL THEN self_eval_score END), 0), 2) AS avgScore
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+    </select>
+
+    <!-- 低分轮次 Top N：分数升序（最差的先看），同分取最近跑的那轮。
+         刻意只回定位信息、不回 self_eval_json —— 明细走 GET /api/trace/{traceId}，避免列表一次拖回几十份 JSON。 -->
+    <select id="selectLowScore" resultType="org.luo.ai.dto.ObservabilitySummary$LowRound">
+        SELECT trace_id AS traceId,
+               conversation_id AS conversationId,
+               mode AS mode,
+               route_source AS routeSource,
+               agent_code AS agentCode,
+               COALESCE(elapsed_ms, 0) AS elapsedMs,
+               self_eval_score AS selfEvalScore,
+               LEFT(user_message, 80) AS userMessage
+        FROM agent_trace
+        WHERE created_at &gt;= #{since}
+          AND self_eval_score IS NOT NULL
+          AND self_eval_score &lt;= #{threshold}
+        ORDER BY self_eval_score ASC, id DESC
+        LIMIT #{limit}
+    </select>
+
 </mapper>

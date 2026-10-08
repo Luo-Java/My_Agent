@@ -55,5 +55,13 @@ public class ChatMessage {
      */
     private Boolean turnActive;
 
+    /**
+     * 用户是否把这条标记为「不参与记忆」：true = 既不进记忆窗口、也不进滚动摘要；false = 正常参与（默认）。
+     * <p>
+     * <b>只过滤记忆侧</b>（记忆窗口 / 消息计数 / 摘要切片三处共用同一条件），<b>不过滤展示侧</b>
+     * （会话历史与导出照常显示）。即「不进记忆」≠「删掉」—— 消息还在，只是模型看不到它。
+     */
+    private Boolean memoryExcluded;
+
     private LocalDateTime createdAt;
 }

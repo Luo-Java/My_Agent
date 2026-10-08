@@ -221,10 +221,55 @@ public class TaskService {
 
     /** 步骤跳过（agent 不存在等确定性失败）：RUNNING → SKIPPED。 */
     public void markStepSkipped(Long stepId) {
+        markStepSkipped(stepId, TaskStep.SKIP_REASON_AGENT_MISSING);
+    }
+
+    /**
+     * 步骤跳过并记录原因：写入 {@code error} 列。
+     * <p>
+     * 复用 {@code error} 列承载「为什么被跳过」而不是新增一列：跳过也是「这一步没跑成」，与 FAILED 属于同
+     * 一类事实；而且这一列本来就只有终态步骤才有值，语义不冲突。
+     */
+    public void markStepSkipped(Long stepId, String reason) {
         stepMapper.update(null, new LambdaUpdateWrapper<TaskStep>()
                 .eq(TaskStep::getId, stepId)
                 .set(TaskStep::getStatus, TaskStep.STATUS_SKIPPED)
+                .set(TaskStep::getError, reason)
                 .set(TaskStep::getFinishedAt, LocalDateTime.now()));
+    }
+
+    /**
+     * 人工跳过某一步：PENDING / FAILED → SKIPPED。
+     * <p>
+     * 与 {@link #markStepSkipped(Long) } 的分工：那个是执行侧对「智能体已删除」这类<b>确定性失败</b>的自动
+     * 处理；本方法是<b>用户显式跳过</b> —— 某步反复失败（{@code retry_count} 已用尽）、或用户就是想越过它
+     * 继续跑时用。<b>没有这个入口，一个反复失败的步骤会把整个任务永久卡死</b>：后续依赖它的步骤永远凑不齐
+     * 前驱，续跑每一轮都只会在同一处等待。
+     * <p>
+     * 三条硬约束：
+     * <ul>
+     *   <li><b>不收 RUNNING</b>：正在跑的步骤被跳掉，它的产出回来时无处可写；</li>
+     *   <li><b>不收 DONE / SKIPPED</b>：已终结的步骤没有「跳过」这回事，重复标只会让 {@code done_steps} 在
+     *       「算不算完成」之间抖动；</li>
+     *   <li><b>不自动续跑</b>：与局部重规划、步骤编辑同节奏 —— 只落库，由用户点「继续执行」走续跑通路。</li>
+     * </ul>
+     * 被跳过步骤的产出是 null，<b>依赖它的下游步骤拿不到这段输入</b>（执行侧按「前驱产出可用」筛 ready，
+     * 跳过的前驱会让下游回落成只用原始目标）—— 调用方要把这点讲清楚，不能让用户以为跳过没有代价。
+     *
+     * @return null 表示成功；非 null 为拒绝原因（调用方转 400 / 404）
+     */
+    public String skipStep(String taskId, int stepIndex) {
+        TaskStep step = findStep(taskId, stepIndex);
+        if (step == null) {
+            return "第 " + (stepIndex + 1) + " 步不存在";
+        }
+        String st = step.getStatus();
+        if (!TaskStep.STATUS_PENDING.equals(st) && !TaskStep.STATUS_FAILED.equals(st)) {
+            return "第 " + (stepIndex + 1) + " 步当前状态为 " + st + "，只能跳过「待执行」或「已失败」的步骤";
+        }
+        markStepSkipped(step.getId(), TaskStep.SKIP_REASON_USER);
+        refreshDoneCount(taskId);
+        return null;
     }
 
     /** 步骤失败：RUNNING → FAILED，记录原因并 retry_count + 1。 */
@@ -335,5 +380,55 @@ public class TaskService {
                 .eq(Task::getStatus, Task.STATUS_RUNNING)
                 .set(Task::getStatus, Task.STATUS_CANCELLED)
                 .set(Task::getUpdatedAt, LocalDateTime.now()));
+    }
+
+    // ------------------------------------------------------------------
+    // 执行中干预：暂停信号
+    // ------------------------------------------------------------------
+
+    /**
+     * 请求暂停：置 {@code pause_requested=1}，由执行循环在下一个「层边界」自行停止推进。
+     * <p>
+     * <b>返回 true 只代表「请求已记下」，不代表已经停下</b> —— 正在跑的那一层会照常跑完（同层是
+     * {@code CompletableFuture} 并行 join，硬中断只会留下半截产出、还得从头再问）。所以调用方措辞要说明
+     * 「本层跑完即停」，不能对用户说「已暂停」而后台还在跑。
+     * <p>
+     * 只对 RUNNING 任务生效：终态任务没有「暂停」这回事。
+     *
+     * @return true=请求已记录；false=任务不存在或已非 RUNNING
+     */
+    public boolean requestPause(String taskId) {
+        if (taskId == null) return false;
+        return taskMapper.update(null, new LambdaUpdateWrapper<Task>()
+                .eq(Task::getId, taskId)
+                .eq(Task::getStatus, Task.STATUS_RUNNING)
+                .set(Task::getPauseRequested, true)
+                .set(Task::getUpdatedAt, LocalDateTime.now())) > 0;
+    }
+
+    /**
+     * 清零暂停信号。
+     * <p>
+     * 由续跑入口（{@code PlannerRoundHandler#resumeTask}）在开头调用：用户点「继续执行」= 明确要跑，
+     * 此时不清就会出现「点了继续、立刻又停」，而且标志会一直留着，之后每一轮一进去就停。
+     */
+    public void clearPause(String taskId) {
+        if (taskId == null) return;
+        taskMapper.update(null, new LambdaUpdateWrapper<Task>()
+                .eq(Task::getId, taskId)
+                .set(Task::getPauseRequested, false));
+    }
+
+    /**
+     * 该任务是否已被请求暂停（执行循环在每层开始时调用一次）。
+     * <p>
+     * 刻意只 select 一列：该查询在每层执行前都会跑一次，取回宽表全部列没有必要。
+     */
+    public boolean isPauseRequested(String taskId) {
+        if (taskId == null) return false;
+        Task t = taskMapper.selectOne(new QueryWrapper<Task>()
+                .select("pause_requested")
+                .eq("id", taskId));
+        return t != null && Boolean.TRUE.equals(t.getPauseRequested());
     }
 }

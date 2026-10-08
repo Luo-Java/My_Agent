@@ -80,6 +80,69 @@
             </div>
         </div>
 
+        <!-- 回答质量（模型自评）：回答「答得对不对」，与上面的「跑得动吗 / 快不快」是两件事。
+             抽样口径：按 traceId 哈希抽检（默认关闭）+ 用户点踩强制。两条通路写在这里，是因为
+             「只有 12 轮被评到」这件事如果不解释，会被读成「只有 12 轮跑过」。 -->
+        <div class="ob-panel" v-if="selfEval">
+            <div class="ob-panel-head">
+                <span class="ob-panel-title">回答质量（模型自评）</span>
+                <span class="ob-panel-sub">
+                    低分线 ≤ {{ lowThreshold }} 分 · 覆盖率 {{ selfEval.coverage }}% · 低分率 {{ selfEval.lowRate }}%
+                </span>
+            </div>
+            <div class="ob-overview ob-overview-mini">
+                <div class="ob-card is-cyan">
+                    <div class="ob-card-num">{{ selfEval.evaluated }}</div>
+                    <div class="ob-card-label">已自评轮次</div>
+                </div>
+                <div class="ob-card">
+                    <div class="ob-card-num">{{ selfEval.unevaluated }}</div>
+                    <div class="ob-card-label">未自评（未命中 / 未评完）</div>
+                </div>
+                <div class="ob-card" :class="selfEval.lowScore > 0 ? 'is-danger' : 'is-success'">
+                    <div class="ob-card-num">{{ selfEval.lowScore }}</div>
+                    <div class="ob-card-label">低分轮次</div>
+                </div>
+                <div class="ob-card">
+                    <div class="ob-card-num">{{ selfEval.avgScore }}</div>
+                    <div class="ob-card-label">平均分（仅已自评）</div>
+                </div>
+            </div>
+            <div class="ob-hint">
+                「未自评」与「低分」是两件事：前者是覆盖不足（自评默认关闭，开启后按采样率抽检），
+                后者才是质量信号。二者混看会把「没抽到」读成「答得差」。
+                <span v-if="selfEval.unevaluated > 0 && selfEval.evaluated === 0">
+                    当前窗口内一次自评都没有：请在 application.yaml 打开 agent.self-eval.enabled，
+                    或在对话页对某条回复点 👎（点踩强制自评，不看开关）。
+                </span>
+            </div>
+        </div>
+
+        <!-- 低分轮次：分数升序（最差的先看）。这里只列定位信息，自评明细（问题短语 / 说明）在对话页
+             该轮的追踪详情里 —— 列表方向是「找出哪几轮有问题」，不是「把明细铺一屏」。 -->
+        <div class="ob-panel" v-if="lowRounds.length">
+            <div class="ob-panel-head">
+                <span class="ob-panel-title">低分轮次（{{ lowRounds.length }}）</span>
+                <span class="ob-panel-sub">分数升序 · 同分取最近 · 明细见对话页追踪详情</span>
+            </div>
+            <table class="ob-table">
+                <thead>
+                <tr><th>自评分</th><th>形态</th><th>来源</th><th>智能体</th><th>耗时</th><th>会话</th><th>用户输入</th></tr>
+                </thead>
+                <tbody>
+                <tr v-for="r in lowRounds" :key="r.traceId">
+                    <td><span class="ob-badge is-error">{{ r.selfEvalScore }} 分</span></td>
+                    <td>{{ modeLabel(r.mode) }}</td>
+                    <td>{{ routeLabel(r.routeSource) }}</td>
+                    <td class="ob-monospace">{{ r.agentCode || '—' }}</td>
+                    <td>{{ fmtMs(r.elapsedMs) }}</td>
+                    <td class="ob-mono-id" :title="r.conversationId">{{ shortId(r.conversationId) }}</td>
+                    <td class="ob-user-msg" :title="r.userMessage">{{ r.userMessage || '—' }}</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
+
         <!-- 按天趋势 -->
         <div class="ob-panel">
             <div class="ob-panel-head">

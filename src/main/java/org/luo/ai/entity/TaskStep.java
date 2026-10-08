@@ -41,6 +41,12 @@ public class TaskStep {
     /** 失败步骤续跑重试次数上限（达到即判确定性失败、放弃重试）。 */
     public static final int MAX_RETRY = 2;
 
+    /** 跳过原因（写入 {@code error} 列）：该步的智能体已被删除，无法执行。 */
+    public static final String SKIP_REASON_AGENT_MISSING = "智能体已被删除，跳过该步";
+
+    /** 跳过原因（写入 {@code error} 列）：用户手动跳过（某步反复失败、或就想跳过它继续跑）。 */
+    public static final String SKIP_REASON_USER = "用户手动跳过该步";
+
     /** 自增主键。 */
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;

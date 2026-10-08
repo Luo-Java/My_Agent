@@ -19,6 +19,7 @@ import java.util.stream.Collectors;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import org.luo.ai.dto.ClarifyState;
 import org.luo.ai.service.ConversationService;
 
 /**
@@ -26,18 +27,19 @@ import org.luo.ai.service.ConversationService;
  * <p>
  * 对声明了 {@code paramSchema} 的智能体，每轮先用 LLM 从「当前追问任务范围内的历史」
  * （见 {@link #clarifyScopedHistory}）抽取已收集参数：缺失必填项则生成追问（带 {@link #CLARIFY_PREFIX}
- * 前缀）直接返回、不调主模型，上限 {@link #MAX_CLARIFY} 次；齐全则把参数交给编排层注入 prompt。
+ * 前缀）直接返回、不调主模型，上限 {@link ClarifyState#MAX_ASKED} 次；齐全则把参数交给编排层注入 prompt。
  * <p>
- * <b>无显式状态</b>：追问计数与参数抽取都以 DB 历史为准（只读最近 {@value #HISTORY_SCAN_LIMIT} 条），
- * 每轮重放推导，天然跨请求/跨重启/多实例一致。<b>依赖「历史消息全量保留」</b>——若改为物理归档旧消息，
- * 必须同步本服务的重放逻辑，否则追问计数与已确认参数会静默丢失。
+ * <b>状态显式落库</b>（{@code conversation.clarify_state}，见 {@link ClarifyState}）：追问次数、原始请求锚点、
+ * 已确认参数都从状态读，不再每轮扫历史推导。理由是重放会算歪 —— 历史超窗被摘要压缩后原始请求滑出窗口、
+ * 消息被标「不参与记忆」后重放侧少算一次、长会话里连续追问段的起点落在扫描范围之外。
+ * <p>
+ * <b>历史重放作为兜底保留</b>：状态为空（本功能之前就已进入追问的老会话、或状态损坏）时退回原逻辑，
+ * 行为与改造前一致，不因升级而回退。<b>仍然依赖「历史消息全量保留」</b>——兜底路径与参数抽取都用历史；
+ * 若改为物理归档旧消息，必须同步本服务。
  */
 @Slf4j
 @Service
 public class ParamFillingService {
-
-    /** 单个智能体单轮对话最多追问次数（达到后转交主模型尽力执行，不再追问）。 */
-    private static final int MAX_CLARIFY = 3;
 
     /** 追问消息的固定前缀：既是友好提示，也用于从历史中识别并统计连续追问段。 */
     private static final String CLARIFY_PREFIX = "🔎 还需补充信息";
@@ -67,43 +69,73 @@ public class ParamFillingService {
      */
     public ClarifyDecision decideClarify(String conversationId, String message, Agent agent) {
         if (agent == null) {
-            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
+            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of(), null);
         }
-        return decideClarify(conversationId, message, agent.getParamSchema());
+        return decideClarify(conversationId, message, agent.getId(), agent.getParamSchema());
     }
 
-    /** 按 paramSchema（JSON 字符串）做决策；空则不追问。 */
-    public ClarifyDecision decideClarify(String conversationId, String message, String paramSchema) {
+    /** 按 paramSchema（JSON 字符串）做决策；空则不追问。{@code agentId} 用于判断已落库状态是否属于本智能体。 */
+    public ClarifyDecision decideClarify(String conversationId, String message, Long agentId, String paramSchema) {
         if (paramSchema == null || paramSchema.isBlank()) {
-            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
+            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of(), null);
         }
         List<ParamDef> schema = parseSchema(paramSchema);
         if (schema.isEmpty()) {
-            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of());
+            return new ClarifyDecision(null, Map.of(), Map.of(), false, List.of(), null);
         }
         // 历史不含本轮用户输入（advisor 在调主模型时落库；追问分支由编排层手动落库）
         List<ChatMessage> history = conversationService.getRecentHistory(conversationId, HISTORY_SCAN_LIMIT);
-        int asked = countClarifyStreak(history);          // 已连续追问次数
-        // 参数抽取范围 = 最后一次正式回答之后的用户请求到末尾（原始请求 + ≤MAX_CLARIFY 轮问答），天然有界
+
+        // 澄清状态优先：读显式落库的那一份；为空（本功能之前的老会话 / 状态损坏）才退回历史重放，
+        // 行为与改造前一致。换智能体（agentId 不匹配）视同无状态：路由转向别的 agent 时状态自然作废。
+        ClarifyState stored = conversationService.getClarifyState(conversationId);
+        ClarifyState prev = (stored != null && stored.belongsTo(agentId)) ? stored : null;
+        int asked;
+        String anchor;
+        Map<String, String> carried;
+        if (prev != null) {
+            asked = prev.asked();
+            anchor = prev.request();
+            carried = prev.params();
+        } else {
+            asked = countClarifyStreak(history);   // 兜底：从历史里数已连续追问几次
+            anchor = null;
+            carried = Map.of();
+        }
+
+        // 抽取范围 = 最近若干条 + 原始请求锚点（锚点即使已被摘要压缩出窗口也会补回来）
         List<ChatMessage> scoped = clarifyScopedHistory(history);
-        Map<String, String> params = extractParams(conversationId, message, scoped, schema);
+        Map<String, String> params = mergeParams(carried,
+                extractParams(conversationId, message, scoped, schema, anchor));
         List<ParamDef> missing = missingRequired(schema, params);
         Map<String, String> paramLabels = schema.stream()
                 .collect(Collectors.toMap(ParamDef::key, ParamDef::label, (a, b) -> a));
         if (missing.isEmpty()) {
-            return new ClarifyDecision(null, params, paramLabels, false, List.of());
+            // 参数已齐：状态随之作废（nextState=null ⇒ 编排层清列），下一段追问从零开始
+            return new ClarifyDecision(null, params, paramLabels, false, List.of(), null);
         }
-        if (asked >= MAX_CLARIFY) {
+        if (asked >= ClarifyState.MAX_ASKED) {
             // 已达上限：转交主模型并列出缺失参数，令其尽力执行、不再追问
             List<String> missLabels = missing.stream().map(ParamDef::label).collect(Collectors.toList());
-            log.info("追问达上限（{}）：转交主模型，缺失参数={}", MAX_CLARIFY, missLabels);
-            return new ClarifyDecision(null, params, paramLabels, true, missLabels);
+            log.info("追问达上限（{}）：转交主模型，缺失参数={}", ClarifyState.MAX_ASKED, missLabels);
+            return new ClarifyDecision(null, params, paramLabels, true, missLabels, null);
         }
-        // 追问文本；落库由编排层在「确认进入追问且非话题切换」时统一完成，避免误落失效追问
+        // 追问文本 + 本轮结束后的状态。落库由编排层在「确认进入追问且非话题切换」时与追问消息一并完成
+        // （只落消息不落状态，下一轮就读不到原始请求锚点，本功能等于没做）。
         String question = buildQuestion(missing, asked + 1);
+        String originalRequest = (anchor != null && !anchor.isBlank()) ? anchor : message;
+        ClarifyState next = new ClarifyState(agentId, asked + 1, originalRequest, question, params);
         log.info("参数补全追问（第 {} 次）：会话={}，缺失={}", asked + 1, conversationId,
                 missing.stream().map(ParamDef::key).collect(Collectors.joining(",")));
-        return new ClarifyDecision(question, params, paramLabels, false, List.of());
+        return new ClarifyDecision(question, params, paramLabels, false, List.of(), next);
+    }
+
+    /** 合并参数：以已落库的快照为底、本轮新抽取的覆盖之（用户中途改口时新值胜出）。 */
+    private static Map<String, String> mergeParams(Map<String, String> carried, Map<String, String> extracted) {
+        if (carried == null || carried.isEmpty()) return extracted;
+        Map<String, String> out = new LinkedHashMap<>(carried);
+        out.putAll(extracted);
+        return out;
     }
 
     /**
@@ -136,7 +168,10 @@ public class ParamFillingService {
 
     /** 最近一条追问文本（无则 null）：供编排层做话题切换预检，让路由区分「回答追问」与「开新话题」。 */
     public String lastClarifyQuestion(String conversationId) {
-        // 最近一条追问一定落在尾部，有界读取即可（见 HISTORY_SCAN_LIMIT）
+        // 显式状态优先：它记的就是最近一次追问原文，且不受历史被压缩 / 被标「不参与记忆」影响
+        ClarifyState st = conversationService.getClarifyState(conversationId);
+        if (st != null && st.question() != null && !st.question().isBlank()) return st.question();
+        // 兜底：本功能之前就已进入追问的老会话（状态列为空）退回历史扫描 —— 最近一条追问一定在尾部
         List<ChatMessage> history = conversationService.getRecentHistory(conversationId, HISTORY_SCAN_LIMIT);
         if (history == null || history.isEmpty()) return null;
         for (int i = history.size() - 1; i >= 0; i--) {
@@ -150,19 +185,31 @@ public class ParamFillingService {
     }
 
     /**
-     * 用裸 ChatModel 从「当前任务切片 + 本轮输入」抽取参数（纯文本行式 "key: 取值"）。
+     * 用裸 ChatModel 从「当前任务切片 + 原始请求锚点 + 本轮输入」抽取参数（纯文本行式 "key: 取值"）。
      * 只在用户明确表达时填值、禁止臆测，失败回退空 Map。
+     *
+     * @param anchorRequest 触发本次追问的原始请求；可能已被摘要压缩出窗口，故单独补进上下文。
+     *                      若它本来就还在切片里（内容逐字相同）则不重复附加，避免白占 token
      */
     private Map<String, String> extractParams(String conversationId, String message, List<ChatMessage> history,
-                                              List<ParamDef> schema) {
+                                              List<ParamDef> schema, String anchorRequest) {
         String schemaText = schema.stream().map(p ->
                         "- " + p.key + "（" + (p.required ? "必填" : "可选") + "）：" + p.label
                                 + (p.hint != null && !p.hint.isBlank() ? "；提示：" + p.hint : "")
                                 + (p.options != null && !p.options.isEmpty() ? "；可选值：" + String.join("/", p.options) : ""))
                 .collect(Collectors.joining("\n"));
-        String histText = history.stream()
-                .map(m -> (m.getRole() != null ? m.getRole() : "user") + "：" + (m.getContent() == null ? "" : m.getContent()))
-                .collect(Collectors.joining("\n"));
+        StringBuilder hist = new StringBuilder();
+        boolean anchorInScope = history != null && history.stream()
+                .anyMatch(m -> anchorRequest != null && anchorRequest.equals(m.getContent()));
+        if (anchorRequest != null && !anchorRequest.isBlank() && !anchorInScope) {
+            hist.append("user（本次任务的原始请求）：").append(anchorRequest).append('\n');
+        }
+        if (history != null) {
+            hist.append(history.stream()
+                    .map(m -> (m.getRole() != null ? m.getRole() : "user") + "：" + (m.getContent() == null ? "" : m.getContent()))
+                    .collect(Collectors.joining("\n")));
+        }
+        String histText = hist.toString();
         try {
             ChatResponse r = chatModel.call(new Prompt(List.of(
                     new SystemMessage(PromptProperties.render(promptProperties.paramExtractorSystem(),
@@ -235,7 +282,7 @@ public class ParamFillingService {
     /** 生成追问文本（带计数与 CLARIFY_PREFIX 前缀）。 */
     private String buildQuestion(List<ParamDef> missing, int n) {
         StringBuilder sb = new StringBuilder(CLARIFY_PREFIX);
-        if (missing.size() > 1) sb.append("（").append(n).append("/").append(MAX_CLARIFY).append("）");
+        if (missing.size() > 1) sb.append("（").append(n).append("/").append(ClarifyState.MAX_ASKED).append("）");
         sb.append("：\n");
         for (ParamDef p : missing) {
             sb.append("- ").append(p.label);
@@ -295,14 +342,21 @@ public class ParamFillingService {
         final Map<String, String> paramLabels;
         final boolean limited;
         final List<String> missingLabels;
+        /**
+         * 本轮追问落库后的澄清状态；<b>非 null 时编排层必须与追问消息一并写入</b>。
+         * 为 null 表示本轮没有产生新追问（参数已齐 / 已达上限）—— 那意味着状态应当作废。
+         */
+        @Getter
+        final ClarifyState nextState;
 
         ClarifyDecision(String question, Map<String, String> params, Map<String, String> paramLabels,
-                        boolean limited, List<String> missingLabels) {
+                        boolean limited, List<String> missingLabels, ClarifyState nextState) {
             this.question = question;
             this.params = params;
             this.paramLabels = paramLabels;
             this.limited = limited;
             this.missingLabels = missingLabels;
+            this.nextState = nextState;
         }
     }
 }

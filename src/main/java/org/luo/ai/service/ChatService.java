@@ -12,6 +12,7 @@ import org.luo.ai.agent.handler.ReviewRoundHandler;
 import org.luo.ai.agent.handler.RoundHandler;
 import org.luo.ai.agent.handler.RoundResult;
 import org.luo.ai.trace.RoundTrace;
+import org.luo.ai.trace.SelfEvalService;
 import org.luo.ai.trace.TraceService;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -20,11 +21,13 @@ import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import org.luo.ai.agent.MemoryMergeService;
 import org.luo.ai.agent.PromptService;
 import org.luo.ai.chat.ChatComposer;
 import org.luo.ai.memory.DbChatMemory;
+import org.luo.ai.memory.MemoryViewService;
 
 /**
  * 对话编排服务（门面）：一轮对话统一走 {@link #runRound}，按会话形态选 {@link RoundHandler} 策略
@@ -70,6 +73,12 @@ public class ChatService {
     private final TraceService traceService;
     /** 内容安全护栏（输出侧）：所有出口正文在推送/返回前过一遍；护栏关闭时完全短路。 */
     private final ContentSafetyService safetyService;
+    /** 记忆窗口视图（只读）：把「本轮会注入哪些历史」采进追踪，供页面回答「它为什么记得/不记得」。 */
+    private final MemoryViewService memoryViewService;
+    /** 长期事实条目：采集「本轮注入了多少字的事实段」用（与注入侧同一段文本，见其 injectableFactsText）。 */
+    private final ConversationFactService factService;
+    /** 线上回答自评（元认知）：回复交付之后按采样抽检一次，结果补写进追踪行；开关默认关。 */
+    private final SelfEvalService selfEvalService;
 
     public ChatService(ConversationService conversationService,
                        MemoryMergeService memoryMergeService,
@@ -77,7 +86,10 @@ public class ChatService {
                        PlannerRoundHandler plannerRoundHandler,
                        ReviewRoundHandler reviewRoundHandler,
                        TraceService traceService,
-                       ContentSafetyService safetyService) {
+                       ContentSafetyService safetyService,
+                       MemoryViewService memoryViewService,
+                       ConversationFactService factService,
+                       SelfEvalService selfEvalService) {
         this.conversationService = conversationService;
         this.memoryMergeService = memoryMergeService;
         this.agentRoundHandler = agentRoundHandler;
@@ -85,6 +97,9 @@ public class ChatService {
         this.reviewRoundHandler = reviewRoundHandler;
         this.traceService = traceService;
         this.safetyService = safetyService;
+        this.memoryViewService = memoryViewService;
+        this.factService = factService;
+        this.selfEvalService = selfEvalService;
     }
 
     /**
@@ -114,11 +129,16 @@ public class ChatService {
         persistAttachments(conversationId, watermark, attachmentsJson);
         persistCitations(conversationId, watermark, out.citations());
         persistBranch(conversationId, watermark, branch);   // 同步接口无事件通道，失败只能落日志
-        log.info("同步对话完成：回复长度={}，引用={}", out.reply() != null ? out.reply().length() : 0,
+        String delivered = screen(out.reply());
+        log.info("同步对话完成：回复长度={}，引用={}", delivered != null ? delivered.length() : 0,
                 out.citations().size());
         afterReply(conversationId, message);
-        traceService.saveAsync(trace);
-        return screen(out.reply());
+        // 自评要 UPDATE 追踪行，故串在「追踪确实落库」之后（详见 SelfEvalService#maybeEvaluate）
+        CompletableFuture<Void> traceSaved = traceService.saveAsync(trace);
+        if (selfEvalWorthy(out)) {
+            selfEvalService.maybeEvaluate(trace, delivered, traceSaved);
+        }
+        return delivered;
     }
 
     /**
@@ -225,7 +245,11 @@ public class ChatService {
             traceService.saveAsync(trace);
             throw e;
         }
-        traceService.saveAsync(trace);
+        // 自评要 UPDATE 追踪行，故串在「追踪确实落库」之后（详见 SelfEvalService#maybeEvaluate）
+        CompletableFuture<Void> traceSaved = traceService.saveAsync(trace);
+        if (selfEvalWorthy(out)) {
+            selfEvalService.maybeEvaluate(trace, screen(out.reply()), traceSaved);
+        }
     }
 
     /** 流式执行体（跑在弹性线程上，可阻塞调用 LLM），结果经 sink 推送。 */
@@ -287,7 +311,11 @@ public class ChatService {
         }
         // 数据优先于记忆：正文推完再收尾（见 afterReply）
         afterReply(conversationId, message);
-        traceService.saveAsync(trace);
+        // 自评要 UPDATE 追踪行，故串在「追踪确实落库」之后（详见 SelfEvalService#maybeEvaluate）
+        CompletableFuture<Void> traceSaved = traceService.saveAsync(trace);
+        if (selfEvalWorthy(out)) {
+            selfEvalService.maybeEvaluate(trace, screen(out.reply()), traceSaved);
+        }
     }
 
     /** 是否有附件展示元数据（空串/null 视为无）。 */
@@ -308,6 +336,28 @@ public class ChatService {
     /** 建本轮追踪上下文（纯内存对象，失败不影响对话）。 */
     private static RoundTrace startTrace(String conversationId, String message) {
         return new RoundTrace(conversationId, message);
+    }
+
+    /**
+     * 采集本轮注入的记忆构成（旁路观测，供页面回答「它为什么记得 / 不记得」）。
+     * <p>
+     * <b>为什么在业务侧算，而不是让 Advisor 上报</b>：Spring AI 的 {@code ChatMemory.get} 只收
+     * conversationId，拿不到 advisor 上下文里的 trace；而这里调的是与它<b>同一个</b>
+     * {@link DbChatMemory#snapshot}，且采集时机就在模型调用之前、期间没有任何写入，故两者数值一致。
+     * 代价是每轮多一次「最近 N 条」的索引查询 —— 属于可接受的观测开销。
+     * <p>
+     * 失败只记日志：追踪是纯旁路，缺数据可以接受，报错不可以。
+     */
+    private void captureMemoryInjection(RoundTrace trace, Conversation conv, String conversationId) {
+        if (trace == null || conv == null) return;
+        try {
+            // 第三段（事实）与注入侧取的是同一段文本：条目优先、旧归档兜底，判据在 ConversationFactService
+            trace.memoryInjection(memoryViewService.window(conversationId),
+                    conv.getSummary(),
+                    factService.injectableFactsText(conversationId, conv.getCoreFacts()));
+        } catch (Exception e) {
+            log.warn("记忆注入采集失败：会话={}", conversationId, e);
+        }
     }
 
     /** 附件元数据写入本轮用户消息（仅历史回看，失败只记日志）。 */
@@ -367,10 +417,21 @@ public class ChatService {
         RoundHandler handler = selectHandler(conv, planner);
         trace.mode(handler == plannerRoundHandler ? MODE_PLANNER
                 : (handler == reviewRoundHandler ? MODE_REVIEW : MODE_AGENT));
+        // 记忆注入采集：只在「整轮只注入一次」的形态下采（agent）。规划模式每一步各自组装 prompt、各自注入
+        // 同一个窗口，评审模式每个候选也各注入一次 —— 那种情况下「一轮一份」的清单代表不了任何一次调用，
+        // 与其给一份看着合理却对不上的数字，不如留空（前端会明确说「未采集」）。
+        if (handler == agentRoundHandler) {
+            captureMemoryInjection(trace, conv, conversationId);
+        }
         RoundResult r = handler.handle(conv, conversationId, message, material, progress, trace);
         // 规划策略返回回退信号（fallback，reply 为 null）：转普通对话策略兜底
         if (r == null || r.isFallback()) {
             trace.mode(MODE_AGENT);
+            // 规划/评审回退成普通对话：形态在这一刻才确定，注入清单也在此刻采（覆盖语义，只采一次）。
+            // 此刻采还有个好处——规划器可能已往 chat_message 写过东西，执行前采反而与真实注入不符。
+            if (handler != agentRoundHandler) {
+                captureMemoryInjection(trace, conv, conversationId);
+            }
             r = agentRoundHandler.handle(conv, conversationId, message, material, progress, trace);
         }
         // 引用由检索环节产出、不在模型调用链上，Advisor 采集不到：必须在此显式回写，
@@ -446,4 +507,15 @@ public class ChatService {
     /** 空进度回调：同步接口（无事件通道）使用，执行过程只落日志。 */
     private static final Consumer<String> NO_PROGRESS = text -> {
     };
+
+    /**
+     * 本轮产出的是否是「值得自评的回答」。
+     * <p>
+     * 澄清追问、计划清单、审批暂停说明都不是「对用户问题的回答」，而自评的锚点是「有没有答到点上」——
+     * 拿清单去评分只会得到一堆低分，把可观测面板的「低分轮次」变成噪声来源，反而掩盖真正的问题轮次。
+     * 故这三类一律不评（{@code self_eval_score} 留 NULL，面板按「未自评」计数，与「评了低分」分开）。
+     */
+    private static boolean selfEvalWorthy(RoundResult out) {
+        return out != null && !out.clarified() && !out.hasPlan() && !out.hasApproval();
+    }
 }

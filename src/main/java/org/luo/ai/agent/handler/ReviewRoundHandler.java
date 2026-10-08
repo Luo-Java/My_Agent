@@ -14,6 +14,7 @@ import org.luo.ai.service.CrossSessionSearchService;
 import org.luo.ai.service.KbSearchService;
 import org.luo.ai.trace.LlmUsageService;
 import org.luo.ai.trace.RoundTrace;
+import org.luo.ai.util.LlmJson;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -230,7 +231,7 @@ public class ReviewRoundHandler implements RoundHandler {
     /** 解析 {@code {"agentCodes":[...]}}，只保留确实在候选池里的编码（模型可能编出不存在的编码）。 */
     private static List<Agent> parseCodes(String text, List<Agent> pool) {
         if (text == null || text.isBlank()) return List.of();
-        String json = extractJsonObject(text);
+        String json = LlmJson.extractObject(text);
         if (json == null) return List.of();
         try {
             JSONArray arr = JSONUtil.parseObj(json).getJSONArray("agentCodes");
@@ -251,12 +252,8 @@ public class ReviewRoundHandler implements RoundHandler {
         }
     }
 
-    /** 从可能被 ``` 包裹或带前后缀的文本里截出第一个 JSON 对象；取不到返回 null。 */
-    private static String extractJsonObject(String text) {
-        int start = text.indexOf('{');
-        int end = text.lastIndexOf('}');
-        return (start < 0 || end <= start) ? null : text.substring(start, end + 1);
-    }
+    // 从可能被 ``` 包裹 / 带前后缀的文本里截出 JSON 对象的逻辑已抽到 LlmJson.extractObject
+    // （自评也用它，两处各写一份迟早会出现细微差异，而差异表现为「某个功能偶尔解析失败」）。
 
     // ==================== ② 并行作答 ====================
 

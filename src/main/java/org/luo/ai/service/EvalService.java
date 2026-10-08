@@ -14,6 +14,7 @@ import org.luo.ai.dto.EvalBatchSummary;
 import org.luo.ai.dto.EvalCase;
 import org.luo.ai.dto.EvalCaseResult;
 import org.luo.ai.dto.EvalCompare;
+import org.luo.ai.entity.EvalCaseEntity;
 import org.luo.ai.entity.EvalResult;
 import org.luo.ai.mapper.EvalResultMapper;
 import org.luo.ai.properties.EvalProperties;
@@ -30,10 +31,12 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -74,6 +77,7 @@ public class EvalService {
     private final PlannerService plannerService;
     private final AgentService agentService;
     private final EvalResultMapper evalResultMapper;
+    private final EvalCaseService evalCaseService;
     private final Executor evalExecutor;
 
     public EvalService(EvalProperties props,
@@ -82,6 +86,7 @@ public class EvalService {
                        PlannerService plannerService,
                        AgentService agentService,
                        EvalResultMapper evalResultMapper,
+                       EvalCaseService evalCaseService,
                        @Qualifier("evalExecutor") Executor evalExecutor) {
         this.props = props;
         this.resourceLoader = resourceLoader;
@@ -89,6 +94,7 @@ public class EvalService {
         this.plannerService = plannerService;
         this.agentService = agentService;
         this.evalResultMapper = evalResultMapper;
+        this.evalCaseService = evalCaseService;
         this.evalExecutor = evalExecutor;
     }
 
@@ -97,12 +103,34 @@ public class EvalService {
     // ------------------------------------------------------------------
 
     /**
-     * 读取用例集并按场景过滤。
+     * 读取用例集（yaml 种子 + 库内用例）并按场景过滤。
      * <p>
-     * 文件不存在 / YAML 解析失败 / 缺 {@code cases} 列表 → 抛 400：评测自己坏掉必须立刻说清楚，
+     * yaml 部分：文件不存在 / 解析失败 / 缺 {@code cases} 列表 → 抛 400。评测自己坏掉必须立刻说清楚，
      * 不能悄悄跑出个空结果让人误以为「全过了」。单条用例字段不全则跳过并告警（不影响其余用例）。
+     * <p>
+     * 库内部分（{@code eval_case} 表，当前唯一来源是用户反馈）：<b>同名以 yaml 为准</b> —— 种子是人工审校
+     * 过的，不该被一条自动生成的记录静默顶掉；撞名时记 WARN 并跳过库内那条。
      */
     public List<EvalCase> loadCases(String scenarioFilter) {
+        List<EvalCase> out = new ArrayList<>();
+        Set<String> yamlNames = new HashSet<>();
+        for (EvalCase c : readYamlCases()) {
+            yamlNames.add(c.name());
+            if (c.matches(scenarioFilter)) out.add(c);
+        }
+        for (EvalCaseEntity row : evalCaseService.listEnabled()) {
+            if (yamlNames.contains(row.getName())) {
+                log.warn("库内用例与用例集同名，已忽略库内那条（种子优先）：{}", row.getName());
+                continue;
+            }
+            EvalCase ec = fromEntity(row);
+            if (ec.matches(scenarioFilter)) out.add(ec);
+        }
+        return out;
+    }
+
+    /** 读取 yaml 用例集（不做场景过滤）；文件缺失 / 解析失败 / 空列表一律 400。 */
+    private List<EvalCase> readYamlCases() {
         Resource res = resourceLoader.getResource(props.casesFile());
         if (!res.exists()) {
             throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "评测用例集不存在：" + props.casesFile());
@@ -132,11 +160,30 @@ public class EvalService {
                 continue;
             }
             JSONObject expect = c.getJSONObject("expect");
-            EvalCase ec = new EvalCase(name.trim(), scenario.trim().toUpperCase(Locale.ROOT), input,
-                    c.getStr("pendingQuestion"), expect == null ? new JSONObject() : expect);
-            if (ec.matches(scenarioFilter)) out.add(ec);
+            out.add(new EvalCase(name.trim(), scenario.trim().toUpperCase(Locale.ROOT), input,
+                    c.getStr("pendingQuestion"), expect == null ? new JSONObject() : expect));
         }
         return out;
+    }
+
+    /**
+     * 库内用例行 → 统一用例形态。
+     * <p>
+     * {@code expect_json} 解析失败时<b>保留空断言</b>而不是丢弃这条用例：断言为空的用例会被判成「用例配置
+     * 错误」（见各 {@code evalXxx} 的末段检查），在界面上显示成琥珀色的一档 —— 让人看见「这条用例坏了」。
+     * 丢弃它反而会让人以为它跑过了。
+     */
+    private static EvalCase fromEntity(EvalCaseEntity row) {
+        JSONObject expect = new JSONObject();
+        if (!isBlank(row.getExpectJson())) {
+            try {
+                expect = JSONUtil.parseObj(row.getExpectJson());
+            } catch (Exception e) {
+                log.warn("库内用例的断言不是合法 JSON（用例={}），按空断言处理：{}", row.getName(), e.getMessage());
+            }
+        }
+        return new EvalCase(row.getName(), row.getScenario(), row.getInput(), row.getPendingQuestion(),
+                expect, EvalCase.SOURCE_FEEDBACK);
     }
 
     // ------------------------------------------------------------------

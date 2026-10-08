@@ -115,12 +115,22 @@ public class AgentRoundHandler implements RoundHandler {
         ParamFillingService.ClarifyDecision decision = paramFillingService.decideClarify(conversationId, message, agent);
         if (decision.getQuestion() != null) {
             // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮回答能复用同一 agent。
-            // 落库由 saveClarifyExchange 统一完成（避免话题切换分支误落库失效的追问）。
+            // 状态与消息同一次落库（避免话题切换分支误落库失效的追问）：只落消息不落状态，下一轮就读不到
+            // 「问到第几次 / 原始请求是什么 / 已确认哪些参数」——历史被摘要压缩或标记不参与记忆后必然算歪。
             if (agent != null && !explicitBinding) {
                 conversationService.bindAgent(conversationId, agent.getId());
             }
+            conversationService.saveClarifyState(conversationId, decision.getNextState());
             conversationService.saveClarifyExchange(conversationId, message, decision.getQuestion());
             return RoundResult.clarify(decision.getQuestion());
+        }
+        // 非追问分支：把可能残留的追问状态显式作废（此时 decision.nextState 恒为 null）。
+        // 不能只依赖下面的 unbindAgent —— 它的第二个条件是「非显式绑定」，而显式绑定的智能体根本不走解绑
+        // （点智能体卡片开会话就是显式绑定，正是带 paramSchema 的智能体的主路径）⇒ 状态与输入区提示会永久残留，
+        // 且下一轮会把「上一轮的原始请求锚点 + 已确认参数」当成新请求的上下文，污染参数抽取。
+        // 只在「该智能体带 paramSchema」时才写，避免给无参数智能体 / 普通闲聊每轮白跑一次 UPDATE。
+        if (agent != null && agent.getParamSchema() != null && !agent.getParamSchema().isBlank()) {
+            conversationService.saveClarifyState(conversationId, decision.getNextState());
         }
         // 常规单智能体回答（动态规划由 planner 会话单独处理，见 PlannerRoundHandler）。
         // message 为纯提问（不含附件），附件材料走 material 注入 system，不进会话记忆。

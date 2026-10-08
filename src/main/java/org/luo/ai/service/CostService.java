@@ -46,7 +46,8 @@ public class CostService {
             "MEMORY_MERGE", "记忆合并",
             "SUBAGENT", "智能体转交",
             "RECALL", "跨会话召回",
-            "REVIEW", "并行评审");
+            "REVIEW", "并行评审",
+            "SELF_EVAL", "回答自评");
 
     /**
      * 聚合近 {@code days} 天的全量成本。任何一步聚合异常都降级为空视图（成本看板是观测，不阻断）。

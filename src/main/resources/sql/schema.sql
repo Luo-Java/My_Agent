@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS conversation (
     updated_at DATETIME                                 COMMENT '最后更新时间，用于会话列表倒序排序',
     summary           TEXT        DEFAULT NULL               COMMENT '较早对话的滚动摘要（长期记忆），超出最近窗口的历史由LLM压缩写入',
     summarized_count  INT         DEFAULT 0                  COMMENT '已被摘要覆盖的最旧消息条数（按时间正序索引）',
-    core_facts        TEXT        DEFAULT NULL               COMMENT '用户核心信息（长期关键事实：姓名/身份/偏好/待办等），随摘要一起由LLM提取更新',
+    core_facts        TEXT        DEFAULT NULL               COMMENT '用户核心信息（旧版事实归档：逐条事实已迁到 conversation_fact，本列保留原文不再自动更新）',
+    clarify_state     TEXT        DEFAULT NULL               COMMENT '参数补全（澄清追问）的显式状态 JSON：{agentId,asked,request,question,params}；NULL=无进行中的追问。落库以摆脱「每轮扫历史重放推导」——历史被摘要压缩或标记不参与记忆后，重放会算错已问次数与已确认参数',
     PRIMARY KEY (id),
     -- 会话列表查询是「WHERE user_id = ? ORDER BY updated_at DESC」：复合索引让过滤与排序一趟走完（免 filesort）。
     -- 单列 (user_id) 是本索引的最左前缀，无需再单独建（存量库若已有 idx_user 可择机删除，见 alter.sql）。
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
     turn_group_id   VARCHAR(64)  DEFAULT NULL            COMMENT '对话分支组ID（UUID）：同一轮提问的多个「版本」（编辑重发 / 重新生成）共用；NULL=从未分叉，该轮只有一个版本。刻意不做回填——NULL 即旧语义',
     turn_version    INT          DEFAULT NULL            COMMENT '该分支组内的版本序号，从 1 开始递增；版本号连续，故前端可直接令 versionCount = 当前 version',
     turn_active     TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '该版本是否为当前生效版本：1=生效（会被读取、会注入记忆）；同一组内至多一个版本为 1。未分叉的行恒为 1',
+    memory_excluded TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否被用户标记为「不参与记忆」：1=该条既不进记忆窗口、也不进摘要（历史仍可见）；0=正常参与（默认）',
     created_at      DATETIME                             COMMENT '消息写入时间；同一轮消息的先后顺序由自增主键 id 兜底（查询统一 ORDER BY created_at, id）。分叉出的新版本沿用被替换版本首条的 created_at，以占回原来的位置——否则它会带着更晚的时间排到后面几轮之后',
     PRIMARY KEY (id),
     -- 复合索引：供「按会话倒序取最近 N 条消息」的记忆窗口读取（DbChatMemory），避免长会话全表扫描
@@ -128,12 +130,15 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     elapsed_ms        BIGINT       NOT NULL DEFAULT 0      COMMENT '本轮总耗时（毫秒，从进入编排到产出回复）',
     status            VARCHAR(16)  NOT NULL DEFAULT 'ok'   COMMENT '本轮结果：ok=正常产出，error=异常',
     error_message     VARCHAR(1000) DEFAULT NULL           COMMENT '异常信息（status=error 时）',
+    memory_json       TEXT         DEFAULT NULL            COMMENT '本轮注入的记忆构成快照（JSON：窗口逐条 role/preview/chars + 长期摘要/长期事实字符数）；NULL=未采集（旁路观测，失败即留空）',
+    self_eval_score   TINYINT      DEFAULT NULL            COMMENT '模型对回答的自评分 1~5；NULL=未自评（按比例采样未命中 / 回答过短 / 调用失败）。单独成列而非只存 JSON：可观测面板的「低分轮次」要按它过滤与聚合，JSON 里解析不出索引',
+    self_eval_json    TEXT         DEFAULT NULL            COMMENT '自评明细 JSON：score/answered/grounded/issues/comment/trigger；NULL=未自评。与 score 同生共死，一列过滤一列细看',
     created_at        DATETIME                             COMMENT '记录时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_trace_id (trace_id),
     INDEX idx_trace_conv (conversation_id, created_at),
     INDEX idx_trace_created (created_at)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '智能体链路追踪表：一轮对话的路由/RAG/工具/token/耗时留痕';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '智能体链路追踪表：一轮对话的路由/RAG/工具/token/耗时/自评留痕';
 
 -- 裸 LLM 调用成本流水表：与 agent_trace 互补，记全量成本。
 -- agent_trace 只记「正式回答 + 工具循环」的 token；路由判定/参数抽取/查询改写/视觉识别/记忆合并这些
@@ -142,7 +147,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交',
+    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交 / RECALL=跨会话召回 / REVIEW=并行评审 / SELF_EVAL=回答自评',
     model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
     prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
     completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
@@ -186,6 +191,7 @@ CREATE TABLE IF NOT EXISTS task (
     status          VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT '任务状态：RUNNING/DONE/FAILED/CANCELLED',
     total_steps     INT          NOT NULL DEFAULT 0      COMMENT '步骤总数（快照，避免反复数）',
     done_steps      INT          NOT NULL DEFAULT 0      COMMENT '已完成步骤数（冗余，供列表快速展示进度）',
+    pause_requested TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '用户中途喊停的信号位：1=执行循环在下一个「层边界」停止推进（正在跑的那一层照常跑完），剩余步骤保持 PENDING、任务保持 RUNNING；由续跑入口（resumeTask）负责清零，故不会把用户永久挡在门外',
     result          LONGTEXT     DEFAULT NULL            COMMENT '最终汇总结果（汇总步产出/最后一个成功步骤产出）',
     created_at      DATETIME                             COMMENT '创建时间',
     updated_at      DATETIME                             COMMENT '最后更新时间',
@@ -217,44 +223,9 @@ CREATE TABLE IF NOT EXISTS task_step (
     INDEX idx_step_task (task_id, step_index)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务步骤表：任务每一步的产出与状态落库（断点续跑的最小粒度）';
 
-
--- 新增「规划任务」与「规划任务步骤」表（跨轮任务状态持久化）：schema.sql 已含建表语句，这里同样保留一份，
--- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
--- 一轮规划 = 一条 task + N 条 task_step；单会话单 RUNNING，开新规划任务前自动结旧；显式续跑只跑剩余步骤。
-CREATE TABLE IF NOT EXISTS task (
-    id              VARCHAR(64)  NOT NULL                COMMENT '任务ID（业务层生成UUID）',
-    conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id',
-    user_goal       TEXT         DEFAULT NULL            COMMENT '用户原始目标（触发规划的那句原话）',
-    status          VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT '任务状态：RUNNING/DONE/FAILED/CANCELLED',
-    total_steps     INT          NOT NULL DEFAULT 0      COMMENT '步骤总数（快照，避免反复数）',
-    done_steps      INT          NOT NULL DEFAULT 0      COMMENT '已完成步骤数（冗余，供列表快速展示进度）',
-    result          LONGTEXT     DEFAULT NULL            COMMENT '最终汇总结果（汇总步产出/最后一个成功步骤产出）',
-    created_at      DATETIME                             COMMENT '创建时间',
-    updated_at      DATETIME                             COMMENT '最后更新时间',
-    PRIMARY KEY (id),
-    INDEX idx_task_conv (conversation_id, status)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务表：一轮多智能体规划任务的落库与断点续跑';
-
-CREATE TABLE IF NOT EXISTS task_step (
-    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-    task_id        VARCHAR(64)  NOT NULL                COMMENT '所属任务ID，关联 task.id',
-    step_index     INT          NOT NULL                COMMENT '步骤下标（0基，对应规划 steps 数组位置，即重映射后的 specs 连续下标）',
-    agent_code     VARCHAR(64)  NOT NULL                COMMENT '本步执行的智能体编码',
-    instruction    TEXT         DEFAULT NULL            COMMENT '给该智能体的指令',
-    depends_on     VARCHAR(500) DEFAULT '[]'            COMMENT '依赖的前序步骤下标（JSON数组，如 [0,1]；空表=无依赖）',
-    status         VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT '步骤状态：PENDING/RUNNING/DONE/SKIPPED/FAILED',
-    retry_count    INT          NOT NULL DEFAULT 0      COMMENT '重试次数（0=未重试；续跑对 FAILED 重试一次，累计>=2 判确定性失败）',
-    approval_required TINYINT(1) NOT NULL DEFAULT 0     COMMENT '该步执行前是否需要用户审批：1=执行到此步先暂停等待批准（计划阶段可改），0=直接执行',
-    approved       TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '审批是否已通过：1=已批准可执行；0=未批准。仅当 approval_required=1 时有约束意义',
-    output         LONGTEXT     DEFAULT NULL            COMMENT '本步产出文本（成功时写入；失败/空为 NULL）',
-    error          VARCHAR(1000) DEFAULT NULL           COMMENT '失败原因（FAILED 时）',
-    citations_json TEXT         DEFAULT NULL            COMMENT '本步 RAG 引用（与 chat_message.citations_json 同构）',
-    started_at     DATETIME                             COMMENT '开始执行时间',
-    finished_at    DATETIME                             COMMENT '完成时间',
-    PRIMARY KEY (id),
-    INDEX idx_step_task (task_id, step_index)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划任务步骤表：任务每一步的产出与状态落库（断点续跑的最小粒度）';
-
+-- ===========================================================================
+-- 下表：把跑顺的多智能体规划「步骤骨架」沉淀为可复用资产（规划模板）
+-- ===========================================================================
 -- 「规划模板」表：把一次跑顺的多智能体规划**步骤骨架**沉淀成可复用资产，同类目标下次直接套用，
 -- 省掉一次规划模型往返（此前 task/task_step 只服务断点续跑，跑成功的序列从没被复用）。
 -- 步骤存**快照 JSON** 而非引用 task_step，两个原因：① task_step 带 status/output/retry_count 等运行态列，
@@ -275,65 +246,68 @@ CREATE TABLE IF NOT EXISTS task_template (
     INDEX idx_tpl_user (user_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划模板表：把跑顺的规划步骤骨架沉淀为可复用资产';
 
-
--- 新增「裸 LLM 调用成本流水」表（全量成本口径）：schema.sql 已含建表语句，这里同样保留一份，
--- 供存量库直接执行（CREATE TABLE IF NOT EXISTS 幂等，表已存在时不报错）。
--- 与 agent_trace 互补：agent_trace 只记「正式回答+工具循环」token；本表记路由/参数抽取/查询改写/任务规划/视觉/记忆合并等
--- 裸 ChatModel.call() 的 token，成本看板据此做全量聚合与按用途（purpose）拆解。
-CREATE TABLE IF NOT EXISTS llm_usage (
-    id                BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-    trace_id          VARCHAR(64)  DEFAULT NULL            COMMENT '本轮追踪ID（可空：视觉识别是独立请求、早于 trace 建立）',
-    conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID（可空：如生成智能体人设这类无会话的调用）',
-    purpose           VARCHAR(24)  NOT NULL                COMMENT '调用用途：ROUTE=智能路由 / CLARIFY=参数抽取 / REWRITE=查询改写 / PLAN=任务规划 / VISION=视觉识别 / MEMORY_MERGE=记忆合并 / SUBAGENT=智能体转交',
-    model             VARCHAR(128) DEFAULT NULL            COMMENT '实际使用的模型名（可空：未显式指定时取默认模型）',
-    prompt_tokens     INT          NOT NULL DEFAULT 0      COMMENT '本次调用输入 token',
-    completion_tokens INT          NOT NULL DEFAULT 0      COMMENT '本次调用输出 token',
-    total_tokens      INT          NOT NULL DEFAULT 0      COMMENT '本次调用 token 合计',
-    created_at        DATETIME                             COMMENT '记录时间',
+-- ===========================================================================
+-- 下表：用户反馈与「库内回归用例」
+--   eval-cases.yaml 是**只读种子**（打包进 jar，运行时写不了），库内用例表承接运行时新增
+--   （主要来自用户对某条回复的点踩），两者在 EvalService.loadCases 里合并参与跑批。
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS message_feedback (
+    id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    message_id      BIGINT       NOT NULL                COMMENT '被评价的消息ID，关联 chat_message.id（恒为助手回复）',
+    conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id（归属校验与按会话查询用）',
+    user_id         BIGINT       NOT NULL                COMMENT '评价人用户ID，关联 sys_user.id；一人对一条消息一票',
+    rating          VARCHAR(8)   NOT NULL                COMMENT '评价：UP=有用 / DOWN=有问题',
+    reason          VARCHAR(32)  DEFAULT NULL            COMMENT '问题分类（仅 DOWN 时有意义）：ANSWERS_OFF=答非所问 / FABRICATED=编造 / ROUTING=路由或规划不对 / OTHER=其他',
+    comment         VARCHAR(500) DEFAULT NULL            COMMENT '补充说明（用户填的原文，供人工排查；不进任何断言）',
+    user_input      TEXT         DEFAULT NULL            COMMENT '那一轮的用户输入快照：转回归用例时作为用例 input。存快照而非联查——反馈是「对那一轮的评价」，会话被删、消息被改都不该让它失效（与 agent_trace 存 user_message 同一取舍）',
+    eval_case_id    BIGINT       DEFAULT NULL            COMMENT '转成的库内回归用例ID，关联 eval_case.id；NULL=尚未转为用例',
+    created_at      DATETIME                             COMMENT '首次评价时间',
+    updated_at      DATETIME                             COMMENT '最后改票时间',
     PRIMARY KEY (id),
-    INDEX idx_usage_purpose (purpose, created_at),
-    INDEX idx_usage_conv (conversation_id, created_at),
-    INDEX idx_usage_created (created_at)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '裸 LLM 调用成本流水表：全量成本口径（按用途拆解）';
+    UNIQUE KEY uk_fb_msg_user (message_id, user_id),
+    INDEX idx_fb_conv (conversation_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '消息反馈表：对助手回复的显式评价，是「线上翻车 → 回归用例」的入口';
 
--- 提示词回归评测结果表（新表，IF NOT EXISTS 幂等）。用于「改完 prompts.yaml 跑一批固定用例、与上一批对比」。
--- 只保留最近 20 个批次（EvalService 跑批后自动清理），无需归档。
-CREATE TABLE IF NOT EXISTS eval_result (
-    id           BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-    batch_id     VARCHAR(32)   NOT NULL                COMMENT '批次ID：同一次跑批的所有用例共用，跨批次对比按它取数',
-    scenario     VARCHAR(16)   NOT NULL                COMMENT '用例场景：ROUTE=智能路由 / PLAN=动态规划',
-    case_name    VARCHAR(128)  NOT NULL                COMMENT '用例名（来自 eval-cases.yaml）；批次间以它对齐身份，改名会被视作一增一删',
-    input        VARCHAR(500)  NOT NULL                COMMENT '用例输入',
-    expected     VARCHAR(500)  DEFAULT NULL            COMMENT '期望值摘要（用例 expect 的文本化）',
-    actual       VARCHAR(500)  DEFAULT NULL            COMMENT '实际值摘要（被测组件真实产出的决策）',
-    passed       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '是否通过',
-    config_error TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '用例自身配置错误（如引用了不存在的 agentCode）：计入本列而非失败，避免「用例写错」污染提示词质量判断',
-    failure      VARCHAR(1000) DEFAULT NULL            COMMENT '失败原因（逐条断言的差异说明）',
-    detail       TEXT          DEFAULT NULL            COMMENT '被测组件的完整原始输出，排查用',
-    cost_ms      INT           NOT NULL DEFAULT 0      COMMENT '该用例耗时（毫秒）',
-    created_at   DATETIME                              COMMENT '记录时间',
+CREATE TABLE IF NOT EXISTS eval_case (
+    id               BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    name             VARCHAR(128) NOT NULL                COMMENT '用例名（批次对比的身份标识，改名会被视作一增一删）',
+    scenario         VARCHAR(16)  NOT NULL                COMMENT '场景：ROUTE=智能路由 / PLAN=动态规划',
+    input            VARCHAR(500) NOT NULL                COMMENT '用例输入（路由场景=用户消息；规划场景=用户目标）',
+    pending_question VARCHAR(500) DEFAULT NULL            COMMENT '路由场景的「待回答追问」上下文（可空）',
+    expect_json      VARCHAR(500) NOT NULL                COMMENT '期望断言（JSON，键与 eval-cases.yaml 的 expect 同构）',
+    source           VARCHAR(16)  NOT NULL DEFAULT 'FEEDBACK' COMMENT '来源：YAML=用例集文件（本项目不写库，仅预留）/ FEEDBACK=由用户反馈转入',
+    feedback_id      BIGINT       DEFAULT NULL            COMMENT '来源反馈ID，关联 message_feedback.id（source=FEEDBACK 时）',
+    enabled          TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '是否参与跑批：0=停用（留在库里但不再计入批次与对比）',
+    created_at       DATETIME                             COMMENT '创建时间',
     PRIMARY KEY (id),
-    INDEX idx_eval_batch (batch_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词回归评测结果表：一次跑批每个用例一行，按 batch_id 分组';
+    UNIQUE KEY uk_case_name (name),
+    INDEX idx_case_enabled (enabled)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '回归用例表（库内用例）：承接运行时新增的用例，与 eval-cases.yaml 合并参与跑批';
 
-
--- ---------------------------------------------------------------------------
--- 新增「规划模板」表（功能扩展，非补列）：存量库执行这一段即可拿到该表。
--- 与 schema.sql 里的同名建表语句一致；CREATE TABLE IF NOT EXISTS 幂等，重复执行不报错。
--- ---------------------------------------------------------------------------
--- 用途：把一次跑顺的多智能体规划「步骤骨架」存成模板，同类目标下次直接套用（省一次规划模型往返）。
--- 步骤存**快照 JSON** 而不引用 task_step：那张表带 status/output/retry_count 等运行态列，
--- 且局部重规划（TaskService.replanTail）会删改甚至重排它的行，引用式模板会被连带破坏。
-CREATE TABLE IF NOT EXISTS task_template (
-    id             BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-    user_id        BIGINT       NOT NULL                COMMENT '创建者用户ID，关联 sys_user.id；模板按用户隔离，仅本人可见',
-    name           VARCHAR(100) NOT NULL                COMMENT '模板名称（用户填写，如「周报生成」）',
-    description    VARCHAR(500) DEFAULT NULL            COMMENT '备注：适用场景、套用时该填什么目标',
-    steps_json     TEXT         NOT NULL                COMMENT '步骤骨架 JSON 数组：[{agentCode,instruction,dependsOn:[0基下标]}]；刻意不含智能体展示名（改名不该让模板失效），展示时现查',
-    source_task_id VARCHAR(64)  DEFAULT NULL            COMMENT '来源任务ID（从哪次规划存下来的，仅供追溯；源任务被删不影响模板）',
-    use_count      INT          NOT NULL DEFAULT 0      COMMENT '被套用次数（统计用，帮用户判断哪个模板值得留）',
-    created_at     DATETIME                             COMMENT '创建时间',
-    updated_at     DATETIME                             COMMENT '最后更新时间',
+-- ===========================================================================
+-- 下表：结构化长期事实条目（逐条可看 / 可改 / 可删）
+--   此前长期事实是 conversation.core_facts 一个平铺文本字段：聊久了话题一杂就变成不断追加的长段落，
+--   新旧事实混在一起，既无法按主题取用，也无法删掉记错的那一条 —— 只能整段覆盖。
+--   本表把「一条事实」变成一个可寻址的行，让用户能像编辑联系人一样维护它。
+--
+--   与 conversation.core_facts 的关系：core_facts **保留不动**，退化为「旧版文本事实归档」——
+--   MemoryMergeService 首次（本表为空）会把它作为输入喂给 LLM 拆成条目，此后注入侧一律以条目为准。
+--   之所以不清空它：拆分是模型行为、可能有损，保留原文让信息零丢失，用户在面板上可显式删除归档。
+--
+--   fact_hash 的必要性：条目由 LLM 每次重新生成，同一件事实在两次合并里措辞会微微变化 ——
+--   不做去重就会一涨一大片。唯一键 (conversation_id, fact_hash) 把「同一会话内同一条事实」收敛为一行。
+--   （不用 fact 本身做唯一键：VARCHAR(500) utf8mb4 超索引长度上限，必须用定长摘要。）
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS conversation_fact (
+    id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id',
+    topic           VARCHAR(32)  NOT NULL                COMMENT '主题标签（身份 / 偏好 / 待办 / 背景 / 其它），供面板分组与人工扫读',
+    fact            VARCHAR(500) NOT NULL                COMMENT '事实内容（单条，不含主题前缀）',
+    fact_hash       CHAR(32)     NOT NULL                COMMENT 'topic+fact 的 MD5，用于同会话内去重（见建表注释）',
+    source          VARCHAR(16)  NOT NULL DEFAULT 'MERGE' COMMENT '来源：MERGE=自动合并产出（每次合并按 diff 重写）/ USER=用户手动添加（合并绝不覆盖或删除）',
+    created_at      DATETIME                             COMMENT '首次写入时间',
+    updated_at      DATETIME                             COMMENT '最后被确认/改写时间（合并里仍然有效即刷新，故它等于「这条最近还在被维护」）',
     PRIMARY KEY (id),
-    INDEX idx_tpl_user (user_id, created_at)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '规划模板表：把跑顺的规划步骤骨架沉淀为可复用资产';
+    UNIQUE KEY uk_conv_fact (conversation_id, fact_hash),
+    INDEX idx_fact_conv (conversation_id, updated_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '会话长期事实条目表：把 core_facts 那一段文本拆成逐条可管理的行';

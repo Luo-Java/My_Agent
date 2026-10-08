@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.constant.AgentBindSource;
 import org.luo.ai.dto.AttachmentDto;
+import org.luo.ai.dto.ClarifyState;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.dto.TurnBranch;
 import org.luo.ai.entity.ChatMessage;
@@ -40,10 +41,20 @@ public class ConversationService {
 
     private final ConversationMapper conversationMapper;
     private final ChatMessageMapper chatMessageMapper;
+    /**
+     * 长期事实条目：本类只在「作废压缩产物」（重置记忆 / 清空消息 / 切分支）与「删会话级联」时用到它，
+     * 逐条增删改的主战场在 {@link ConversationFactService}。
+     * <p>
+     * 依赖方向是单向的 {@code ConversationService → ConversationFactService}（后者只依赖 mapper，
+     * 归属校验放在 Controller），故不会成环。
+     */
+    private final ConversationFactService factService;
 
-    public ConversationService(ConversationMapper conversationMapper, ChatMessageMapper chatMessageMapper) {
+    public ConversationService(ConversationMapper conversationMapper, ChatMessageMapper chatMessageMapper,
+                               ConversationFactService factService) {
         this.conversationMapper = conversationMapper;
         this.chatMessageMapper = chatMessageMapper;
+        this.factService = factService;
     }
 
     /** 创建新会话：可绑定智能体或标记为规划模式（planner 优先，与 agentId 互斥）。会话归属 {@code userId}。 */
@@ -240,7 +251,7 @@ public class ConversationService {
         log.debug("更新会话跨会话搜索开关：id={}，enabled={}", conversationId, on);
     }
 
-    /** 删除会话及其全部消息。仅本人会话可删，非本人/不存在抛 404。 */
+    /** 删除会话及其全部消息、长期事实条目。仅本人会话可删，非本人/不存在抛 404。 */
     @Transactional
     public void deleteConversation(String conversationId, Long userId) {
         if (conversationId == null || conversationId.isBlank()) return;
@@ -249,6 +260,8 @@ public class ConversationService {
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
         chatMessageMapper.delete(qw);
+        // 事实条目没有外键级联（DDL 刻意不建外键，与本项目其他表一致），必须显式清理，否则留下孤儿行
+        factService.deleteAll(conversationId);
         conversationMapper.deleteById(conversationId);
     }
 
@@ -256,7 +269,23 @@ public class ConversationService {
     public List<Conversation> listConversations(Long userId) {
         QueryWrapper<Conversation> qw = new QueryWrapper<>();
         qw.eq("user_id", userId).orderByDesc("updated_at");
-        return conversationMapper.selectList(qw);
+        List<Conversation> list = conversationMapper.selectList(qw);
+        for (Conversation c : list) decorateClarify(c);
+        return list;
+    }
+
+    /**
+     * 把内部的澄清状态 JSON 解析成两个对外展示字段（{@code clarifyAsked} / {@code clarifyMax}）。
+     * <p>
+     * 解析放在服务端而不是把原始 JSON 丢给前端：前者让「状态结构」只活在服务端，改结构不必同时改前端；
+     * 后者等于把内部 JSON 变成对外契约。无追问 / 坏数据时两个字段留 null，前端 {@code v-if} 自然不渲染。
+     */
+    private static void decorateClarify(Conversation c) {
+        ClarifyState st = ClarifyState.parse(c.getClarifyState());
+        if (st != null && st.asked() > 0) {
+            c.setClarifyAsked(st.asked());
+            c.setClarifyMax(ClarifyState.MAX_ASKED);
+        }
     }
 
     /** 会话内当前最大消息 ID（无消息返回 null）：落库前的「水位」。 */
@@ -328,6 +357,21 @@ public class ConversationService {
     }
 
     /**
+     * <b>记忆口径</b>过滤：在 {@link #activeOnly} 之上再排除用户标记为「不参与记忆」的消息。
+     * <p>
+     * <b>只用于记忆侧三处</b>——{@link #getRecentHistory}（记忆窗口）、{@link #countMessages} 与
+     * {@link #getMessagesRange}（摘要水位）。展示侧（{@link #getHistory}）刻意<b>不</b>加这一条：
+     * 「不进记忆」不等于「删掉」，历史与导出仍应完整可见。
+     * <p>
+     * 三处必须同口径的理由与 {@code turn_active} 完全相同：它们描述的是<b>同一个「可见消息序列」</b>，
+     * 一个多滤掉一条就会让摘要水位与注入区间错位，裂出「既不摘要也不注入」的记忆空洞。
+     */
+    private static void memoryVisible(QueryWrapper<ChatMessage> qw) {
+        activeOnly(qw);
+        qw.eq("memory_excluded", 0);
+    }
+
+    /**
      * 读取会话全部历史（<b>只含当前生效的分支版本</b>），按时间正序。<b>排序必须带 id tiebreaker</b>：
      * {@code created_at} 是秒级 DATETIME，同一轮 user/assistant 时间相同，只按它排序时顺序取决于执行计划，
      * 改走 filesort 就会错序。
@@ -341,19 +385,26 @@ public class ConversationService {
     }
 
     /**
-     * 读取最近 N 条历史（时间正序，同样只含生效版本）：先按 {@code created_at, id} 倒序取 N 条再反转，
-     * 供记忆窗口读取，避免长会话每轮全量加载。走索引需 {@code (conversation_id, created_at)} 复合索引
-     * （schema.sql 已建）。
+     * 读取最近 N 条历史（时间正序，只含<b>生效版本且未标记「不参与记忆」</b>的消息）：先按
+     * {@code created_at, id} 倒序取 N 条再反转，供记忆窗口读取，避免长会话每轮全量加载。走索引需
+     * {@code (conversation_id, created_at)} 复合索引（schema.sql 已建）。
+     * <p>
+     * 这是<b>记忆口径</b>（见 {@link #memoryVisible}）：被用户排除的消息在此不出现，因而既不会进
+     * prompt 上下文、也不会被 {@code MemoryMergeService} 纳入摘要。历史展示请用 {@link #getHistory}。
      *
-     * @param limit &lt;= 0 时退化为全量查询
+     * @param limit &lt;= 0 时退化为全量查询（同样走记忆口径）
      */
     public List<ChatMessage> getRecentHistory(String conversationId, int limit) {
         if (limit <= 0) {
-            return getHistory(conversationId);
+            QueryWrapper<ChatMessage> all = new QueryWrapper<>();
+            all.eq("conversation_id", conversationId);
+            memoryVisible(all);
+            all.orderByAsc("created_at").orderByAsc("id");
+            return chatMessageMapper.selectList(all);
         }
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
-        activeOnly(qw);
+        memoryVisible(qw);
         qw.orderByDesc("created_at").orderByDesc("id")
                 .last("LIMIT " + limit);   // limit 为受控 int 参数，无注入风险
         List<ChatMessage> list = chatMessageMapper.selectList(qw);
@@ -362,20 +413,21 @@ public class ConversationService {
     }
 
     /**
-     * 统计消息总条数（只走 count，同样只算生效版本）。供 {@code MemoryMergeService} 把窗口起点换算成绝对索引：
-     * 摘要侧与注入侧必须基于同一段列表，否则会出现「既不摘要也不注入」的记忆空洞。
+     * 统计消息总条数（只走 count，<b>记忆口径</b>：只算生效版本、且排除「不参与记忆」的消息）。
+     * 供 {@code MemoryMergeService} 把窗口起点换算成绝对索引：摘要侧与注入侧必须基于同一段列表，
+     * 否则会出现「既不摘要也不注入」的记忆空洞。
      */
     public int countMessages(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return 0;
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
-        activeOnly(qw);
+        memoryVisible(qw);
         Long n = chatMessageMapper.selectCount(qw);
         return n == null ? 0 : n.intValue();
     }
 
     /**
-     * 取时间正序下的第 {@code [fromIndex, toIndex)} 条消息（只读「尚未摘要的那一段」，同样只算生效版本）。
+     * 取时间正序下的第 {@code [fromIndex, toIndex)} 条消息（只读「尚未摘要的那一段」，<b>同样走记忆口径</b>）。
      * <p>
      * <b>索引口径与 {@link #countMessages} 必须一致</b>：两者一个给总数、一个给切片，用不同的过滤条件会让
      * 水位指向错误的位置。过滤条件下 {@code LIMIT offset} 作用在过滤之后的结果集上，语义仍然成立。
@@ -388,7 +440,7 @@ public class ConversationService {
         }
         QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
         qw.eq("conversation_id", conversationId);
-        activeOnly(qw);
+        memoryVisible(qw);
         qw.orderByAsc("created_at").orderByAsc("id")
                 .last("LIMIT " + fromIndex + ", " + (toIndex - fromIndex));   // 受控 int 参数，无注入风险
         return chatMessageMapper.selectList(qw);
@@ -436,7 +488,8 @@ public class ConversationService {
      * 清空会话全部消息（保留会话本身），用于 ChatMemory.clear。
      * <p>
      * <b>必须与摘要水位一起归零</b>：否则 {@code summary} 指向不存在的历史，且打破
-     * {@link #getMessagesRange} 的索引契约。两步刻意写在一起——分开写迟早会漏掉一边。
+     * {@link #getMessagesRange} 的索引契约。两步刻意写在一起——分开写迟早会漏掉一边。自动整理出来的
+     * 事实条目同理一并作废（它们是从这段已消失的历史里抽出来的）。
      * <p>
      * 分支版本一并物理删除：消息都没了，留下「没有生效版本」的孤儿版本组只会让切换器指向不存在的内容。
      */
@@ -446,6 +499,9 @@ public class ConversationService {
         log.info("清空会话消息并重置摘要水位：id={}", conversationId);
         chatMessageMapper.delete(new QueryWrapper<ChatMessage>().eq("conversation_id", conversationId));
         resetMemoryWatermark(conversationId);
+        // 消息全没了 ⇒ 进行中的追问也失去了对象（它的「原始请求」就是其中一条消息）。
+        // 这与「重置记忆」不同：那边消息仍在、追问仍可见可答，故刻意不清。
+        saveClarifyState(conversationId, null);
     }
 
     // ===== 对话分支：同一轮提问的多个版本原地并存 =====
@@ -618,22 +674,35 @@ public class ConversationService {
     /** 首次分叉时旧轮记为第 1 版，新版本顺延为第 2 版。 */
     private static final int FIRST_BRANCH_VERSION = 2;
 
-    /** 摘要 / 核心事实 / 已摘要条数三列一齐清零（消息不动）。「删消息」与「重置记忆」共用的一步。 */
+    /**
+     * 摘要 / 旧版事实归档 / 已摘要条数三列一齐清零（消息不动），<b>并作废自动整理出来的长期事实条目</b>。
+     * <p>
+     * 「删消息」与「重置记忆」共用这一步。事实条目一并清理的理由：它们与此前那三段是同一份压缩产物 ——
+     * 摘要清零了、归档清零了，却把从同一段历史里抽出来的条目留着，模型下一轮照样能把这些「已经作废的
+     * 记忆」背出来，现象上就是「重置记忆没生效」。<b>用户手加的条目保留</b>：它不是从历史里压出来的，
+     * 历史换了它依然成立（见 {@code ConversationFactService#deleteGenerated}）。
+     */
     private void resetMemoryWatermark(String conversationId) {
         Conversation c = conversationMapper.selectById(conversationId);
-        if (c == null) return;
-        c.setSummary(null);
-        c.setCoreFacts(null);
-        c.setSummarizedCount(0);
-        conversationMapper.updateById(c);
+        if (c != null) {
+            c.setSummary(null);
+            c.setCoreFacts(null);
+            c.setSummarizedCount(0);
+            conversationMapper.updateById(c);
+        }
+        factService.deleteGenerated(conversationId);
     }
 
     /**
-     * 覆写长期记忆的「摘要」与「核心事实」两列，<b>刻意不动水位 {@code summarized_count}</b>。
+     * 覆写长期记忆的「摘要」与「旧版事实归档」两列，<b>刻意不动水位 {@code summarized_count}</b>。
      * <p>
      * 水位是「已压缩到正序第几条」的执行游标，不是展示字段：用户手改它会让下次自动合并从错误位置继续
      * （重复摘要或整段漏摘要），且这种错位在现象上只表现为「模型记性变怪」，很难回溯。要重置游标请走
      * {@link #resetMemory}（它把三列一起归零，语义自洽）。
+     * <p>
+     * <b>{@code coreFacts} 现在承担的是「旧版文本归档」</b>：逐条事实已迁到 {@code conversation_fact}
+     * （见 {@code ConversationFactService}），自动流程不再写这一列。这里保留写入口，是为了让用户在面板上
+     * 能自行清空 / 修正这份归档 —— 传空串即清空归档而摘要不变。
      * <p>
      * 空串 / 纯空白一律归一为 {@code null}：否则 {@code "  "} 会被当作「有摘要」注入 prompt，占用 token
      * 却不含信息。<b>两个字段都传 null 即等于「清空记忆内容但保留游标」。</b>
@@ -651,16 +720,78 @@ public class ConversationService {
     }
 
     /**
-     * 重置长期记忆：摘要 / 核心事实 / 水位三列一齐归零，<b>但不删消息</b>。
+     * 重置长期记忆：摘要 / 旧版事实归档 / 水位三列归零，<b>并作废自动整理出来的事实条目</b>，但不删消息。
      * <p>
      * 效果是「忘掉此前压缩出的一切，下次超窗时从最早的未摘要消息重新摘要」—— 与 {@link #truncateAfter}
      * 的区别只在「消息保不保留」：这里是「记忆错了、消息没错」，那边是「消息本身就不该在」。
+     * <p>
+     * <b>用户手加的事实条目不在作废范围内</b>（见 {@link #resetMemoryWatermark}）：那是用户写下的，
+     * 不是从历史里压出来的。
      */
     @Transactional
     public void resetMemory(String conversationId, Long userId) {
         requireOwned(conversationId, userId);
         resetMemoryWatermark(conversationId);
         log.info("重置长期记忆（三列归零，消息保留）：会话={}", conversationId);
+    }
+
+    /**
+     * 把某条消息标记为「不参与记忆」（或取消标记）。只改该条，<b>不删任何东西</b> —— 历史与导出照常可见。
+     * <p>
+     * <b>为什么改这一位要顺带清摘要游标</b>：{@code summarized_count} 是「可见消息序列的前几条已被摘要
+     * 覆盖」的执行游标，而「可见」的构成刚被这次操作改变了 —— 游标不动的话它指向的就不再是原来那段历史
+     * （少摘要一条，或把一段已排出的内容永远留在摘要里）。故一律归零，让下次超窗时按新的可见序列重算。
+     * <p>
+     * <b>但摘要内容不清</b>：重新合并会把已有摘要作为输入一起压缩（见 {@code MemoryMergeService#summarize}），
+     * 信息不丢，只是多花一次合并调用。反过来若因为「排掉一条日志」就把 {@code summary}/{@code core_facts}
+     * 也清掉，用户会莫名丢掉「我是谁 / 我的偏好」这类长期事实 —— 那不是这个开关该有的语义。
+     *
+     * @return 该条的记忆参与状态是否真的发生了变化（幂等：重复设同一个值返回 false，且不动游标）
+     */
+    @Transactional
+    public boolean setMessageMemoryExcluded(Long messageId, boolean excluded, Long userId) {
+        ChatMessage m = messageId == null ? null : chatMessageMapper.selectById(messageId);
+        if (m == null) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "消息不存在");
+        }
+        // 归属校验：不是本人的消息，与「消息不存在」返回同一个 404 —— 文案有差异就等于告诉对方
+        // 「这条消息存在，只是不归你」，那就把 messageId 变成了一次存在性探测。
+        String conversationId = m.getConversationId();
+        Conversation owner = conversationId == null ? null : conversationMapper.selectById(conversationId);
+        if (owner == null || !Objects.equals(owner.getUserId(), userId)) {
+            throw new AiBusinessException(AiErrorCode.NOT_FOUND, "消息不存在");
+        }
+        if (Boolean.TRUE.equals(m.getMemoryExcluded()) == excluded) {
+            return false;
+        }
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getId, messageId)
+                .set(ChatMessage::getMemoryExcluded, excluded));
+        resetSummaryCursor(conversationId);
+        log.info("消息记忆参与状态变更：会话={}，消息={}，excluded={}（摘要游标已归零，摘要内容保留）",
+                conversationId, messageId, excluded);
+        return true;
+    }
+
+    /** 被标记为「不参与记忆」的<b>有效</b>消息条数（供记忆面板显示「这些没进上下文」）。 */
+    public int countExcluded(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return 0;
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId);
+        activeOnly(qw);
+        qw.eq("memory_excluded", 1);
+        Long n = chatMessageMapper.selectCount(qw);
+        return n == null ? 0 : n.intValue();
+    }
+
+    /**
+     * 只把摘要<b>执行游标</b>归零，{@code summary} / {@code core_facts} 内容保留。
+     * 与 {@link #resetMemoryWatermark}（三列全清）的区别：这里表达「覆盖范围要重算」，而不是「忘掉一切」。
+     */
+    private void resetSummaryCursor(String conversationId) {
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getSummarizedCount, 0));
     }
 
     /** 空白串归一为 null（区分「没填」与「填了空」——两者对 prompt 注入是同一件事）。 */
@@ -788,26 +919,70 @@ public class ConversationService {
         if (conversationId == null || conversationId.isBlank()) return;
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null || c.getAgentId() == null) return;
-        // 一并清除来源标记，避免残留 EXPLICIT/CLARIFY 指向空绑定
+        // 一并清除来源标记与澄清状态：来源标记留着会出现「EXPLICIT/CLARIFY 指向空绑定」的残留，
+        // 澄清状态留着会出现「已解绑却还停在追问第 2 轮」——两者都是解绑这一刻就该消失的东西。
         LambdaUpdateWrapper<Conversation> wrapper = new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
                 .set(Conversation::getAgentId, null)
-                .set(Conversation::getAgentBindSource, null);
+                .set(Conversation::getAgentBindSource, null)
+                .set(Conversation::getClarifyState, null);
         conversationMapper.update(null, wrapper);
         log.info("解绑智能体：会话={}", conversationId);
     }
 
-    /** 写入长期记忆：滚动摘要 + 核心信息 + 已覆盖条数（一次 UPDATE）。 */
+    // ===== 澄清（参数补全）状态：让「问到第几次 / 原请求是什么 / 已确认哪些参数」跨轮稳定 =====
+
+    /**
+     * 读取澄清状态。无状态（列为空）或数据损坏都返回 {@code null}，调用侧据此重新开始一段追问
+     * （见 {@code ClarifyState#parse}：坏数据只 WARN 不抛，一条坏 JSON 不该让整轮对话 500）。
+     */
+    public ClarifyState getClarifyState(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        Conversation c = conversationMapper.selectById(conversationId);
+        return c == null ? null : ClarifyState.parse(c.getClarifyState());
+    }
+
+    /**
+     * 覆写澄清状态；{@code null} = 清空。
+     * <p>
+     * 两个调用点（都在 {@code AgentRoundHandler}）：① 「确认进入追问」时写入，与追问消息<b>同一次落库</b> ——
+     * 只落消息不落状态，下一轮就读不到原始请求锚点，本功能等于没做；只落状态不落消息，用户看不到那一问。
+     * 两者必须同生同死。② 「本轮不追问」（参数已齐 / 无需参数）时以 {@code null} 清空，作废上一段追问。
+     * 第二步不能省：不清会让输入区提示常驻，且下一轮把上一轮的原始请求与已确认参数当成本轮上下文。
+     */
+    public void saveClarifyState(String conversationId, ClarifyState state) {
+        if (conversationId == null || conversationId.isBlank()) return;
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getClarifyState, state == null ? null : state.toJson()));
+        // 清除是常规动作（「参数已齐」的每一轮都会走到，见 AgentRoundHandler），不记 INFO，免得刷屏；
+        // 真正「写入一段进行中的追问」才值得留痕。
+        if (state == null) {
+            log.debug("清除澄清状态：会话={}", conversationId);
+        } else {
+            log.info("写入澄清状态：会话={}，已问次数={}，已确认参数={}", conversationId,
+                    state.asked(), state.params().size());
+        }
+    }
+
+    /**
+     * 写入自动压缩的产物：滚动摘要 + 已覆盖条数（一次 UPDATE）。
+     * <p>
+     * <b>刻意不再写 {@code core_facts}</b>：自功能 E 起，长期事实改由 {@code conversation_fact} 逐条承载
+     * （见 {@code ConversationFactService}），那一列退化为「旧版文本归档」—— 内容只在用户手动编辑时变化，
+     * 自动合并不再覆写。这样做的意义是「信息不丢」：迁移期它仍是被拆条目的输入（表为空时注入侧也回退读它），
+     * 但一旦条目建立，它就不再被任何自动流程改写，用户可以放心地把它当历史留档或删掉。
+     * <p>
+     * 若哪天又在这里写回 {@code core_facts}，注入侧的「条目优先、归档兜底」就会变成两处内容打架：
+     * 面板上归档看着是新拆出来的条目，模型看到的却是两段措辞不同的同一批事实。
+     */
     @Transactional
-    public void updateMemory(String conversationId, String summary, String coreFacts, int summarizedCount) {
-        log.info("更新长期记忆：会话={}，已覆盖条数={}，摘要长度={}，关键事实长度={}",
-                conversationId, summarizedCount,
-                summary != null ? summary.length() : 0,
-                coreFacts != null ? coreFacts.length() : 0);
+    public void updateSummary(String conversationId, String summary, int summarizedCount) {
+        log.info("更新滚动摘要：会话={}，已覆盖条数={}，摘要长度={}",
+                conversationId, summarizedCount, summary != null ? summary.length() : 0);
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null) return;
         c.setSummary(summary);
-        c.setCoreFacts(coreFacts);
         c.setSummarizedCount(summarizedCount);
         conversationMapper.updateById(c);
     }

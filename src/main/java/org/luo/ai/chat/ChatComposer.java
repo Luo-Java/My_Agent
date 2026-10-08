@@ -7,6 +7,7 @@ import org.luo.ai.properties.PromptProperties;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.entity.Agent;
 import org.luo.ai.entity.Conversation;
+import org.luo.ai.service.ConversationFactService;
 import org.luo.ai.service.CrossSessionSearchService;
 import org.luo.ai.service.KbSearchService;
 import org.luo.ai.tool.SubAgentTool;
@@ -74,6 +75,8 @@ public class ChatComposer {
     private final QueryRewriteService queryRewriteService;
     /** 跨会话召回：在本人其他会话的历史消息里做关键词匹配（与知识库检索是两条独立链路，见其类注释）。 */
     private final CrossSessionSearchService crossSessionSearchService;
+    /** 长期事实条目：注入侧的事实来源（见 {@link #buildLongTermMemoryText}）。 */
+    private final ConversationFactService factService;
     /** 检索问题改写的预取线程池（见 {@link #prefetchRetrievalQuery}）。 */
     private final Executor prefetchExecutor;
 
@@ -89,6 +92,7 @@ public class ChatComposer {
                         KbSearchService kbSearchService,
                         QueryRewriteService queryRewriteService,
                         CrossSessionSearchService crossSessionSearchService,
+                        ConversationFactService factService,
                         @Qualifier("roundPrefetchExecutor") Executor prefetchExecutor) {
         // 中间步骤客户端：先 clone（须在 defaultAdvisors 之前，避免继承记忆 Advisor）
         this.internalChatClient = chatClientBuilder.clone()
@@ -103,6 +107,7 @@ public class ChatComposer {
         this.kbSearchService = kbSearchService;
         this.queryRewriteService = queryRewriteService;
         this.crossSessionSearchService = crossSessionSearchService;
+        this.factService = factService;
         this.prefetchExecutor = prefetchExecutor;
     }
 
@@ -357,14 +362,20 @@ public class ChatComposer {
         }
     }
 
-    /** 长期记忆文本（core_facts + summary，持久化于 conversation 表）。 */
+    /**
+     * 长期记忆文本：<b>事实段</b>（逐条条目优先、旧版归档兜底）+ 滚动摘要。
+     * <p>
+     * <b>为什么事实在这里现查，而不是由调用方传进来</b>：本方法被四条路径共用 —— 普通对话、规划每一步、
+     * 评审每个候选。改成传参就得在四个调用点各查一次并记得传；漏传的地方不会报错，只会静默少一段记忆
+     * （正是本项目最忌讳的那类 bug）。现查的代价是每轮多一次按会话索引的等值查询（行数在几十以内）。
+     * <p>
+     * 「条目优先、归档兜底」的判据与两种块头都在 {@link ConversationFactService#injectableFactsText}，
+     * 与追踪侧报的字符数是<b>同一段文本</b>。
+     */
     public String buildLongTermMemoryText(Conversation conv) {
         if (conv == null) return "";
         StringBuilder sb = new StringBuilder();
-        if (conv.getCoreFacts() != null && !conv.getCoreFacts().isBlank()) {
-            sb.append("\n\n[长期核心信息] 以下内容来自长期记忆（姓名/身份/偏好/待办等），回答时应优先考虑并遵守：\n")
-                    .append(conv.getCoreFacts());
-        }
+        sb.append(factService.injectableFactsText(conv.getId(), conv.getCoreFacts()));
         if (conv.getSummary() != null && !conv.getSummary().isBlank()) {
             sb.append("\n\n[历史摘要] 本次对话更早阶段的摘要（长期记忆，仅供上下文参考，不要复述）：\n")
                     .append(conv.getSummary());

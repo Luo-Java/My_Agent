@@ -75,6 +75,9 @@ public class PromptProperties {
     /** 并行评审的裁决综合提示词（纯静态，各候选作答由调用方拼在 user 消息里）。 */
     private List<String> reviewJudgeSystem = new ArrayList<>();
 
+    /** 线上回答自评提示词（含 {question} / {answer} / {evidence} 占位符；输出严格 JSON）。 */
+    private List<String> selfEvalSystem = new ArrayList<>();
+
     // ------------------------------------------------------------------
     // 便捷读取器：把 List<String> 拼接为带 \n 的完整文本
     // ------------------------------------------------------------------
@@ -141,6 +144,10 @@ public class PromptProperties {
 
     public String reviewJudgeSystem() {
         return join(reviewJudgeSystem);
+    }
+
+    public String selfEvalSystem() {
+        return join(selfEvalSystem);
     }
 
     /** 把行列表拼接为带换行的完整文本；空列表返回空串。 */

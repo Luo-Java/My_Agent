@@ -56,7 +56,7 @@ public class AttachmentService {
         // 先抽出图片子集（保持原始顺序），整批交给 VisionService 并发识别，结果按图片序对齐
         List<MultipartFile> images = new ArrayList<>();
         for (MultipartFile f : files) {
-            if (isImage(f)) images.add(f);
+            if (VisionService.isSupportedImage(f)) images.add(f);
         }
         List<String> imageCaptions = visionService.describeAll(images);
 
@@ -64,7 +64,7 @@ public class AttachmentService {
         int imgIdx = 0;
         for (MultipartFile f : files) {
             String filename = f.getOriginalFilename();
-            ChatAttachment base = isImage(f)
+            ChatAttachment base = VisionService.isSupportedImage(f)
                     ? ChatAttachment.image(imageCaptions.get(imgIdx++), filename)
                     : processDocument(f, filename);
             result.add(attachStorage(f, base));
@@ -83,25 +83,8 @@ public class AttachmentService {
         }
     }
 
-    /** 是否图片：优先按 MIME，MIME 缺失时按扩展名兜底（防止浏览器未带 MIME 时图片被误判为不支持）。 */
-    private static boolean isImage(MultipartFile f) {
-        String mime = f.getContentType();
-        if (mime != null && mime.startsWith("image/")) {
-            // 必须排除 svg（MIME 为 image/svg+xml）：它是「可内嵌脚本的 XML」，既不适合视觉模型识别，
-            // 落盘也会被白名单转成 .bin（缩略图必然显示不出来）→ 不挡会白跑一次视觉调用。
-            return !mime.toLowerCase(java.util.Locale.ROOT).contains("svg");
-        }
-        String name = f.getOriginalFilename();
-        if (name == null) return false;
-        int idx = name.lastIndexOf('.');
-        if (idx < 0) return false;
-        String ext = name.substring(idx + 1).toLowerCase(java.util.Locale.ROOT);
-        // 同样刻意不含 svg：落盘后经免鉴权的 /files/** 同源访问会成为脚本执行入口。
-        return switch (ext) {
-            case "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif" -> true;
-            default -> false;
-        };
-    }
+    // 「是否图片」的判据统一在 {@link VisionService#isSupportedImage}（MIME 优先、扩展名兜底、排除 svg）：
+    // 知识库入库也要用同一份，各写一份必然漂移成「同一张 png 在附件里能识别、在知识库里被拒」。
 
     /** 文档类附件：解析为文本后截断；任何失败降级为占位（type=file）。 */
     private ChatAttachment processDocument(MultipartFile file, String filename) {

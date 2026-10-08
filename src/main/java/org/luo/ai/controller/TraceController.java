@@ -3,7 +3,9 @@ package org.luo.ai.controller;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import org.luo.ai.dto.InjectedMessage;
 import org.luo.ai.dto.KbCitation;
+import org.luo.ai.dto.SelfEvalDto;
 import org.luo.ai.dto.TraceDto;
 import org.luo.ai.entity.AgentTrace;
 import org.luo.ai.service.ConversationService;
@@ -87,18 +89,57 @@ public class TraceController {
         return toDto(t);
     }
 
-    /** 实体 → 视图：把两个 JSON 字符串列解析为结构化列表，解析失败按空列表降级（不因脏数据整体失败）。 */
+    /** 实体 → 视图：把几个 JSON 字符串列解析为结构化列表，解析失败按空/null 降级（不因脏数据整体失败）。 */
     private static TraceDto toDto(AgentTrace t) {
         return new TraceDto(
                 t.getTraceId(), t.getConversationId(), t.getMode(), t.getRouteSource(), t.getAgentCode(),
-                t.getUserMessage(), t.getRetrievalQuery(), t.getPlanJson(), parseToolCalls(t.getToolCalls()),
+                t.getUserMessage(), t.getRetrievalQuery(), t.getPlanJson(), parseMemory(t.getMemoryJson()),
+                parseToolCalls(t.getToolCalls()),
                 t.getKbHitCount() == null ? 0 : t.getKbHitCount(),
                 KbCitation.parse(t.getCitationsJson()),
                 t.getPromptTokens() == null ? 0 : t.getPromptTokens(),
                 t.getCompletionTokens() == null ? 0 : t.getCompletionTokens(),
                 t.getTotalTokens() == null ? 0 : t.getTotalTokens(),
                 t.getElapsedMs() == null ? 0L : t.getElapsedMs(),
+                SelfEvalDto.of(t),
                 t.getStatus(), t.getErrorMessage(), t.getCreatedAt());
+    }
+
+    /**
+     * 记忆注入快照 JSON → 视图。
+     * <p>
+     * 无值或解析失败一律返回 <b>null</b>，而不是一个空对象 —— 前端要能区分「这一轮没采到」（规划模式 /
+     * 采集失败 / 老数据）与「这一轮确实什么都没注入」。返回空对象会把两者抹平成同一个样子。
+     */
+    private static TraceDto.MemoryInjectionDto parseMemory(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            JSONObject o = JSONUtil.parseObj(json);
+            List<InjectedMessage> window = new ArrayList<>();
+            JSONArray arr = o.getJSONArray("window");
+            if (arr != null) {
+                for (int i = 0; i < arr.size(); i++) {
+                    JSONObject w = arr.getJSONObject(i);
+                    window.add(new InjectedMessage(w.getStr("role"), w.getStr("preview"),
+                            w.getInt("chars", 0)));
+                }
+            }
+            return new TraceDto.MemoryInjectionDto(o.getInt("windowChars", 0), o.getInt("summaryChars", 0),
+                    factsChars(o), window);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 取长期事实段的字符数；<b>缺 {@code factsChars} 时回退读旧键 {@code coreFactsChars}</b>。
+     * <p>
+     * 键名在功能 E 里随「逐条事实」一起改过（{@code core_facts} 文本 → {@code facts}），而追踪表的
+     * {@code memory_json} 是已经写进去的历史数据，不重写。不做回退的话，E 之前所有轮次在弹窗里都会显示
+     * 「事实段 0 字」—— 那是假数据，比留空更糟。
+     */
+    private static int factsChars(JSONObject o) {
+        return o.containsKey("factsChars") ? o.getInt("factsChars", 0) : o.getInt("coreFactsChars", 0);
     }
 
     /** 工具调用明细 JSON → 列表；空/异常返回空列表。 */

@@ -45,6 +45,23 @@ public class AgentTrace {
     /** 规划模式的步骤计划 JSON。 */
     private String planJson;
 
+    /**
+     * 本轮注入的记忆构成快照 JSON：窗口逐条（role/preview/chars）+ 长期摘要/长期事实的字符数。
+     * {@code null} = 未采集（规划模式各步分别注入、或采集失败）—— 与「注入为空」不同，前端可区分。
+     */
+    private String memoryJson;
+
+    /**
+     * 模型对回答的自评分 1~5；{@code null} = <b>未自评</b>（按比例采样未命中 / 回答过短 / 调用或解析失败）。
+     * <p>
+     * 单独成列而不只存在 {@link #selfEvalJson} 里：可观测面板的「低分轮次」要按分过滤与聚合，
+     * JSON 里解析不出索引。两列同生共死（要么都有、要么都为 null），一个用于过滤、一个用于细看。
+     */
+    private Integer selfEvalScore;
+
+    /** 自评明细 JSON（score / answered / grounded / issues / comment / trigger）；{@code null} = 未自评。 */
+    private String selfEvalJson;
+
     /** 工具调用明细 JSON 数组（name/args/result，均截断）。 */
     private String toolCalls;
 

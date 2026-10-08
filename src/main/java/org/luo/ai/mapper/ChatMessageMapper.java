@@ -29,4 +29,22 @@ public interface ChatMessageMapper extends BaseMapper<ChatMessage> {
                                   @Param("excludeConversationId") String excludeConversationId,
                                   @Param("keywords") List<String> keywords,
                                   @Param("limit") int limit);
+
+    /**
+     * 取某条消息<b>之前</b>、同一会话里最近的一条用户输入（消息反馈转回归用例时用它还原「用户当时说了什么」）。
+     * <p>
+     * 三个口径要点：
+     * <ul>
+     *   <li>按 {@code id} 而不是 {@code created_at} 排序：同轮 user/assistant 的时间戳完全相同（秒级），
+     *       {@code created_at} 定不了先后；</li>
+     *   <li>带分支过滤（{@code turn_group_id IS NULL OR turn_active = 1}）：被翻走的历史版本不算「用户说过」；</li>
+     *   <li><b>刻意不过滤 {@code memory_excluded}</b> —— 这是<b>展示侧</b>口径。那条消息是否参与记忆，
+     *       与「用户当时到底问了什么」无关，这正是反馈要还原的事实。</li>
+     * </ul>
+     * SQL 见 {@code resources/mapper/ai/ChatMessageMapper.xml}。
+     *
+     * @return 用户输入文本；找不到（如该消息是本会话第一条）返回 null
+     */
+    String selectPrevUserInput(@Param("conversationId") String conversationId,
+                               @Param("messageId") Long messageId);
 }

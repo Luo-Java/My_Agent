@@ -1,6 +1,7 @@
 package org.luo.ai.trace;
 
 import lombok.Getter;
+import org.luo.ai.dto.InjectedMessage;
 import org.luo.ai.dto.KbCitation;
 
 import java.time.LocalDateTime;
@@ -65,6 +66,13 @@ public class RoundTrace {
 
     private final List<ToolCall> toolCalls = new ArrayList<>();
     private final List<KbCitation> citations = new ArrayList<>();
+
+    /**
+     * 本轮注入的记忆构成（窗口逐条 + 长期摘要/长期事实的长度）。
+     * {@code null} = <b>未采集</b>，可能是规划模式（各步骤分别注入，本字段不展开）、非对话链路，
+     * 或采集本身失败 —— 与「采集到空窗口」是两件事，前端据此区分「没数据」与「这一轮确实什么都没注入」。
+     */
+    private MemoryInjection memoryInjection;
 
     /**
      * 执行过程进度回调（可选）。流式接口由 {@code ChatService} 注入，把各环节（路由 / 检索 / 工具调用）
@@ -132,6 +140,38 @@ public class RoundTrace {
     /** 记录本轮实际用于检索的问题；调用方只在改写结果与用户原话不同时写入。 */
     public void retrievalQuery(String query) {
         this.retrievalQuery = chop(query, USER_MESSAGE_LIMIT);
+    }
+
+    /**
+     * 记录本轮注入的记忆构成（覆盖语义，一轮只采一次）。
+     * <p>
+     * 三类入参刻意分开：窗口（近处原文，逐条可核对）与长期记忆两段（事实 / 摘要，模型看到的是一整段文本，
+     * 只报长度）性质不同，混成一个总数就回答不了「它这次是靠摘要还是靠原文记起来的」。
+     *
+     * @param window  窗口内将被注入的历史（时间正序）；null 视为空
+     * @param summary 长期摘要原文（null / 空 = 未注入）；只取长度
+     * @param facts   注入的长期事实原文（条目文本，或条目为空时的旧版归档）；null / 空 = 未注入；只取长度
+     */
+    public void memoryInjection(List<InjectedMessage> window, String summary, String facts) {
+        List<InjectedMessage> items = (window == null || window.isEmpty())
+                ? List.of() : List.copyOf(window);
+        int windowChars = items.stream().mapToInt(InjectedMessage::chars).sum();
+        this.memoryInjection = new MemoryInjection(items, windowChars, lengthOf(summary), lengthOf(facts));
+    }
+
+    /**
+     * 本轮注入的记忆构成：窗口明细 + 长期记忆两段的字符数。
+     * <p>
+     * {@code factsChars} 是<b>实际注入的那一段事实文本</b>的长度 —— 条目非空时是渲染后的条目列表，
+     * 条目为空时是旧版 {@code core_facts} 归档。两者刻意不再分成两个数：注入侧本来就是「二选一」，
+     * 分开只会多一个恒为 0 的字段，反而让人以为「有一类记忆没被注入」。
+     */
+    public record MemoryInjection(List<InjectedMessage> window, int windowChars, int summaryChars, int factsChars) {
+
+        /** 本轮注入的总字符数（近似 token 口径）——「这一轮光记忆就占了多少上下文」。 */
+        public int totalChars() {
+            return windowChars + summaryChars + factsChars;
+        }
     }
 
     /**
@@ -237,6 +277,11 @@ public class RoundTrace {
         public static ToolCall of(String name, String args, String result) {
             return new ToolCall(name, chop(args, TOOL_TEXT_LIMIT), chop(result, TOOL_TEXT_LIMIT));
         }
+    }
+
+    /** 文本长度（null 安全）。 */
+    private static int lengthOf(String text) {
+        return text == null ? 0 : text.length();
     }
 
     /** 文本截断（null 安全）。 */

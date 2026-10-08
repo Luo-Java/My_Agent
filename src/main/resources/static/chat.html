@@ -113,9 +113,9 @@
                     <!-- 会话导出：把当前会话导出为 Markdown（含附件文件名与 RAG 引用来源）。 -->
                     <button v-if="currentId" class="nav-pill" @click="exportConversation"
                             title="把当前会话导出为 Markdown 文件">⬇ 导出</button>
-                    <!-- 长期记忆面板：双层记忆此前完全黑盒，这里把摘要与核心事实摊开，可查看、订正、重置。 -->
+                    <!-- 长期记忆面板：此前完全黑盒，这里把摘要、长期事实（逐条）与旧版归档摊开，可查看、订正、重置。 -->
                     <button v-if="currentId" class="nav-pill" @click="openMemory"
-                            title="查看并编辑本会话的长期记忆（滚动摘要 + 核心事实）">🧠 记忆</button>
+                            title="查看并编辑本会话的长期记忆（摘要 / 长期事实 / 旧版归档）">🧠 记忆</button>
                     <!-- 成本看板入口：全局视角（跨会话）的全量成本聚合（按天趋势 + 按用途拆解），不依赖当前会话。
                          ADMIN 专属（后端 CostController 标了 @RequireRole(ADMIN)，接口本身返回 403）——
                          成本是全站聚合口径、天然跨用户，收敛到管理员；普通账号不渲染该入口。 -->
@@ -148,14 +148,35 @@
                 <span class="resume-bar-ico">⏸</span>
                 <span class="resume-bar-text" v-if="!runningTask.doneSteps">已生成执行计划（共 {{ runningTask.totalSteps || 0 }} 步），尚未执行</span>
                 <span class="resume-bar-text" v-else>上次任务尚未完成（已完成 {{ runningTask.doneSteps }}/{{ runningTask.totalSteps || 0 }} 步）</span>
+                <!-- 卡住的那一步：失败且重试用尽 ⇒ 它不会再被执行，不处理就会把整个任务永久卡死
+                     （后续依赖它的步骤永远凑不齐前驱，每一轮续跑都在同一处空转）。 -->
+                <span class="resume-bar-stuck" v-if="nextSkippable && nextSkippable.retryExhausted"
+                      :title="nextSkippable.error || ''">
+                    第 {{ nextSkippable.index + 1 }} 步（{{ nextSkippable.agentName }}）重试已用尽，不会自行恢复
+                </span>
                 <button class="resume-bar-btn" :disabled="loading" @click="resumeTask">
                     {{ runningTask.doneSteps ? '继续执行' : '执行计划' }}
+                </button>
+                <!-- 跳过卡住的步骤：某步反复失败时唯一能越过它继续跑的手段。执行中不显示（先暂停再跳，
+                     因为此时步骤可能正落在 RUNNING，后端也会拒）。 -->
+                <button class="resume-bar-btn resume-bar-btn-ghost"
+                        v-if="nextSkippable && !canPause"
+                        :disabled="loading || skipping"
+                        @click="skipStep(nextSkippable.index)"
+                        title="把这一步标为跳过；依赖它的后续步骤将拿不到它的产出">
+                    {{ skipping ? '跳过中…' : ('跳过第 ' + (nextSkippable.index + 1) + ' 步') }}
                 </button>
                 <!-- 局部重规划：原计划这一段本身行不通时的出口。只重排「第一个未成功步骤及其之后」，
                      已完成的步骤与其产出保持不动；结果作为新计划卡片推入消息区，确认后再执行。 -->
                 <button class="resume-bar-btn resume-bar-btn-ghost" :disabled="loading || replanning"
                         @click="replanTask">
                     {{ replanning ? '规划中…' : '重新规划' }}
+                </button>
+                <!-- 暂停：仅当规划任务真的在跑时出现（canPause）。不是硬中断——当前这一层跑完才停，
+                     回执文案里说明了这点，这里不全盘转成「已暂停」以免与事实不符。 -->
+                <button class="resume-bar-btn resume-bar-btn-warn" v-if="canPause"
+                        :disabled="pausing || runningTask.pauseRequested" @click="pauseTask">
+                    {{ runningTask.pauseRequested ? '已请求暂停…' : (pausing ? '请求中…' : '暂停') }}
                 </button>
             </div>
             <div class="messages" ref="scroll">
@@ -405,7 +426,7 @@
                         <!-- 消息重做：编辑重发（用户消息）/ 重新生成（AI 回复）。生成中一律不出现 ——
                              那一轮尚未落库，此时既不能重发，也不该切版本。
                              两条都是「给这一轮开一个新版本」：旧版本一条不删，可用右侧切换器翻回。 -->
-                        <div class="msg-actions"
+                        <div class="msg-actions" :class="{ 'actions-pinned': m.fbOpen }"
                              v-if="canRedo(i) || (m.role === 'user' && m.turn && m.turn.versionCount > 1)">
                             <button v-if="m.role === 'user'" type="button" class="msg-act"
                                     title="修改这条提问并重新发送（旧版本保留，可用「‹ ›」翻回）"
@@ -422,6 +443,76 @@
                                 <button type="button" class="turn-nav" :disabled="m.turn.version >= m.turn.versionCount"
                                         title="下一个版本" @click="switchTurn(m, 1)">›</button>
                             </span>
+                            <!-- 单条「不参与记忆」开关：把这条排除出后续上下文与滚动摘要（历史里仍然保留）。
+                                 与「重新生成 / 编辑重发」不同 —— 它不改内容、不新增版本，只是让模型看不见这一条。
+                                 刚发出的消息还没落库主键（SSE 不回落库 ID），此时禁用，刷新会话后即可标记。 -->
+                            <button type="button" class="msg-act mem-act" :class="{ 'mem-act-on': m.memoryExcluded }"
+                                    :disabled="!m.messageId || m.memoryBusy"
+                                    :title="!m.messageId
+                                        ? '这条刚发出、尚未落库主键，刷新会话后即可标记'
+                                        : (m.memoryExcluded
+                                            ? '这条当前不参与记忆：模型看不到它，也不会被写进摘要。点一下恢复参与'
+                                            : '把这条排除出记忆：不进后续上下文、也不进摘要（历史里仍然保留）')"
+                                    @click="toggleMemoryExcluded(m, i)">
+                                {{ m.memoryExcluded ? '不参与记忆 ✓' : '不参与记忆' }}
+                            </button>
+                            <!-- 消息反馈：只对助手回复开放（后端也拦：只能对 assistant 消息反馈）。
+                                 已反馈时按钮高亮并显示当前票，点开可改票 / 撤回 —— 一人对一条消息只有一票。
+                                 刚流式发出的那条还没有落库主键（SSE 不回落库 ID），此时禁用，刷新会话后即可评。 -->
+                            <button v-if="m.role !== 'user' && m.messageId" type="button"
+                                    class="msg-act fb-act"
+                                    :class="{ 'fb-act-on': m.feedback, 'fb-act-down': m.feedback && m.feedback.rating === 'DOWN' }"
+                                    :disabled="m.fbSaving"
+                                    :title="m.feedback
+                                        ? (m.feedback.rating === 'UP'
+                                            ? '当前记为「有用」。点开可改成「有问题」'
+                                            : '当前记为「有问题」。点开可修改分类或撤回')
+                                        : '这条回答有问题？点踩并归类，之后可一键转成回归用例'"
+                                    @click="openFeedback(m)">
+                                {{ m.feedback ? (m.feedback.rating === 'UP' ? '👍 有用' : '👎 有问题') : '👎 反馈' }}
+                            </button>
+                        </div>
+                        <!-- 反馈表单：问题分类 + 备注。展开在消息下方而不是弹窗里 —— 评价的对象就在眼前，
+                             弹窗会把它挡掉。别名「备注」而非「理由」：它只作人工排查线索，不参与任何自动断言
+                             （见下方提示，避免让人以为写了它就会自动判定答案质量）。
+                             <b>条件里的 canRedo(i) 不是笔误</b>：生成中动作条整行不出现（那一轮尚未落库），
+                             表单若独立于它显示，就会在下方留一块没有按钮的孤儿面板。 -->
+                        <div class="fb-panel" v-if="m.fbOpen && canRedo(i)">
+                            <div class="fb-row">
+                                <span class="fb-label">问题分类</span>
+                                <ui-select v-model="m.fbReason" :options="fbReasons" size="sm"
+                                           style="width: 150px; flex: none"
+                                           :disabled="m.fbSaving"></ui-select>
+                                <span class="fb-spacer"></span>
+                                <button type="button" class="fb-link" :disabled="m.fbSaving"
+                                        @click="markFeedbackUp(m)"
+                                        title="记为「有用」。会清掉之前填的问题分类与备注（「点赞 + 编造」是自相矛盾的组合）">
+                                    这条其实没问题
+                                </button>
+                                <button type="button" class="fb-btn fb-btn-ghost" :disabled="m.fbSaving"
+                                        @click="m.fbOpen = false">取消</button>
+                                <button type="button" class="fb-btn fb-btn-primary" :disabled="m.fbSaving"
+                                        @click="submitFeedback(m)">{{ m.fbSaving ? '提交中…' : '提交' }}</button>
+                            </div>
+                            <textarea class="fb-comment" v-model="m.fbComment" rows="2" maxlength="500"
+                                      :disabled="m.fbSaving"
+                                      placeholder="补充说明（选填，最多 500 字）。只作人工排查线索，不参与自动断言。"></textarea>
+                            <div class="fb-hint">
+                                转成回归用例时只会自动钉住<b>可确定的部分</b>：那一轮实际路由到哪个智能体 /
+                                计划里包含哪几个智能体。<b>答案质量本身不自动断言</b> —— 判它得让模型当裁判，
+                                裁判自身不稳定会让回归结果失去可比性。
+                            </div>
+                            <div class="fb-hint fb-hint-ok" v-if="m.feedback && m.feedback.evalCaseId">
+                                已生成回归用例（ID {{ m.feedback.evalCaseId }}），可在「🧪 提示词回归评测」里跑批验证。
+                            </div>
+                            <!-- 「转成用例」限 ADMIN：库内用例是全局资产、所有跑批共用，且只有能跑批的人才能验证它 -->
+                            <div class="fb-row fb-row-end" v-if="m.feedback && !m.feedback.evalCaseId && isAdmin">
+                                <button type="button" class="fb-btn fb-btn-primary" :disabled="m.fbPromoting"
+                                        @click="promoteFeedback(m)">
+                                    {{ m.fbPromoting ? '生成中…' : '保存为回归用例' }}
+                                </button>
+                            </div>
+                            <div class="fb-error" v-if="m.fbError">{{ m.fbError }}</div>
                         </div>
                     </div>
                 </div>
@@ -519,7 +610,15 @@
                         <svg class="tg-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.4 15.4L21 21"/><path d="M8 10.5h5"/><path d="M10.5 8v5"/></svg>
                         <span class="toggle-text">跨会话</span>
                     </label>
-                    <span v-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
+                    <!-- 参数补全（澄清追问）进行中：放在「本轮会发生什么」的提示位而不是顶部配置徽标行 ——
+                         顶部那排讲的是会话级开关（规划 / 评审 / RAG / 跨会话），而澄清是「这一轮正停在一次追问上」
+                         的交互态；且顶部行已排满，再塞一个会把标题挤到折行（实测 1440 宽下 1 行 → 3 行）。
+                         次数来自后端落库状态（conversation.clarify_state），不靠扫历史重放，故不受摘要压缩影响。 -->
+                    <span v-if="currentClarifyAsked" class="input-hint clarify-hint"
+                          :title="'参数补全进行中：已追问 ' + currentClarifyAsked + ' 次（上限 ' + currentClarifyMax + ' 次）。补齐缺失信息后会自动继续，无需重发原问题。'">
+                        ⏳ 参数补全中（{{ currentClarifyAsked }}/{{ currentClarifyMax }}）：补齐后自动继续
+                    </span>
+                    <span v-else-if="currentAgentId" class="input-hint">智能体会话暂不支持规划模式</span>
                     <span v-else-if="reviewEnabled" class="input-hint">评审已开：本轮多候选并行作答后综合，模型调用次数会增加</span>
                     <span v-else-if="!ragEnabled" class="input-hint">未开启 RAG，本轮不使用知识库</span>
                     <!-- 成本配额（仅后端开启 agent.quota.enabled 且非豁免时出现）：展示本人当日用量。
@@ -800,7 +899,7 @@
 
                                 <div v-if="kbDetail.fileList.length === 0" class="kb-empty-tip">
 
-                                    还没有文件，上传 txt / md / pdf / docx / xlsx 后自动解析入库
+                                    还没有文件，上传 txt / md / pdf / docx / xlsx / 图片 后自动解析入库
 
                                 </div>
 
@@ -887,7 +986,7 @@
 
                                     <input type="file" ref="kbFileInput" multiple hidden
 
-                                           accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx"
+                                           accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.gif,.webp,.bmp,.tif,.tiff"
 
                                            @change="onFilesChosen" />
 
@@ -895,7 +994,7 @@
 
                                     <div class="kb-upload-main">{{ kbDetail.uploading ? '解析并向量化中，请稍候…' : '点击选择文件，或将文件拖拽到此处' }}</div>
 
-                                    <div class="kb-upload-exts">支持 txt / md / csv / pdf / docx / xlsx · 单个文件 ≤ 15MB · 同名文件将覆盖替换</div>
+                                    <div class="kb-upload-exts">支持 txt / md / csv / pdf / docx / xlsx / 图片（图片自动识别为文字描述再入库） · 单个文件 ≤ 15MB · 同名文件将覆盖替换</div>
 
                                 </div>
 
@@ -1350,19 +1449,93 @@
                 <div v-else-if="memoryModal.error" class="mem-tip mem-tip-error">{{ memoryModal.error }}</div>
                 <template v-else>
                     <div class="mem-meta">{{ memoryCoverage() }}</div>
+                    <!-- 当前记忆窗口：本轮会注入 prompt 的那几条历史。与下面的「滚动摘要」是两层 ——
+                         摘要描述更早的（已经出窗的）历史，窗口是仍在上下文里的近处对话；此前两层都是黑盒。
+                         这里用的是与真实注入完全相同的窗口算法，故列出的就是模型这一轮真正能看到的那几条。 -->
+                    <div class="mem-win">
+                        <div class="mem-label">
+                            当前窗口（本轮会注入的历史）
+                            <span class="mem-win-count">{{ (memoryModal.window || []).length }} 条</span>
+                        </div>
+                        <ul class="mem-win-list" v-if="memoryModal.window && memoryModal.window.length">
+                            <li v-for="(w, wi) in memoryModal.window" :key="wi" :class="'mem-win-' + w.role">
+                                <span class="mem-win-role">{{ w.role === 'user' ? '用户' : '助手' }}</span>
+                                <span class="mem-win-text">{{ w.preview }}</span>
+                                <span class="mem-win-chars">{{ w.chars }} 字</span>
+                            </li>
+                        </ul>
+                        <div class="mem-win-empty" v-else>
+                            窗口为空：没有历史会被注入（首轮对话，或历史都被标记为「不参与记忆」）。
+                        </div>
+                        <div class="mem-win-hint" v-if="memoryModal.excludedCount">
+                            另有 {{ memoryModal.excludedCount }} 条被标记为「不参与记忆」：既不在窗口里、也不会进摘要。
+                        </div>
+                    </div>
+                    <!-- 长期事实（逐条）：功能 E 之前这里是一段整块的「核心事实」文本，只能整体覆盖 ——
+                         聊久了话题一杂，想删掉记错的那一条无从下手。现在逐条可改可删、可手动加。
+                         两条来源待遇不同：手动条目永不被自动整理动到；自动条目由记忆合并按对话维护。
+                         注入规则（有条目就用条目、一条都没有才回退归档）必须写在界面上 —— 否则用户看着
+                         归档有内容、模型却不提，会误判成「模型无视记忆」。 -->
+                    <div class="mem-facts">
+                        <div class="mem-label">
+                            长期事实（逐条）
+                            <span class="mem-fact-count">{{ (memoryModal.facts || []).length }} 条</span>
+                        </div>
+                        <ul class="mem-fact-list" v-if="memoryModal.facts && memoryModal.facts.length">
+                            <li v-for="f in memoryModal.facts" :key="f.id" class="mem-fact-item">
+                                <template v-if="factEdit.id === f.id">
+                                    <select v-model="factEdit.topic" class="mem-fact-topic">
+                                        <option v-for="t in factTopics" :key="t" :value="t">{{ t }}</option>
+                                    </select>
+                                    <input v-model="factEdit.fact" class="mem-fact-input" maxlength="500"
+                                           @keyup.enter="saveFact" />
+                                    <button class="mem-mini is-primary" :disabled="factBusy" @click="saveFact">保存</button>
+                                    <button class="mem-mini" :disabled="factBusy" @click="cancelFactEdit">取消</button>
+                                </template>
+                                <template v-else>
+                                    <span class="mem-fact-tag">{{ f.topic }}</span>
+                                    <span class="mem-fact-text">{{ f.fact }}</span>
+                                    <span class="mem-fact-src" :class="f.source === 'USER' ? 'is-user' : 'is-merge'"
+                                          :title="f.source === 'USER'
+                                              ? '手动添加 / 人工修正：自动整理绝不覆盖或删除'
+                                              : '由记忆合并按对话内容维护：下一次合并没有它就会被淘汰'">
+                                        {{ f.source === 'USER' ? '手动' : '自动' }}
+                                    </span>
+                                    <button class="mem-mini" :disabled="factBusy" @click="startFactEdit(f)">改</button>
+                                    <button class="mem-mini is-danger" :disabled="factBusy" @click="deleteFact(f)">删</button>
+                                </template>
+                            </li>
+                        </ul>
+                        <div class="mem-win-empty" v-else>
+                            还没有逐条事实：下次记忆合并会自动整理出来（也可以直接手动加一条）。
+                        </div>
+                        <div class="mem-fact-add">
+                            <select v-model="factAdd.topic" class="mem-fact-topic">
+                                <option v-for="t in factTopics" :key="t" :value="t">{{ t }}</option>
+                            </select>
+                            <input v-model="factAdd.fact" class="mem-fact-input" maxlength="500"
+                                   placeholder="手动加一条长期事实（例：他偏好书面答复，不要口头结论）"
+                                   @keyup.enter="addFact" />
+                            <button class="mem-mini is-primary" :disabled="factBusy" @click="addFact">添加</button>
+                        </div>
+                        <div class="mem-hint">
+                            注入时<b>以条目为准</b>：只要还有条目，下面的「旧版归档」就不再注入。
+                            手动条目永不被自动整理删除；自动条目被你改过之后会转为「手动」。
+                        </div>
+                    </div>
                     <label class="mem-field">
                         <span class="mem-label">滚动摘要</span>
                         <textarea v-model="memoryModal.summary" rows="9"
                                   placeholder="较早对话的压缩摘要；留空表示没有长期摘要"></textarea>
                     </label>
                     <label class="mem-field">
-                        <span class="mem-label">核心事实</span>
+                        <span class="mem-label">旧版事实归档（不再自动更新）</span>
                         <textarea v-model="memoryModal.coreFacts" rows="6"
-                                  placeholder="姓名 / 身份 / 偏好 / 待办等长期关键事实；留空表示没有"></textarea>
+                                  placeholder="功能 E 之前承载长期关键事实的整段文本；已由上面的条目接管，仅在一条条目都没有时兜底注入"></textarea>
                     </label>
                     <div class="mem-hint">
-                        这两段会随每轮对话注入模型，修订后立即生效。清空内容等于「忘掉这些」，
-                        但历史消息本身不受影响；要让记忆从头重新压缩，用左下角的「重置全部记忆」。
+                        上面的条目、摘要与归档都会随每轮对话注入模型，修订后立即生效。清空内容等于「忘掉这些」，
+                        但历史消息本身不受影响；要让记忆从头重新压缩（含作废自动整理的条目），用左下角的「重置全部记忆」。
                     </div>
                 </template>
             </div>
@@ -1451,6 +1624,12 @@
                                 <span :title="'工具调用次数'">🔧 {{ (t.toolCalls && t.toolCalls.length) || 0 }}</span>
                                 <span :title="'token 合计（输入+输出）'">🎫 {{ t.totalTokens }}</span>
                                 <span :title="'本轮总耗时'">⏱ {{ fmtElapsed(t.elapsedMs) }}</span>
+                                <!-- 自评分：只在评过时显示。这里是原始分数，不做「低分」判定 ——
+                                     阈值口径由可观测面板从后端取（agent.self-eval.low-score-threshold），
+                                     前端再写一份 3 就会与前缀口径漂移。 -->
+                                <span v-if="t.selfEval" :title="'回答自评（' + (t.selfEval.trigger === 'FEEDBACK' ? '点踩强制' : '采样抽检') + '）'">
+                                    ⭐ {{ t.selfEval.score }}
+                                </span>
                             </span>
                         </div>
                         <div class="trace-detail" v-show="traceModal.expanded[t.traceId]">
@@ -1459,6 +1638,52 @@
                             <div class="trace-kv" v-if="t.errorMessage"><b>错误</b>{{ t.errorMessage }}</div>
                             <div class="trace-kv">
                                 <b>token</b>输入 {{ t.promptTokens }} · 输出 {{ t.completionTokens }} · 合计 {{ t.totalTokens }}
+                            </div>
+                            <!-- 回答自评（元认知）：模型对刚产出这轮的打分。t.selfEval 为 null = 未自评
+                                 （采样未命中 / 回答过短 / 调用失败），与「评了低分」是两件事 —— 故两种文案分开，
+                                 不把「没评」显示成 0 分。answered/grounded 为 null 表示明细不可读（分数列有、
+                                 JSON 丢了），也不拿 false 顶替，那会凭空造出「模型说没答到」这个结论。 -->
+                            <div class="trace-block" v-if="t.selfEval">
+                                <div class="trace-block-title">
+                                    回答自评 · {{ t.selfEval.score }} 分
+                                    <span class="trace-tag" :class="t.selfEval.trigger === 'FEEDBACK' ? 'tag-route' : 'tag-mode'">
+                                        {{ t.selfEval.trigger === 'FEEDBACK' ? '点踩强制' : '采样抽检' }}
+                                    </span>
+                                </div>
+                                <div class="trace-kv">
+                                    <b>回答</b>{{ t.selfEval.answered === null ? '明细不可读' : (t.selfEval.answered ? '答到了问题' : '没答到点上') }}
+                                    · <b>依据</b>{{ t.selfEval.grounded === null ? '明细不可读' : (t.selfEval.grounded ? '有据可依' : '依据不足') }}
+                                </div>
+                                <div class="trace-kv" v-if="t.selfEval.issues && t.selfEval.issues.length">
+                                    <b>问题</b>{{ t.selfEval.issues.join('；') }}
+                                </div>
+                                <div class="trace-kv" v-if="t.selfEval.comment"><b>说明</b>{{ t.selfEval.comment }}</div>
+                            </div>
+                            <div class="trace-kv trace-kv-muted" v-else>
+                                <b>回答自评</b>本轮未自评 —— 自评按采样率抽检（默认关闭），用户点 👎 会强制评该轮；
+                                没被抽到也是一种正常结果，不代表这轮回答有问题。
+                            </div>
+                            <!-- 本轮注入的记忆构成：窗口原文 + 长期记忆两段。回答「它为什么记得 / 不记得」。
+                                 t.memory 为 null = 未采集（规划模式各步分别注入，或采集失败）—— 与「注入为空」
+                                 是两件事，故两种文案分开，不都显示成一张空表。 -->
+                            <div class="trace-block" v-if="t.memory">
+                                <div class="trace-block-title">
+                                    本轮注入记忆 · 窗口 {{ t.memory.windowChars }} 字 + 摘要 {{ t.memory.summaryChars }} 字 + 事实 {{ t.memory.factsChars }} 字
+                                </div>
+                                <div class="trace-mem" v-for="(w, wi) in t.memory.window" :key="wi">
+                                    <span class="trace-mem-role" :class="'mem-role-' + w.role">
+                                        {{ w.role === 'user' ? '用户' : '助手' }}
+                                    </span>
+                                    <span class="trace-mem-text">{{ w.preview }}</span>
+                                    <span class="trace-mem-chars">{{ w.chars }} 字</span>
+                                </div>
+                                <div class="trace-mem-none" v-if="!t.memory.window || !t.memory.window.length">
+                                    窗口内没有历史消息：首轮对话，或历史都被标记为「不参与记忆」。
+                                </div>
+                            </div>
+                            <div class="trace-kv" v-else>
+                                <b>记忆注入</b>未采集 —— 规划模式各步骤分别注入记忆窗口（一轮一份代表不了任何一步），
+                                故此处留空；普通对话轮次会正常采集。
                             </div>
                             <div class="trace-block" v-if="t.planJson && t.planJson !== '[]'">
                                 <div class="trace-block-title">规划步骤</div>
@@ -1652,6 +1877,35 @@
                     <div class="eval-diff-row eval-diff-none"
                          v-if="!evalModal.compare.broken.length && !evalModal.compare.fixed.length && !evalModal.compare.stillFailed.length">
                         两批结果一致，无变化。
+                    </div>
+                </div>
+
+                <!-- 库内用例（来自反馈）：eval-cases.yaml 打包进 jar 后运行时写不了，所以「点踩 → 转用例」只能落库。
+                     yaml 是只读种子、本区块是运行时增量，同名以种子为准 —— 故这里列出的是「新增的那些」，不是全集。 -->
+                <div v-if="evalModal.dbCases.length || evalModal.dbError" class="eval-section">
+                    <div class="trace-block-title">
+                        来自反馈的用例
+                        <span class="eval-src-note">运行时新增，与种子用例合并参与跑批</span>
+                    </div>
+                    <div v-if="evalModal.dbError" class="trace-empty">{{ evalModal.dbError }}</div>
+                    <div class="eval-item eval-src-db" v-for="c in evalModal.dbCases" :key="c.id">
+                        <div class="eval-item-head">
+                            <span class="eval-item-name">{{ c.name }}</span>
+                            <span class="eval-item-tag">
+                                {{ c.scenario === 'PLAN' ? '规划' : '路由' }} · {{ c.enabled ? '启用' : '停用' }}
+                            </span>
+                            <button type="button" class="eval-del" :disabled="evalModal.dbBusy === c.id"
+                                    title="删除这条用例（只影响后续跑批，历史批次结果不受影响）"
+                                    @click="deleteEvalCase(c)">
+                                {{ evalModal.dbBusy === c.id ? '删除中…' : '删除' }}
+                            </button>
+                        </div>
+                        <div class="eval-item-line">
+                            <span class="eval-item-key">输入</span><span>{{ c.input }}</span>
+                        </div>
+                        <div class="eval-item-line">
+                            <span class="eval-item-key">断言</span><span>{{ c.expectJson }}</span>
+                        </div>
                     </div>
                 </div>
 

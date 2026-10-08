@@ -52,6 +52,12 @@ function routeLabel(src) {
     return map[src] || (src || '未知');
 }
 
+/** 会话 ID 截短展示（UUID 有 36 位，整串会把表格撑开）；完整值放在 title 里。 */
+function shortId(id) {
+    if (!id) return '—';
+    return id.length > 8 ? id.slice(0, 8) + '…' : id;
+}
+
 createApp({
     setup() {
         // 顶栏登录用户区（用户名 + 下拉菜单）不在这里 —— 整块由 js/auth.js 渲染到 data-auth-nav
@@ -76,6 +82,13 @@ createApp({
         const byRouteSource = ref([]);
         const byAgent = ref([]);
         const slowest = ref([]);
+        // 回答自评：selfEval 为 null 表示响应里没有这一段（老后端 / 字段缺失），模板据此整块不渲染 ——
+        // 不渲染成 0，否则「没这个功能」会被读成「一轮都没评到」。
+        const selfEval = ref(null);
+        const lowRounds = ref([]);
+        // 低分阈值来自后端（agent.self-eval.low-score-threshold），前端不写死 3：阈值改在后端、
+        // 界面却仍显示 3 分，就会变成一份看着权威的错口径。
+        const lowThreshold = ref(3);
 
         // 分布条宽度：各桶轮次相对最大值归一化（最大值恒 100%）。
         const maxModeRounds = computed(() => byMode.value.reduce((m, b) => Math.max(m, b.rounds), 0));
@@ -112,6 +125,9 @@ createApp({
                 byRouteSource.value = data.byRouteSource || [];
                 byAgent.value = data.byAgent || [];
                 slowest.value = data.slowest || [];
+                selfEval.value = data.selfEval || null;
+                lowRounds.value = data.lowRounds || [];
+                lowThreshold.value = (typeof data.lowScoreThreshold === 'number') ? data.lowScoreThreshold : 3;
             } catch (e) {
                 error.value = '加载失败：' + e.message;
             } finally {
@@ -132,8 +148,9 @@ createApp({
         return {
             isAdmin, dayOptions, days, loading, error,
             overview, daily, byMode, byRouteSource, byAgent, slowest,
+            selfEval, lowRounds, lowThreshold,
             maxModeRounds, maxRouteRounds, maxAgentRounds,
-            pct, setDays, load, fmtMs, fmtTokens, modeLabel, routeLabel
+            pct, setDays, load, fmtMs, fmtTokens, modeLabel, routeLabel, shortId
         };
     }
 }).mount('#app');

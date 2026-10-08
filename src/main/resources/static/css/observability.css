@@ -136,6 +136,10 @@ body {
 .ob-badge.is-ok { color: var(--success); background: rgba(52, 211, 153, .12); }
 .ob-badge.is-error { color: var(--danger); background: rgba(248, 113, 113, .14); }
 .ob-user-msg { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+/* 面板内的次级指标行（自评四张卡）：列数与总览不同，故单独一个类 —— 直接复用 .ob-overview 会被
+   repeat(6,1fr) 把四张卡拉成半空的两行。 */
+.ob-overview-mini { grid-template-columns: repeat(4, 1fr); margin-bottom: 10px; }
+.ob-mono-id { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12px; color: var(--text-soft); }
 
 /* ===== 空态 / 加载 ===== */
 .ob-empty { text-align: center; color: var(--text-soft); padding: 40px 0; font-size: 13px; }
@@ -143,5 +147,6 @@ body {
 
 @media (max-width: 900px) {
     .ob-overview { grid-template-columns: repeat(3, 1fr); }
+    .ob-overview-mini { grid-template-columns: repeat(2, 1fr); }
     .ob-grid-2 { grid-template-columns: 1fr; }
 }

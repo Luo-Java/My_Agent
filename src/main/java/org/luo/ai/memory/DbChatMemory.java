@@ -87,13 +87,13 @@ public class DbChatMemory implements ChatMemory {
         try {
             // SQL 层先取最近 N 条（走 (conversation_id, created_at) 索引），再按预算精确截断
             List<ChatMessage> history = conversationService.getRecentHistory(conversationId, SQL_FETCH_LIMIT);
-            int windowStart = computeWindowStart(history, props);
-            List<Message> result = new ArrayList<>(history.size() - windowStart);
-            for (int i = windowStart; i < history.size(); i++) {
-                result.add(toMessage(history.get(i)));
+            MemorySnapshot snap = snapshot(history, props);
+            List<Message> result = new ArrayList<>(snap.injected().size());
+            for (ChatMessage m : snap.injected()) {
+                result.add(toMessage(m));
             }
-            log.debug("记忆读取：会话={}，共 {} 条，窗口=[{},{}))",
-                    conversationId, history.size(), windowStart, history.size());
+            log.debug("记忆读取：会话={}，预取 {} 条，窗口=[{},{}）",
+                    conversationId, snap.fetched(), snap.windowStart(), snap.fetched());
             return result;
         } catch (Exception e) {
             log.error("记忆读取失败：会话={}", conversationId, e);
@@ -148,6 +148,32 @@ public class DbChatMemory implements ChatMemory {
         return Math.max(0, Math.min(start, floor));
     }
 
+    /**
+     * 一次记忆读取的结果。
+     *
+     * @param injected    窗口内那一段（时间正序）——即<b>会被注入 prompt 的历史</b>
+     * @param windowStart 起点在预取列表中的下标（含）；等于 {@code fetched} 表示窗口整个落在预取范围之前
+     * @param fetched     预取列表的总条数（= {@code SQL_FETCH_LIMIT} 或实际可用条数）
+     */
+    public record MemorySnapshot(List<ChatMessage> injected, int windowStart, int fetched) {
+    }
+
+    /**
+     * 按窗口三重约束从「最近 N 条」里切出<b>将注入的那一段</b>。抽成静态方法是刻意的：
+     * {@link #get}（真正注入 prompt）与观测侧（把「本轮注入了什么」写进追踪、供页面展示）
+     * <b>必须共用同一份实现</b>，各写一份迟早会漂移，而这种漂移的表现是「面板显示的与实际注入的不一致」，
+     * 恰好把「透明化」变成新的误导源。
+     *
+     * @param recent 预取到的最近 N 条（时间正序，已按记忆口径过滤）；可空
+     */
+    public static MemorySnapshot snapshot(List<ChatMessage> recent, MemoryProperties props) {
+        if (recent == null || recent.isEmpty()) {
+            return new MemorySnapshot(List.of(), 0, 0);
+        }
+        int start = computeWindowStart(recent, props);
+        return new MemorySnapshot(List.copyOf(recent.subList(start, recent.size())), start, recent.size());
+    }
+
     /** 将 Spring AI Message 映射为数据库 role（user/assistant）；其他类型返回 null 表示跳过。 */
     private String toRole(Message m) {
         if (m instanceof UserMessage) {
@@ -161,7 +187,7 @@ public class DbChatMemory implements ChatMemory {
 
     /** 把持久化的单条消息转为 Spring AI Message（超长内容先按配置截断）。 */
     private Message toMessage(ChatMessage m) {
-        String content = truncateOverlong(m.getContent());
+        String content = truncateForContext(m.getContent(), props);
         if ("assistant".equals(m.getRole())) {
             return new AssistantMessage(content);
         }
@@ -171,8 +197,11 @@ public class DbChatMemory implements ChatMemory {
     /**
      * 单条消息截断：超过 {@code max-message-chars} 时保留前 N 字符并追加截断标注（配置为 0 则原样返回）。
      * 与 {@link #computeWindowStart} 的下限保护互补——下限保证「窗口不为空」，截断保证「窗口不因一条巨型消息超预算」。
+     * <p>
+     * <b>static 是为了让观测侧能算出「实际注入多长」</b>：面板与追踪若按原始长度统计，长消息那一轮会显示出
+     * 一个远大于真实上下文的数字。取的是同一个函数，故展示值与真实注入值一致。
      */
-    private String truncateOverlong(String content) {
+    public static String truncateForContext(String content, MemoryProperties props) {
         if (content == null || !props.truncateLongMessageOn() || content.length() <= props.maxMessageChars()) {
             return content;
         }

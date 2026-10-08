@@ -14,8 +14,10 @@ import java.time.LocalDateTime;
  * @param plannerConfirm 规划模式「先看计划」开关（true=规划只产出计划并暂停，确认后才执行）
  * @param reviewEnabled 并行评审开关（true=多候选智能体并行作答 + 裁决者综合；与 planner 互斥）
  * @param crossSession 跨会话搜索开关（true=在本用户其他会话里做关键词召回并注入）
+ * @param clarifyAsked 进行中的参数补全（澄清追问）已问次数；0/null=没有进行中的追问（输入区提示不渲染）
+ * @param clarifyMax   参数补全的追问次数上限（与 {@code ClarifyState.MAX_ASKED} 同源，前端只读展示）
  */
 public record ConversationSummary(String id, String title, LocalDateTime updatedAt, Long agentId, Boolean planner,
                                   Boolean ragEnabled, Boolean plannerConfirm, Boolean reviewEnabled,
-                                  Boolean crossSession) {
+                                  Boolean crossSession, Integer clarifyAsked, Integer clarifyMax) {
 }

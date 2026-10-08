@@ -1,6 +1,7 @@
 package org.luo.ai.entity;
 
 import com.baomidou.mybatisplus.annotation.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -75,8 +76,33 @@ public class Conversation {
     /** 已被摘要覆盖的最旧消息条数（与 chat_message 按时间正序的索引对齐）。 */
     private Integer summarizedCount;
 
-    /** 用户核心信息（长期关键事实：姓名/身份/偏好/待办等），随摘要一起由 LLM 提取更新。 */
+    /** 用户核心信息（旧版事实归档：逐条事实已迁到 conversation_fact，本列保留原文不再自动更新）。 */
     private String coreFacts;
+
+    /**
+     * 参数补全（澄清追问）的显式状态 JSON，见 {@code ClarifyState}；为空表示当前没有进行中的追问。
+     * <p>
+     * 落库的理由：此前「已问几次 / 已确认哪些参数 / 原始请求是什么」靠每轮扫历史重放推导，
+     * 而历史会被摘要压缩、会被标「不参与记忆」，重放结果随之失真（详见 {@code ParamFillingService}）。
+     * <p>
+     * <b>不对客户端序列化</b>：会话列表/详情返回的是本实体，而这个字段是内部结构 —— 对外只出下面两个
+     * 已解析的展示字段，避免把 JSON 结构变成前端契约（前端只想知道「问到第几次了」）。
+     */
+    @JsonIgnore
+    private String clarifyState;
+
+    /**
+     * 非持久化：进行中的参数补全「已追问次数」（>0 表示有追问进行中）。
+     * <p>
+     * 由 {@code ConversationService#listConversations} 从 {@link #clarifyState} 解析填入，供顶部徽标
+     * 展示「参数补全 2/3」。<b>不落库、不参与 SQL</b>（{@code @TableField(exist = false)}）。
+     */
+    @TableField(exist = false)
+    private Integer clarifyAsked;
+
+    /** 非持久化：参数补全次数上限（与 {@code ClarifyState#MAX_ASKED} 同源）。 */
+    @TableField(exist = false)
+    private Integer clarifyMax;
 
     private LocalDateTime createdAt;
 

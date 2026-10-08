@@ -229,15 +229,27 @@ function escapeHtml(text) {
 /** 构造一条消息对象，预渲染 html 字段（v-html 直接绑定，避免流式突变不刷新）。
  *  version：每次内容更新自增，用作 v-html 所在 DOM 的 :key，强制 Vue 重建节点，
  *  规避流式高频更新下 v-html 未刷新（DOM 停留在中间态）导致的 Markdown 未渲染问题。
- *  citations：AI 消息的 RAG 引用来源（[{index,kbName,source,score}]），来自历史接口或当轮 SSE citations 事件。 */
-function toMsg(role, content, attachments, citations, turn) {
+ *  citations：AI 消息的 RAG 引用来源（[{index,kbName,source,score}]），来自历史接口或当轮 SSE citations 事件。
+ *  extra：仅历史接口能提供的写回类字段（{ id, memoryExcluded }）—— 本轮流式新增的消息还没落库主键，
+ *  故没有这两项，「不参与记忆」开关在那两条上会被禁用（刷新后拿到历史即可用）。传对象而不是再加两个
+ *  位置参数，是为了让调用处一眼看出「这些是可选的历史侧字段」。 */
+function toMsg(role, content, attachments, citations, turn, extra) {
+    const e = extra || {};
     return {
         role, content: content || '', html: renderMd(content || ''), version: 0,
         attachments: (attachments && attachments.length) ? attachments : undefined,
         citations: (citations && citations.length) ? citations : undefined,
         citesOpen: true,
         // 对话分支版本（同一轮提问的第几版 / 共几版）：只有分过叉的轮才有，切换器据此显隐
-        turn: turn || null
+        turn: turn || null,
+        // 消息主键（写回用）与「不参与记忆」标记；两者都只在历史加载时有值
+        messageId: (e.id != null) ? e.id : null,
+        memoryExcluded: !!e.memoryExcluded,
+        memoryBusy: false,
+        // 消息反馈（👎）：由 loadFeedback() 按 messageId 合并进来；null = 还没评价过
+        feedback: e.feedback || null,
+        fbOpen: false, fbSaving: false, fbPromoting: false,
+        fbReason: 'ANSWERS_OFF', fbComment: '', fbError: ''
     };
 }
 
@@ -441,6 +453,27 @@ const app = createApp({
         // 局部重规划请求进行中（按钮态）：一次模型往返、几秒量级，期间禁用按钮防重复提交。
         const replanning = ref(false);
 
+        // 请求暂停计划执行中（按钮态）。暂停本身只置一个标志位（重复请求无害），但连点会让「已请求暂停」
+        // 的提示刷屏，且用户会以为没生效 —— 故按钮点一次就禁用。
+        const pausing = ref(false);
+
+        // 跳过某一步执行中（按钮态）；同一时刻只允许跳一步。
+        const skipping = ref(false);
+
+        // 续跑通路（点「执行计划 / 继续执行」）执行中。与 loading 分开是因为 loading 也覆盖普通发送，
+        // 而「暂停」只对真的在跑的计划任务有意义（见 canPause）。
+        const taskExecuting = ref(false);
+
+        /**
+         * 是否显示「暂停」入口：只有规划任务真的在跑时才有意义。
+         *
+         * 覆盖两种跑法：① 续跑通路（taskExecuting，点过「执行计划 / 继续执行」）；② 会话里发消息触发的
+         * 首轮规划（规划模式会话生成中）—— 它的执行体在 /stream 的流里，前端拿不到任务 id，只能用
+         * 「规划模式 + 生成中」近似判断。若这一轮其实退化成了普通回答，后端会明确回「当前会话没有未完成
+         * 的计划」，不会静默假装暂停成功。
+         */
+        const canPause = computed(() => taskExecuting.value || (loading.value && currentPlanner.value));
+
         // ===== 对话分支（编辑重发 / 重新生成）=====
         // 正在「编辑重发」的用户消息下标；-1 = 不在编辑态。
         // 编辑态下 send() 会先为这一轮开一个新版本（旧版本一条不删、随时可翻回），再用输入框里的新文本重发，
@@ -449,11 +482,21 @@ const app = createApp({
 
         // ===== 长期记忆面板 =====
         // 双层记忆此前完全黑盒：压缩由后端异步写入，用户看不到「它记住了什么」、也无法纠正记错的内容。
-        // 本面板把 summary / core_facts 摊开可编辑；summarizedCount 是执行游标，只展示不可改。
+        // 本面板把「逐条长期事实 / 旧版归档 / 滚动摘要」摊开可编辑；summarizedCount 是执行游标，只展示不可改。
+        // window 是另一半黑盒 —— 本轮会注入的那几条原文（与摘要分属两层：摘要 = 已出窗的更早历史）。
         const memoryModal = reactive({
             open: false, loading: false, saving: false, error: '',
-            summary: '', coreFacts: '', summarizedCount: 0, messageCount: 0
+            summary: '', coreFacts: '', summarizedCount: 0, messageCount: 0,
+            excludedCount: 0, window: [], facts: []
         });
+
+        // 长期事实条目（功能 E）：逐条可改可删。来源分两种 —— USER=手动（自动整理绝不动它）、
+        // MERGE=自动（由记忆合并按对话内容维护，改过之后会转成 USER）。这一点必须在 UI 上说清：
+        // 用户删掉一条自动条目后若它又出现，那不是 bug，而是「对话里又提到了一次」。
+        const factTopics = ['身份', '偏好', '待办', '背景', '其它'];
+        const factBusy = ref(false);
+        const factAdd = reactive({ topic: '偏好', fact: '' });
+        const factEdit = reactive({ id: null, topic: '偏好', fact: '' });
 
         // ===== 引用回链：查看被引用的那段原文 =====
         // 气泡里的「引用来源」此前只有「库名 · 文件名 · 相关度」，看不到真正回答问题的原文段落，
@@ -731,6 +774,18 @@ const app = createApp({
             return !!(conv && conv.ragEnabled);
         });
 
+        // 参数补全（澄清追问）进行中：已问次数 / 上限。
+        // 两个字段由后端从 conversation.clarify_state 解析后随会话列表下发（0/null = 无追问，徽标不渲染）。
+        // 不在这里读原始 JSON：内部状态结构只应活在服务端，前端只需要「问到第几次」。
+        const currentClarifyAsked = computed(() => {
+            const conv = conversations.value.find(c => c.id === currentId.value);
+            return (conv && conv.clarifyAsked) ? conv.clarifyAsked : 0;
+        });
+        const currentClarifyMax = computed(() => {
+            const conv = conversations.value.find(c => c.id === currentId.value);
+            return (conv && conv.clarifyMax) ? conv.clarifyMax : 0;
+        });
+
         // RAG 开关变更 → 即时写回会话（纯开关，不选库），刷新后保持上次选择。
         // 开启后每轮自动检索「通用知识库 + 路由到智能体时其专属库」，由后端 KbService 决定目标库。
         async function onRagEnabledChange() {
@@ -981,10 +1036,12 @@ const app = createApp({
                 // 竞态守卫：resp.json() 也是 await，期间可能又切走了，所以拿到数据后要再判一次
                 if (seq !== historySeq) return;
                 if (data) {
-                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations, m.turn));
+                    messages.value = (data.messages || []).map(m => toMsg(m.role, m.content, m.attachments, m.citations, m.turn,
+                        { id: m.id, memoryExcluded: m.memoryExcluded }));
                 }
             } catch (e) { /* 忽略 */ }
             if (seq !== historySeq) return;   // 结果已过期：不写 messages，也不滚动/渲染图表
+            await loadFeedback();             // 反馈单独拉一次，按 messageId 合并到消息上（见 loadFeedback 注释）
             scrollToBottom();
             renderChartsNow(); // 历史消息可能含 echarts 块，渲染图表
         }
@@ -1153,20 +1210,22 @@ const app = createApp({
         }
 
         // ===== 长期记忆面板 =====
-        /** 拉取当前会话的记忆快照（摘要素 / 核心事实 / 游标 / 总条数）。 */
+        /** 拉取当前会话的记忆快照（逐条事实 / 归档 / 摘要 / 游标 / 总条数 / 当前窗口构成 / 已排除条数）。 */
         async function openMemory() {
             if (!currentId.value) return;
             memoryModal.open = true;
             memoryModal.loading = true;
             memoryModal.error = '';
+            cancelFactEdit();
             try {
-                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory');
-                if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                const d = await resp.json();
+                const d = await fetchMemory();
                 memoryModal.summary = d.summary || '';
                 memoryModal.coreFacts = d.coreFacts || '';
                 memoryModal.summarizedCount = d.summarizedCount || 0;
                 memoryModal.messageCount = d.messageCount || 0;
+                memoryModal.excludedCount = d.excludedCount || 0;
+                memoryModal.window = Array.isArray(d.window) ? d.window : [];
+                memoryModal.facts = Array.isArray(d.facts) ? d.facts : [];
             } catch (e) {
                 memoryModal.error = '读取失败：' + e.message;
             } finally {
@@ -1174,7 +1233,273 @@ const app = createApp({
             }
         }
 
-        /** 保存记忆内容（只覆盖两列内容；游标由系统维护，不在请求范围内）。 */
+        /** GET …/memory 的公共取数（打开面板与条目改动后刷新共用）。 */
+        async function fetchMemory() {
+            const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return resp.json();
+        }
+
+        /**
+         * 只刷新条目列表，<b>不碰摘要 / 归档两个 textarea</b>。
+         * <p>条目改动后重拉整份快照会把用户正在编辑的摘要文本冲掉（弹窗还开着，他可能刚敲了一半），
+         * 而条目本身是独立的列表，单独换掉即可。
+         */
+        async function reloadFacts() {
+            const d = await fetchMemory();
+            memoryModal.facts = Array.isArray(d.facts) ? d.facts : [];
+        }
+
+        /** 手动新增一条事实。空内容本地就拦掉（后端也会 400，但没必要白跑一趟）。 */
+        async function addFact() {
+            const text = (factAdd.fact || '').trim();
+            if (!currentId.value || factBusy.value) return;
+            if (!text) {
+                alert('请先填写事实内容');
+                return;
+            }
+            factBusy.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/facts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ topic: factAdd.topic, fact: text })
+                });
+                const d = await resp.json().catch(() => null);
+                if (!resp.ok) throw new Error((d && d.message) || ('HTTP ' + resp.status));
+                factAdd.fact = '';
+                await reloadFacts();
+                alert('已添加（手动条目不会被自动整理删除）');
+            } catch (e) {
+                alert('添加失败：' + e.message);
+            } finally {
+                factBusy.value = false;
+            }
+        }
+
+        /** 进入某条事实的行内编辑态。 */
+        function startFactEdit(f) {
+            factEdit.id = f.id;
+            factEdit.topic = f.topic;
+            factEdit.fact = f.fact;
+        }
+
+        function cancelFactEdit() {
+            factEdit.id = null;
+            factEdit.topic = '偏好';
+            factEdit.fact = '';
+        }
+
+        /** 保存行内编辑：内容与主题都会写回；后端会把该条转为「手动」来源（人工修正过的不再被自动淘汰）。 */
+        async function saveFact() {
+            const id = factEdit.id;
+            const text = (factEdit.fact || '').trim();
+            if (id == null || factBusy.value) return;
+            if (!text) {
+                alert('事实内容不能为空');
+                return;
+            }
+            factBusy.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value)
+                    + '/facts/' + encodeURIComponent(id), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ topic: factEdit.topic, fact: text })
+                });
+                const d = await resp.json().catch(() => null);
+                if (!resp.ok) throw new Error((d && d.message) || ('HTTP ' + resp.status));
+                cancelFactEdit();
+                await reloadFacts();
+                alert('已保存（该条已转为「手动」，自动整理不再覆盖它）');
+            } catch (e) {
+                alert('保存失败：' + e.message);
+            } finally {
+                factBusy.value = false;
+            }
+        }
+
+        /**
+         * 删除一条事实。自动条目删掉后<b>不会</b>被下一次合并自动加回来（模型看不到被删的行），
+         * 但若后续对话里又提到它，会重新整理出类似条目 —— 提示必须写清这一点，否则用户会以为删除没生效。
+         */
+        async function deleteFact(f) {
+            if (!currentId.value || factBusy.value) return;
+            const extra = f.source === 'USER' ? '' : '（自动条目；若后续对话再次提到，可能会重新整理出类似条目）';
+            if (!confirm('删除这条长期事实？\n\n' + f.fact + extra)) return;
+            factBusy.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value)
+                    + '/facts/' + encodeURIComponent(f.id), { method: 'DELETE' });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                if (factEdit.id === f.id) cancelFactEdit();
+                await reloadFacts();
+                alert('已删除');
+            } catch (e) {
+                alert('删除失败：' + e.message);
+            } finally {
+                factBusy.value = false;
+            }
+        }
+
+        /**
+         * 切换单条消息的「不参与记忆」开关。
+         * <p>后端会顺带把该会话的摘要<b>游标</b>归零（可见消息构成变了），故成功且真的发生变化时
+         * 明确提示一句 —— 否则这次重置是静默的，用户下次发现摘要从头重压时无从归因。
+         * 消息对象就地在内存里翻转，不重拉整份历史：历史接口没有分页，重拉长会话代价不值当。
+         */
+        async function toggleMemoryExcluded(m, i) {
+            if (!currentId.value || !m || m.memoryBusy) return;
+            const next = !m.memoryExcluded;
+            m.memoryBusy = true;
+            try {
+                const resp = await apiFetch('/api/chat/message/' + encodeURIComponent(m.messageId) + '/memory-excluded', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ excluded: next })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const d = await resp.json();
+                m.memoryExcluded = !!d.excluded;
+                // 副作用必须说出来：改这一位会重置该会话的摘要游标（可见消息构成变了），下次超窗时会重新整理一遍。
+                // 摘要与长期记忆的「内容」保留，故不丢信息 —— 但用户有权知道这次重置发生了。
+                if (d.memoryCursorReset) {
+                    alert((next ? '已排除出记忆。' : '已恢复参与记忆。')
+                        + '本会话的长期记忆游标已归零，下次超窗时会重新整理一遍（摘要与长期记忆内容保留）。');
+                }
+            } catch (e) {
+                alert('修改记忆参与状态失败：' + e.message);
+            } finally {
+                m.memoryBusy = false;
+            }
+        }
+
+        // ===== 消息反馈（👎）→ 回归用例 =====
+        // 反馈的价值不在「记录」，而在「可复用」：一条躺在表里的点踩只是留档，转成断言之后才会在下次改提示词
+        // 时替用户把问题再问一遍。所以这里除了提交，还接了一条「转成回归用例」的出口。
+        //
+        // 必须说清能自动断言什么（别高估）：只有「那一轮实际路由到哪个智能体 / 计划里包含哪几个智能体」是
+        // 确定的，故只预填这些。选「答非所问 / 编造」生成的用例天然钉不住答案质量 —— 备注全程只作人工线索，
+        // 不假装它能自动判答案（与评测弹窗「不判答案质量」同一立场，见 EvalService 的类注释）。
+        //
+        // 「转成用例」限 ADMIN：库内用例是全局资产（所有跑批共用），且只有能跑批的人才能验证它。
+        // 取值与后端 MessageFeedback.REASONS 同一份口径；这里给的顺序按「用户最容易说清的」排。
+        const fbReasons = [
+            { value: 'ANSWERS_OFF', label: '答非所问' },
+            { value: 'FABRICATED', label: '编造内容' },
+            { value: 'ROUTING', label: '路由或规划不对' },
+            { value: 'OTHER', label: '其他' }
+        ];
+
+        /**
+         * 拉本会话全部反馈，按 messageId 合并到已加载的消息上。
+         * <p>刻意单开一个请求、不并进历史接口（后端也刻意没做进 history 响应）：历史是「说了什么」，反馈是
+         * 「怎么看这句话」，两者变化频率与读取时机都不同；合成的代价是每次翻历史都白拉一遍反馈，也让消息
+         * DTO 多一个只有标记用途的字段。
+         * <p>读不到就静默按「没反馈」处理 —— 反馈是附加信息，不该因为它把整屏历史挡住。
+         */
+        async function loadFeedback() {
+            const id = currentId.value;
+            if (!id) return;
+            const seq = historySeq;   // 切会话守卫：拿到结果时若已切走则丢弃
+            try {
+                const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(id) + '/feedback');
+                if (!resp.ok) return;
+                const list = await resp.json();
+                if (seq !== historySeq) return;
+                const byMsg = new Map((list || []).map(f => [f.messageId, f]));
+                for (const m of messages.value) {
+                    if (m.messageId != null) m.feedback = byMsg.get(m.messageId) || null;
+                }
+            } catch (e) { /* 反馈读不到不影响对话：按「没反馈」处理 */ }
+        }
+
+        /**
+         * 展开 / 收起某条消息的反馈表单。
+         * <p>有历史评价时把原因与备注回填（改票场景：一人一票，改主意是改票不是追加），没有则用默认值。
+         * 默认原因取「答非所问」而不是「路由或规划不对」—— 后者生成的用例有真实断言价值，默认它等于悄悄
+         * 把用户往「更有价值的那一类」上引，分类就不再是用户说的了。
+         */
+        function openFeedback(m) {
+            if (!m || !m.messageId) return;
+            m.fbError = '';
+            m.fbOpen = !m.fbOpen;
+            if (!m.fbOpen) return;
+            m.fbReason = (m.feedback && m.feedback.reason) || 'ANSWERS_OFF';
+            m.fbComment = (m.feedback && m.feedback.comment) || '';
+        }
+
+        /** 提交「这条回答有问题」（👎 + 问题分类 + 备注）。 */
+        async function submitFeedback(m) {
+            if (!m || m.fbSaving) return;
+            await sendFeedback(m, 'DOWN');
+        }
+
+        /** 记为「有用」（改票 / 撤回点踩）。后端会顺带清掉问题分类与备注 —— 「点赞 + 编造」是自相矛盾的组合。 */
+        async function markFeedbackUp(m) {
+            if (!m || m.fbSaving) return;
+            await sendFeedback(m, 'UP');
+        }
+
+        /** 提交反馈的公共实现。成功后消息对象原地更新，不重拉整份历史。 */
+        async function sendFeedback(m, rating) {
+            if (!m.messageId) return;
+            m.fbSaving = true;
+            m.fbError = '';
+            try {
+                const resp = await apiFetch('/api/chat/message/' + encodeURIComponent(m.messageId) + '/feedback', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        rating: rating,
+                        reason: rating === 'UP' ? null : m.fbReason,
+                        comment: m.fbComment
+                    })
+                });
+                const body = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(body.message || ('HTTP ' + resp.status));
+                m.feedback = body;   // 后端回的是更新后的那条（改票也是这一条）
+                m.fbOpen = false;
+            } catch (e) {
+                m.fbError = '提交失败：' + e.message;
+            } finally {
+                m.fbSaving = false;
+            }
+        }
+
+        /**
+         * 把这条反馈转成库内回归用例（ADMIN 专属）。
+         * <p>生成后把用例名念给用户听 —— 断言边界在用例上，用户得知道它到底钉住了什么，才不会以为
+         * 「转成用例」等于「以后答案质量也被自动看着」。
+         */
+        async function promoteFeedback(m) {
+            if (!m || !m.feedback || m.fbPromoting) return;
+            m.fbPromoting = true;
+            m.fbError = '';
+            try {
+                const resp = await apiFetch('/api/eval/cases/from-feedback', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ feedbackId: m.feedback.id })
+                });
+                const body = await resp.json().catch(() => ({}));
+                // 403 说清原因：这是角色不够，不是转用例这件事本身出错。入口已按角色隐藏，
+                // 走到这里多半是「同一浏览器换了小号登录」或角色被摘掉后的残留状态。
+                if (resp.status === 403) throw new Error('仅管理员可转成回归用例（当前账号无 ADMIN 角色）');
+                if (!resp.ok) throw new Error(body.message || ('HTTP ' + resp.status));
+                m.feedback.evalCaseId = body.id;
+                alert('已生成回归用例：' + body.name + '\n\n'
+                    + '它钉住的是这一轮「可确定的部分」：走哪个智能体 / 计划里包含哪几个智能体。'
+                    + '答案质量本身不会被自动断言 —— 你写的备注仍只作人工排查线索。\n'
+                    + '可在顶部「🧪 提示词回归评测」弹窗里跑批验证。');
+            } catch (e) {
+                m.fbError = '转用例失败：' + e.message;
+            } finally {
+                m.fbPromoting = false;
+            }
+        }
+
+        /** 保存记忆内容（只覆盖两列内容；游标由系统维护，不在请求范围内）。事实条目走各自的端点。 */
         async function saveMemory() {
             if (!currentId.value || memoryModal.saving) return;
             memoryModal.saving = true;
@@ -1193,10 +1518,15 @@ const app = createApp({
             }
         }
 
-        /** 重置记忆：摘要 / 核心事实 / 游标三列归零，消息保留（下次超窗会从头重新摘要）。 */
+        /**
+         * 重置记忆：摘要 / 旧版归档 / 游标归零，<b>并作废自动整理出的条目</b>，消息保留（下次超窗会从头重新摘要）。
+         * <p>确认文案必须把「自动条目会被清除」写出来：这是本次操作里唯一会让用户看到东西消失的部分，
+         * 不说清楚就变成了一次静默删除。手动条目不在范围内，也写明白 —— 否则用户不敢点。
+         */
         async function resetMemory() {
             if (!currentId.value || memoryModal.saving) return;
-            if (!confirm('重置会清空摘要与核心事实，并让下次记忆压缩从头开始（历史消息不会被删除）。继续吗？')) return;
+            if (!confirm('重置会清空摘要与旧版归档、清除自动整理出的长期事实条目（手动添加的条目保留），'
+                + '并让下次记忆压缩从头开始。历史消息不会被删除。继续吗？')) return;
             memoryModal.saving = true;
             try {
                 const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/memory', {
@@ -1206,6 +1536,7 @@ const app = createApp({
                 memoryModal.summary = '';
                 memoryModal.coreFacts = '';
                 memoryModal.summarizedCount = 0;
+                await reloadFacts();
             } catch (e) {
                 alert('重置记忆失败：' + e.message);
             } finally {
@@ -2197,7 +2528,9 @@ const app = createApp({
         ];
         const evalModal = reactive({
             open: false, scenario: '', caseCount: 0,
-            running: false, error: '', result: null, batches: [], compare: null
+            running: false, error: '', result: null, batches: [], compare: null,
+            // 库内用例（yaml 之外的增量，目前唯一来源是「用户反馈转用例」）：json / 读取错误 / 正在删的那条 id
+            dbCases: [], dbError: '', dbBusy: 0
         });
 
         /** 打开评测弹窗：先读用例集把条数显示出来（点「跑一批」前就该知道会发起多少次模型调用）。 */
@@ -2206,6 +2539,7 @@ const app = createApp({
             evalModal.result = null;
             evalModal.error = '';
             await loadEvalCases();
+            await loadEvalDbCases();
             await loadEvalBatches();
         }
 
@@ -2213,6 +2547,44 @@ const app = createApp({
             evalModal.open = false;
             evalModal.result = null;
             evalModal.compare = null;
+        }
+
+        /**
+         * 库内用例（来自反馈的那些）：展示 + 删除。
+         * <p>{@code eval-cases.yaml} 打包进 jar 后运行时写不了，所以「点踩 → 转成回归用例」只能落在库里；
+         * yaml 退化为只读种子，本区块展示的是运行时增量。同名以 yaml 为准（种子是人工审校过的，不该被一条
+         * 自动记录静默顶掉）—— 所以两侧可能有同名条目，这里只列库内的，不假装是全集。
+         */
+        async function loadEvalDbCases() {
+            try {
+                const resp = await apiFetch('/api/eval/cases/db');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                evalModal.dbCases = await resp.json();
+                evalModal.dbError = '';
+            } catch (e) {
+                evalModal.dbCases = [];
+                evalModal.dbError = '库内用例读取失败：' + e.message;
+            }
+        }
+
+        /** 删除库内用例。只影响后续跑批 —— 历史批次里已落库的结果不受影响（故确认文案里明说）。 */
+        async function deleteEvalCase(c) {
+            if (!c || evalModal.dbBusy) return;
+            if (!confirm('删除回归用例「' + c.name + '」？\n\n'
+                    + '删除只影响后续跑批；历史批次里已落库的结果不受影响。')) return;
+            evalModal.dbBusy = c.id;
+            evalModal.dbError = '';
+            try {
+                const resp = await apiFetch('/api/eval/cases/db/' + encodeURIComponent(c.id), { method: 'DELETE' });
+                const body = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(body.message || ('HTTP ' + resp.status));
+                await loadEvalDbCases();
+                await loadEvalCases();   // 用例条数随之变化，头部那行得跟着更新
+            } catch (e) {
+                evalModal.dbError = '删除失败：' + e.message;
+            } finally {
+                evalModal.dbBusy = 0;
+            }
         }
 
         /** 只读用例集（不跑批），仅取条数。 */
@@ -2751,11 +3123,16 @@ const app = createApp({
         async function resumeTask() {
             if (loading.value || !currentId.value) return;
             const convId = currentId.value;
-            // 推一条空的 assistant 消息承接续跑输出（无用户气泡；续跑是对既有任务的延续）
-            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true, turn: branchTurn });
+            // 推一条空的 assistant 消息承接续跑输出（无用户气泡；续跑是对既有任务的延续）。
+            // turn 恒为 null：它只用于「同一轮提问的多版本切换器」，而续跑不是给哪一轮开新版本 ——
+            // 挂上一个版本上下文只会凭空多出一个翻不到第 2 版的切换器。
+            // （此处原先写的是 `turn: branchTurn`，而 branchTurn 是 send() 里的局部量 —— 点「继续执行」
+            //   会先抛 ReferenceError，整条续跑通路连请求都发不出去。2026-10-07 由 probe_intervene 抓到。）
+            messages.value.push({ role: 'assistant', content: '', html: '', version: 0, steps: [], stepsOpen: true, citesOpen: true, turn: null });
             const lastIndex = messages.value.length - 1;
             const signal = beginStream();   // 续跑同样可中断（与 send 共用一套中断控制）
             loading.value = true;
+            taskExecuting.value = true;
             scrollToBottom();
 
             try {
@@ -2908,6 +3285,7 @@ const app = createApp({
             } finally {
                 endStream();
                 loading.value = false;
+                taskExecuting.value = false;
                 // 续跑完成后刷新未完成任务状态：任务已 DONE/FAILED 则提示条消失
                 await loadRunningTask();
                 loadQuota();   // 续跑同样消耗 token，刷新配额刻度
@@ -3079,6 +3457,73 @@ const app = createApp({
                 m.approvalRunning = false;
             }
         }
+
+        // ===== 执行中干预：暂停 / 跳过卡住的步骤 =====
+        // 两个出口共用一条原则：都只改库、都不新开执行通路 —— 停或跳之后，都由用户点「继续执行」走既有的
+        // 断点续跑（resumeTask）。所以这里不需要任何新的执行逻辑。
+
+        /** 请求暂停正在执行的计划。不是硬中断：当前这一层跑完后才停，回执原文转述这一点。 */
+        async function pauseTask() {
+            if (!currentId.value || pausing.value) return;
+            pausing.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/task/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: currentId.value })
+                });
+                const body = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    pushNotice('暂停失败：' + (body.message || ('HTTP ' + resp.status)));
+                    return;
+                }
+                pushNotice(body.message || '已请求暂停');
+                if (runningTask.value) runningTask.value.pauseRequested = true;
+            } catch (e) {
+                pushNotice('暂停失败：' + e.message);
+            } finally {
+                pausing.value = false;
+            }
+        }
+
+        /** 跳过卡住的那一步（PENDING / FAILED → SKIPPED）；成功后重拉提示条，进度随之更新。 */
+        async function skipStep(stepIndex) {
+            if (!currentId.value || skipping.value) return;
+            if (!confirm('跳过第 ' + (stepIndex + 1) + ' 步？\n\n'
+                    + '它不会被执行、产出为空；依赖它的后续步骤拿不到这段输入。\n'
+                    + '（跳过只落库，之后点「继续执行」才接着跑）')) return;
+            skipping.value = true;
+            try {
+                const resp = await apiFetch('/api/chat/task/step/skip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: currentId.value, stepIndex: stepIndex })
+                });
+                const body = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    pushNotice('跳过失败：' + (body.message || ('HTTP ' + resp.status)));
+                    return;
+                }
+                pushNotice('已跳过第 ' + (stepIndex + 1) + ' 步，点「继续执行」接着跑');
+                await loadRunningTask();
+            } catch (e) {
+                pushNotice('跳过失败：' + e.message);
+            } finally {
+                skipping.value = false;
+            }
+        }
+
+        /**
+         * 提示条上「可跳过的步骤」：第一个未成功的步骤（PENDING / FAILED）；没有则 null（不出跳过按钮）。
+         *
+         * 用 computed 而不是模板里调函数：流式期间消息区会频繁重渲染，模板里的函数调用每次都要重跑一遍
+         * 查找。这个列表本身也跟着 runningTask 变，正是 computed 的适用场景。
+         */
+        const nextSkippable = computed(() => {
+            const rt = runningTask.value;
+            if (!rt || !Array.isArray(rt.steps)) return null;
+            return rt.steps.find(s => s.status === 'PENDING' || s.status === 'FAILED') || null;
+        });
 
         // ===== 局部重规划（只重排「第一个未成功步骤及其之后」的一段）=====
         // 与「续跑」的区别：续跑是原计划再跑一遍，重规划是这一段本身行不通时换一套。
@@ -3292,6 +3737,8 @@ const app = createApp({
             editPlanStep, cancelPlanStep, savePlanStep,
             // 步骤审批点：勾选「需审批」/ 批准并继续 / 终止计划
             toggleStepApproval, approveAndResume, cancelPlanTask,
+            // 执行中干预：暂停（canPause/pausing/pauseTask）、跳过卡住的步骤（nextSkippable/skipping/skipStep）
+            canPause, pausing, pauseTask, nextSkippable, skipping, skipStep,
             // 成本配额刻度（只展示，闸门在后端；fmtTokens 已在成本看板处导出）
             quota,
             // 规划模板：存 / 列 / 套用 / 删
@@ -3303,6 +3750,7 @@ const app = createApp({
             attachments, fileInput, triggerFilePicker, onFilePicked, removeAttachment, ACCEPT,
             editingId, editingTitle, agentModal, agentView,
             currentAgentName, currentAgentIcon, currentAgentId, currentPlanner, currentRagOn,
+            currentClarifyAsked, currentClarifyMax,
             mainView, iconPresets,
             kbs, kbModal, kbDetail, availableAgents, kbFileInput, chroma, loadChromaStatus, syncChroma,
             send, stopGeneration, newConversation, startAgentChat, selectConversation,
@@ -3312,6 +3760,12 @@ const app = createApp({
             // 引用回链：正文 [n] 角标点击 → 定位来源；来源条目「原文」→ 取知识块详情
             chunkModal, openCite, closeCite, onCiteClick,
             exportConversation, memoryModal, openMemory, saveMemory, resetMemory, memoryCoverage,
+            // 长期事实条目（逐条）：增 / 改 / 删 + 行内编辑态（factTopics 与后端 TOPICS 同口径）
+            factTopics, factBusy, factAdd, factEdit, addFact, startFactEdit, cancelFactEdit, saveFact, deleteFact,
+            // 记忆透明化：单条「不参与记忆」开关（面板里的「当前窗口构成」读 memoryModal.window）
+            toggleMemoryExcluded,
+            // 消息反馈（👎 → 回归用例）：fbReasons 是原因下拉的可选项（与后端 REASONS 同口径）
+            fbReasons, loadFeedback, openFeedback, submitFeedback, markFeedbackUp, promoteFeedback,
             // 智能体导入 / 导出
             exportAgents, triggerAgentImport, onAgentImportFile, agentImportInput,
             goChat, goAgents, goKbs,
@@ -3338,8 +3792,9 @@ const app = createApp({
             costModal, openCost, closeCost, loadCost, fmtTokens,
             // 页面级角色视点：顶栏按角色显隐的入口都读它（当前仅 💰 成本）
             isAdmin,
-            // 提示词回归评测：evalModal + 跑批/用例数/批次对比
-            evalScenarios, evalModal, openEval, closeEval, loadEvalCases, runEval, evalItemClass, evalTag
+            // 提示词回归评测：evalModal + 跑批/用例数/批次对比 + 库内用例（来自反馈）的列出与删除
+            evalScenarios, evalModal, openEval, closeEval, loadEvalCases, runEval, evalItemClass, evalTag,
+            deleteEvalCase
         };
     }
 });

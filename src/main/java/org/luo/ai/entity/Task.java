@@ -47,6 +47,18 @@ public class Task {
     /** 已完成步骤数（冗余，供列表快速展示进度）。 */
     private Integer doneSteps;
 
+    /**
+     * 用户「中途喊停」信号位：1=已请求暂停。
+     * <p>
+     * <b>这不是状态</b>：任务仍是 {@link #STATUS_RUNNING}，它是一个「让执行循环在下一个层边界自行停下」的
+     * 一次性信号。执行体跑在 SSE 的异步线程上，用库里的列而不是内存标志，是为了与「单会话单 RUNNING」
+     * 这条既有不变量放在同一处（task 表），不引入第二种状态源。
+     * <p>
+     * 清零责任在续跑入口（{@code PlannerRoundHandler#resumeTask} 开头），否则用户点了「继续执行」会立刻
+     * 又被自己的暂停位拦住。
+     */
+    private Boolean pauseRequested;
+
     /** 最终汇总结果（汇总步产出 / 最后一个成功步骤产出）。 */
     private String result;
 

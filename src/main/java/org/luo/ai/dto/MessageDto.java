@@ -5,17 +5,21 @@ import java.util.List;
 /**
  * 历史消息项。
  *
- * @param role        user / assistant
- * @param content     消息内容
- * @param attachments 本轮附件展示元数据（仅 user 消息可能有；无附件为空列表）。
- *                    仅用于历史渲染，不参与 LLM 上下文。
- * @param citations   本轮 RAG 引用来源（仅 assistant 消息可能有；无引用为空列表）。
- *                    仅用于历史渲染 [n] 角标与来源列表，不参与 LLM 上下文。
- * @param turn        该消息所属的对话分支版本；{@code null} = 这一轮从未分叉（没有版本可切）。
- *                    这一轮的所有消息（提问 + 回复）拿到的是<b>同一份</b> turn，切换器只在提问上渲染。
+ * @param id             消息主键。写回类操作（「不参与记忆」开关）要靠它定位到具体那一条；
+ *                       只暴露主键本身没有额外风险 —— 对应接口先按会话归属校验，拿别人的 id 一律 404。
+ * @param role           user / assistant
+ * @param content        消息内容
+ * @param attachments    本轮附件展示元数据（仅 user 消息可能有；无附件为空列表）。
+ *                       仅用于历史渲染，不参与 LLM 上下文。
+ * @param citations      本轮 RAG 引用来源（仅 assistant 消息可能有；无引用为空列表）。
+ *                       仅用于历史渲染 [n] 角标与来源列表，不参与 LLM 上下文。
+ * @param turn           该消息所属的对话分支版本；{@code null} = 这一轮从未分叉（没有版本可切）。
+ *                       这一轮的所有消息（提问 + 回复）拿到的是<b>同一份</b> turn，切换器只在提问上渲染。
+ * @param memoryExcluded 用户是否把这条标记为「不参与记忆」。为 true 时它不会进上下文、也不会进滚动摘要，
+ *                       但<b>历史里照常显示</b> —— 前端据此把开关渲染成已选状态，让人一眼看出「模型看不到这条」。
  */
-public record MessageDto(String role, String content, List<AttachmentDto> attachments,
-                         List<KbCitation> citations, Turn turn) {
+public record MessageDto(Long id, String role, String content, List<AttachmentDto> attachments,
+                         List<KbCitation> citations, Turn turn, boolean memoryExcluded) {
 
     /**
      * 对话分支版本。
@@ -32,8 +36,8 @@ public record MessageDto(String role, String content, List<AttachmentDto> attach
         }
     }
 
-    /** 无附件、无引用、无分支的便捷构造（旧数据 / 无需展示溯源的消息）。 */
+    /** 无主键、无附件、无引用、无分支、参与记忆的便捷构造（旧数据 / 无需展示溯源的消息）。 */
     public MessageDto(String role, String content) {
-        this(role, content, List.of(), List.of(), null);
+        this(null, role, content, List.of(), List.of(), null, false);
     }
 }

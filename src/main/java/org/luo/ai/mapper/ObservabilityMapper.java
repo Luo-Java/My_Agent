@@ -4,9 +4,11 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.luo.ai.dto.ObservabilitySummary.AgentBucket;
 import org.luo.ai.dto.ObservabilitySummary.DailyBucket;
+import org.luo.ai.dto.ObservabilitySummary.LowRound;
 import org.luo.ai.dto.ObservabilitySummary.ModeBucket;
 import org.luo.ai.dto.ObservabilitySummary.Overview;
 import org.luo.ai.dto.ObservabilitySummary.RouteBucket;
+import org.luo.ai.dto.ObservabilitySummary.SelfEvalSummary;
 import org.luo.ai.dto.ObservabilitySummary.SlowRound;
 
 import java.time.LocalDateTime;
@@ -44,4 +46,16 @@ public interface ObservabilityMapper {
 
     /** 窗口内最慢的 N 轮（耗时降序），用于定位瓶颈。 */
     List<SlowRound> selectSlowest(@Param("since") LocalDateTime since, @Param("limit") int limit);
+
+    /**
+     * 回答自评的覆盖与分数（窗口内全站）。
+     * <p>
+     * {@code threshold} 由 {@code agent.self-eval.low-score-threshold} 传入，<b>不在这里写死</b>：
+     * 面板上的「低分」与后端采样自评用的门槛必须是同一个数，否则会出现「面板说低分、自评里却算达标」。
+     */
+    SelfEvalSummary aggregateSelfEval(@Param("since") LocalDateTime since, @Param("threshold") int threshold);
+
+    /** 窗口内低分轮次（分数升序，同分取最近）。 */
+    List<LowRound> selectLowScore(@Param("since") LocalDateTime since, @Param("threshold") int threshold,
+                                  @Param("limit") int limit);
 }

@@ -34,4 +34,22 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      取某条消息之前、同一会话里最近的一条用户输入（反馈转回归用例时还原「用户当时说了什么」）。
+      1) 按 id 排序而不是 created_at：同轮 user/assistant 的 created_at 秒级完全相同，定不了先后。
+      2) 带分支过滤（与所有读取侧同口径）：被翻走的历史版本不算「用户说过」。
+      3) 刻意不过滤 memory_excluded —— 这是展示侧口径：那条消息是否参与记忆，与「用户当时问了什么」无关。
+      单列 resultType=String，不涉及 record 投影的列数/列序陷阱。
+    -->
+    <select id="selectPrevUserInput" resultType="java.lang.String">
+        SELECT m.content
+        FROM chat_message m
+        WHERE m.conversation_id = #{conversationId}
+          AND m.role = 'user'
+          AND m.id &lt; #{messageId}
+          AND (m.turn_group_id IS NULL OR m.turn_active = 1)
+        ORDER BY m.id DESC
+        LIMIT 1
+    </select>
+
 </mapper>

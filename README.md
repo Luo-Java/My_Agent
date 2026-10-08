@@ -14,11 +14,15 @@
 
 - **自定义智能体**：页面创建任意角色（翻译、天气、教育数据分析、代码助手…），配置人设提示词、模型、温度与可用工具；提示词自动汇总到 `agent_code.md`。
 - **智能路由**：未绑定智能体的会话由 LLM 三态路由（命中智能体 / 普通对话 / 正在回答追问），并携带最近上下文识别「北京呢？」这类承接上一轮的短追问。
-- **参数追问补全**：智能体用 `paramSchema`（JSON 数组）声明参数；缺失必填项时自动追问（上限 3 轮），参数齐全才正式回答。跟进任务会继承上一轮已明确的参数（如「今天」→ 日期=今天）。追问状态**无显式存储**，每轮从历史重放推导，天然跨重启一致。
+- **参数追问补全**：智能体用 `paramSchema`（JSON 数组）声明参数；缺失必填项时自动追问（上限 3 轮，常量 `ClarifyState.MAX_ASKED` 唯一来源），参数齐全才正式回答。跟进任务会继承上一轮已明确的参数（如「今天」→ 日期=今天）。**追问状态显式落库**（`conversation.clarify_state`，JSON `{agentId, asked, request, question, params}`），跨轮稳定、跨重启一致；历史重放**降级为兜底**——老会话没有这一列时行为与改造前一致，不因升级而回退。**为什么要落库**：此前每轮都靠扫历史重放推导「已问几次 / 已确认哪些参数」，一旦原始请求被摘要压缩滑出窗口、或被标「不参与记忆」，重放就会**算错**（追问次数从头算、已确认参数丢失）。`agentId` 即**换智能体作废**判据（路由转向别的智能体时状态自然失效，无需额外清理），解绑智能体时一并清空；`clearMessages` 也清（消息没了、追问失去对象），而「重置记忆」**刻意不清**（消息仍在、追问仍可答）。
 - **动态规划（Planner）**：会话级 🧭 开关开启后，由 LLM 运行时把用户目标拆成多智能体步骤并**按依赖并行**执行；执行过程实时展示、不写入记忆。规划模式与绑定智能体互斥。**任务状态持久化**：每轮规划落库 `task`/`task_step`，服务重启/中断后可点「继续执行」显式续跑剩余步骤（不重新规划）。
 - **先看计划（可选，规划模式的子开关）**：再开「先看计划」后，规划**只产出计划就暂停**，页面给出可交互的计划卡片（步骤清单 + 「执行计划」按钮），确认无误才开跑。执行复用的就是上面那条**断点续跑**通路——计划已作为 RUNNING 任务落库、步骤全 PENDING，所以后端没有第二套执行入口；计划明细同时也作为正文推过一遍，刷新后卡片消失但内容仍可回看。默认关闭（规划完直接执行，与改造前一致）。
 - **规划模板（把「怎么排」沉淀成资产）**：跑顺的一次规划可在计划卡片上点「存为模板」，其**步骤骨架**（智能体 + 指令 + 依赖快照）即成为可复用资产；下次同类目标在输入区「模板」里选一个、填本次目标，就按骨架生成计划——**零模型调用**，省掉一次规划往返，生成后仍可用卡片上的「编辑」逐条微调再执行。模板**只存「怎么排」、不存「做什么」**（目标每次都不同，故套用时必填），也不含各步产出与任何运行态：存的是**快照 JSON** 而非引用 `task_step`（那张表会随局部重规划删改、重排行，引用式模板会被连带破坏）。按用户隔离，仅本人可见；套用同样只做「落库」，执行仍走断点续跑。
 - **步骤审批点（让「跑一半停下来问你」成为能力）**：计划卡片上可给任意步骤勾选「需审批」，执行到该步**先暂停并等待批准**，页面弹出审批卡片（批准并继续 / 终止计划）。**关键是这套关卡复用现成通路**：批准后走的就是断点续跑（`POST /api/chat/task/resume`），没有第二套执行逻辑；终止走 `POST /api/chat/task/cancel`，把任务收成 `CANCELLED`。审批是「允不允许跑」、状态是「跑到哪了」，两者正交（`approval_required` / `approved` 两列独立于 `status`）。
+- **执行中干预（暂停 / 跳过卡住的步骤）**：审批是「计划里就写好的关卡」，这两个是「跑起来之后才决定」的出口，都不能靠新建一套执行逻辑实现，故都只改库、由用户点「继续执行」走现成的断点续跑。
+  - **暂停（`task.pause_requested`）**：请求置位后，执行循环在下一个**层边界**停止推进（任务仍是 RUNNING、剩余步骤仍是 PENDING），之后可改步 / 跳步再续跑。**它不是硬中断，回执刻意不说「已暂停」**——同一层是 `CompletableFuture` 并行 join，硬中断一个跑到一半的调用只会留下半截产出、还得从头再问；回执文案写「当前正在执行的那一层跑完后停止推进」，前端原样转述。暂停位由**续跑入口**负责清零（不清就会出现「点了继续、立刻又停」，且之后每轮一进去就停）。
+  - **跳过（`PENDING`/`FAILED` → `SKIPPED`）**：没有这个出口，一个反复失败的步骤会把整个任务**永久卡死**——重试次数一旦用尽，执行侧只把它当作「前驱失败」，而后续依赖它的步骤永远凑不齐前驱、每一轮续跑都在同一处空转。前端在步骤重试用尽时于提示条上明说「第 N 步（某智能体）重试已用尽，不会自行恢复」并给出「跳过第 N 步」；执行中不显示跳过（先暂停再跳，后端也只收 `PENDING`/`FAILED`）。
+  - 提示条改为返回**步骤明细**（`RunningTaskView`：每步的智能体名 / 状态 / 错误 / 是否重试用尽）而不只是「已完成 1/4 步」——用户看得到进度却不知道卡在哪、也没有可点的动作，那两句话等于没回答。
 - **成本配额（按用户 × 自然日）**：可选的用量护栏 —— 打开后每轮对话开始前汇总「该用户今天花了多少 token」（`agent_trace` 回答侧 + `llm_usage` 裸调用侧，口径与成本看板一致），超限**明确返回 429 并说明已用/上限/何时重置**，接近上限（默认 90%）时在回复前推一条预警。ADMIN 默认豁免。**超限不许静默降级**（不换小模型、不截断历史、不假装成功）；统计出错则 fail-open 放行并落 WARN（配额是治理手段、不是正确性保障，宁可放过也不因统计故障挡住正常使用）。
 - **并行评审（多智能体对同一问题并行作答 + 裁决）**：会话级 ⚖ 开关开启后，本轮先由 LLM 从智能体库里挑若干**候选**（会话已绑定智能体时它固定占一席，其余按问题类型选），各候选**互相不可见地**独立作答，再由裁决者综合成**一份**最终回答——答案是「综合」而非「挑一份」，从而减少单次作答的偏斜。候选与最终答案一起推给前端（候选走 `review` 事件、只作展示不落记忆），让「答案是怎么来的」可追溯。
   - **候选互不可见**：互相看得见就退化成串行接力（后答者会跟着前面的思路走），拿不到「多解」。**共用同一份检索素材**（RAG 命中 + 跨会话回忆只取一次）既控成本（否则 N 份检索），也保证「谁答得好」里不混进「谁拿到的资料多」。
@@ -31,14 +35,24 @@
   - **边界要说清**：规则是**正则字面匹配、不是语义审核** —— 换个说法、加个谐音就能绕过，且规则只进配置（改规则不改代码）。规则命中只记 WARN、**不落原文**（拦截记录本身不该成为敏感内容的新副本）。
   - **替换只作用于推送与展示**：普通对话的助手消息由记忆 Advisor 在模型返回时就已落库，输出侧护栏跑在它之后，因此库里仍是模型原始输出。要让落库也替换得把护栏下沉进 Advisor 改写 response（会牵动 token / 工具元数据重建），本版本刻意不做。
 - **双层记忆**：短期窗口（`chat_message` 原文，受 token 预算与条数下限约束）+ 长期滚动摘要（`conversation.summary` / `core_facts`）；超窗历史异步压缩合并，**先推回复、后处理记忆**。
-- **长期记忆可视化与编辑**：双层记忆此前是纯黑盒 —— 压缩由后端异步完成，用户既看不到「它记住了什么」，也无法纠正记错的内容。顶栏 🧠 记忆把摘要与核心事实摊开可改，并给出「已压缩 N / M 条」的覆盖度（直接回答「它为什么还记着那么早的事」）。**水位 `summarized_count` 只读不可改**：它是「压缩到第几条」的执行游标，手改会让下次合并从错误位置继续；要重置得走「重置全部记忆」（三列一起归零、历史消息保留，下次超窗从头重新摘要）。
+- **长期记忆可视化与编辑**：双层记忆此前是纯黑盒 —— 压缩由后端异步完成，用户既看不到「它记住了什么」，也无法纠正记错的内容。顶栏 🧠 记忆把摘要、长期事实（逐条）与旧版归档摊开可改，并给出「已压缩 N / M 条」的覆盖度（直接回答「它为什么还记着那么早的事」）。**水位 `summarized_count` 只读不可改**：它是「压缩到第几条」的执行游标，手改会让下次合并从错误位置继续；要重置得走「重置全部记忆」（三列一起归零、历史消息保留，下次超窗从头重新摘要）。
+- **记忆注入透明化 + 单条禁用**：此前「这一轮到底往 prompt 里塞了哪些历史」只在追踪里看得到路由 / 工具 / token，记忆这一段是黑盒。现在两处可见：**记忆面板**多出「当前窗口（本轮会注入的历史）」逐条清单（角色 / 前 60 字预览 / **实际进上下文的字符数**），与摘要、长期事实一起回答「这次是靠原文记起来的、还是靠摘要记起来的」；**追踪弹窗**每轮多出「本轮注入记忆」块，给出窗口逐条 + 窗口 / 摘要 / 长期事实三段字符数（刻意分开计 —— 混成一个总数就答不了上面那个问题）。另有**单条消息开关**：某条消息可标「不参与记忆」，此后它既不进窗口、也不参与摘要，但**历史里仍然看得见**（「不进记忆」≠「删掉」，展示侧刻意不过滤）。
+- **「改参与状态」会重置摘要游标（副作用明说）**：`summarized_count` 是「已压缩到第几条」的执行游标，而窗口可见构成刚被这次操作改变，游标不动就指向了错误位置 ⇒ 标记/取消标记时把**游标**归零。摘要与长期记忆的**内容保留**（否则用户会莫名丢掉「我是谁 / 我的偏好」），代价是下次超窗时重新整理一遍。前端在操作后 `alert` 明说这一点。
+- **长期事实条目（逐条可看 / 可改 / 可删）**：长期记忆此前是一段由模型异步合并出来的长文本（`conversation.core_facts`），用户既无法逐条纠正，也看不出哪一条是「它自己整理的」、哪一条是「我明确告诉它的」。现在改为**逐条承载**（新表 `conversation_fact`）：记忆面板按主题分组列出每条事实，每条都带**来源标签**（手动 / 自动），可单独改、单独删、也可手动新增。**旧的归档文本保留不动**（面板里标为「旧版事实归档（不再自动更新）」），并在**首次合并时被当作输入拆成条目**——所以升级本身不丢任何记忆，也不需要迁移脚本。
+  - **两条来源待遇不同**：**自动**条目每次合并**按 diff 重写**（不在新清单里的即视为过时删除，这是淘汰旧事实的唯一通路）；**手动**条目**合并绝不覆盖、绝不删除**。用户手改一条自动条目会让它**转成手动**（= 认领），此后自动合并再也动不了它——这才是「我纠正过的事，别再给我改回去」。
+  - **注入优先级**：只要还有条目，就注入条目；条目被删光才回退读旧归档。**手动条目永不被删**，重置记忆也只清自动条目。
+  - 同一会话内按 `MD5(主题 + 事实)` 去重；手动新增撞上同一条已存在的自动条目时不报错，而是把它**认领**为手动（用户的意图就是「我要它留着」，与自动条目的诉求一致）。
+- **线上回答自评（元认知）**：模型在答完之后**给自己这一轮打分**（1~5 分 + 是否答到问题 / 是否言之有据 / 问题短语 / 一句话说明），落进 `agent_trace`。**它回答的是「答得对不对」，与「跑得动吗 / 快不快」是两件事**，因此和链路追踪同源、同样只作旁路——自评失败只记 WARN，绝不影响对话。
+  - **默认关闭，两条触发通路**：① **按比例抽检**（`agent.self-eval.sample-rate`，按 `traceId` 哈希采样，因此**可重现**——同一轮重跑结论一致，便于对账）；② **用户点踩强制自评**，**不看开关、不看采样率**（用户既然明确说这轮有问题，就不该因为"没抽到"而没有任何留档）。
+  - **「未自评」与「评了低分」必须分得开**：对话页追踪详情里，无自评的那轮显式写「本轮未自评」并解释原因（而不是留白或显示 0 分——留白会被读成这轮答得很差）；可观测面板把「已自评 / 未自评 / 低分」三个数**并列**给出，且**低分率的分母是"已自评"而不是全量**——否则把采样率调低就会让指标自动变好看，那是指标自欺。
+  - 「是否有依据」「是否答到问题」在明细读不出来时是**`null` 而不是 `false`**：「明细没采到」与「模型明确说没答到」是两件事。
 - **流式输出**：SSE 推送 `token`（正文，进记忆）、`progress`（执行过程，不进记忆）、`citations`（引用来源）、`plan`（待确认计划，见「先看计划」）、`approval`（触到审批关卡，见「步骤审批点」）、`review`（并行评审候选，见上）、`recall`（跨会话回忆命中，见上）、`ping`（心跳）、`error` 等事件，前端逐字渲染。**前置链也有实时反馈**：发送后到首个 token 之间，路由判定 / 参数抽取 / 检索问句改写各环节都会先推一条 `progress`，不再是一片空白干等。`review` / `recall` 都排在正文之前：它们是「结论怎么来的 / 用了什么素材」，先给依据再给结论。
 - **对话分支（编辑重发 / 重新生成不删历史）**：与 DeepSeek 一致的形态——对某一轮「重新生成」、或对某条用户消息「编辑重发」，**不删旧版本**，而是给这一轮**再开一个版本**；那条**提问**气泡上出现「n / m ‹ ›」版本切换器，点箭头原地翻看同一轮提问的多个版本（提问与其后的助手回复作为一个「分支组」一起换）。这与早前「先截断再重发」只差一个取舍：截断是「旧答案当场消失、原思路回不去」，分支是「旧版本留在库里可翻回」。**开新版本发生在消息确实落库之后**（流式之前只分组、算版本号，绝不提前失效旧版本）——否则附件失败 / 配额拦截 / 发送中断都会让那一轮凭空消失。
 - **分支的落库口径**：`chat_message` 上用三列刻画 —— `turn_group_id`（同轮多版本共用，UUID）、`turn_version`（组内序号，从 1 连续递增，故前端可直接令 `versionCount = version`）、`turn_active`（当前生效版本，同组至多一个为 1）。**`turn_group_id IS NULL` 即「从未分叉」**，存量数据零回填、无需迁移。**读取侧四处共用同一过滤**（`turn_group_id IS NULL OR turn_active = 1`）：喂 prompt 的历史、记忆窗口、消息总数、摘要切片——任一处漏掉都会让「摘要水位按物理行数推进」与「注入侧按生效版本取」错位，裂出既不摘要也不注入的记忆空洞。新版本行还会**把 `created_at` 锚回该组首条的时间**，否则按 `created_at, id` 排序时它会掉到后面几轮之后。
 - **切版本 / 开新版本会重置长期记忆水位**：注入模型的历史整段换了，旧摘要即失效（与「截断重发」同一语义）；切换只改 `turn_active`（先全灭同组、再点亮目标），不动作答内容。
 - **会话导出**：顶栏 ⬇ 导出把当前会话导出为 Markdown（消息全文 + 附件文件名 + RAG 引用来源与相关度）。后端只回文本、由前端拼 Blob 下载 —— 下载必须带 `Authorization`，而浏览器对裸链接的导航请求带不上这个头，走文件通道只会 401。附件刻意只留文件名不留 URL：导出文件要自包含，指向本机 `/files/**` 的链接换台机器就是死链。
 - **链路追踪**：每轮对话的路由来源、规划步骤、改写后检索问句、RAG 命中、工具调用（参数/结果/token/耗时）异步落库 `agent_trace`；页面 🔍 追踪弹窗按**每页 10 条**分页查看本会话最近 50 轮，**只显示自己名下会话的记录**（管理员可切到「全部会话」看全站）。
-- **可观测面板（仅 ADMIN）**：跨会话聚合 `agent_trace` 回答「整体运行得怎么样」——成功率 / 平均耗时 / 平均 token、按天·按形态·按处理方来源·按智能体拆解、以及最慢的 N 轮（定位瓶颈）。独立页 `/observability.html`，与成本看板（讲「花了多少钱」）互补：本面板讲「跑得多快、成不成」。接口与入口都限 ADMIN（跨会话全站聚合口径）。
+- **可观测面板（仅 ADMIN）**：跨会话聚合 `agent_trace` 回答「整体运行得怎么样」——成功率 / 平均耗时 / 平均 token、按天·按形态·按处理方来源·按智能体拆解、以及最慢的 N 轮（定位瓶颈）；另有一块**回答质量（模型自评）**：已自评 / 未自评 / 低分 / 平均分四张卡 + **低分轮次表**（分数升序，最差的先看；只列定位信息，明细点进对话页看），低分线由后端 `agent.self-eval.low-score-threshold` 下发、前端不写死。独立页 `/observability.html`，与成本看板（讲「花了多少钱」）互补：本面板讲「跑得多快、成不成、答得对不对」。接口与入口都限 ADMIN（跨会话全站聚合口径）。
 - **成本看板（仅 ADMIN）**：全量成本口径——除「回答本身」（`agent_trace`）外，路由判定/参数抽取/查询改写/任务规划/视觉识别/记忆合并/跨会话召回（`RECALL`）/并行评审（`REVIEW`）这些裸 `ChatModel` 调用也各自记入 `llm_usage`（按用途 `purpose` 拆解）；页面 💰 成本弹窗按天趋势 + 按用途聚合展示（近 7/30/90 天）。接口与入口都限 ADMIN（全站聚合口径，按人拆分无意义）。
 
 ### 知识库与多模态
@@ -49,6 +63,7 @@
 - **多模态图片理解**：输入框 🖼 支持多选图片（≤5 张 / 单张 ≤10MB），由视觉模型（默认 `qwen-image-2.0-pro-2026-06-22`，可配）识别成中文 caption 拼入本轮上下文；走 Spring AI 原生多模态（裸 `ChatModel` + `UserMessage.media`，per-request 覆盖模型、多图并发识别）。**原始二进制不进会话存储**——caption 仅当轮可见。
 - **引用回链（从角标一路点回原文）**：回答正文里的 `[n]` 是**可点击角标**，点一下会展开该轮的「引用来源」并高亮第 n 条；来源条目上的「原文」再进一步，按 `chunkId` 拉出**被引用的那段知识块正文**。此前只有「库名 · 文件名 · 相关度」，用户无法判断一句话是文档里写的还是模型编的。取块失败（块被删或重新分片，这在几个月前的老引用上很正常）**明确 404 并说明原因**，不返回空白块——空白块会被读成「文档里本来就是空的」。角标处理只改正文文本段，`<pre>`/`<code>`/`<a>` 内的 `[n]`（代码、数组下标、链接文字）与图表 JSON 一律不动。
 - **文档解析**：附件与知识库支持 txt / md / markdown / csv / json / xml / yml / properties / log / sql 文本，以及 pdf（PDFBox）、docx / xlsx（POI）。
+- **知识库图片入库（多模态）**：知识库上传遇图片（png / jpg / jpeg / gif / webp / bmp / tif / tiff / heic / avif）时，先由视觉模型识别成中文文字描述、再按普通文本切块入库 —— 让「一张图里的信息」也能被 RAG 检索到。**图片判据单例**（`VisionService.isSupportedImage`，对话附件与知识库共用同一份 MIME / 扩展名规则，并**排除 svg**），杜绝「同一张 png 在附件里能识别、在知识库里被拒」。**失败语义与对话附件刻意不同**：对话附件单图失败降级为占位文本（一张图没认出来不该让整轮对话失败），知识库入库失败则**直接让该文件失败**——把「[图片识别失败：超时]」当知识块存进去，等于往检索结果里灌噪声，比报错糟得多。
 
 ### 工具调用
 
@@ -65,11 +80,16 @@
 
 ### 提示词回归评测
 
-- **改提示词前后各跑一批**：`prompts.yaml` 里 11 个模板（路由判定、参数抽取、查询改写、规划、汇总…）都是 LLM 行为契约，改一个词可能悄悄修好 A、弄坏 B。评测把这层「跑批 + 断言」补齐 —— 用例集声明「什么输入应得什么结果」，跑批走真实链路，逐条给通过 / 失败 / 配置错误。
+- **改提示词前后各跑一批**：`prompts.yaml` 里 14 个模板（路由判定、参数抽取、查询改写、规划、评审、自评…）都是 LLM 行为契约，改一个词可能悄悄修好 A、弄坏 B。评测把这层「跑批 + 断言」补齐 —— 用例集声明「什么输入应得什么结果」，跑批走真实链路，逐条给通过 / 失败 / 配置错误。
 - **三态不混算**：**失败** = 提示词质量问题；**配置错误** = 用例自己写错（例如断言引用了不存在的智能体编码）—— 单列一档，否则用例维护失误会被误读成「模型变笨了」。
 - **批次对比看 broken**：每批落库，`/api/eval/compare` 直接给出 `fixed`（上批挂→本批过）与 `broken`（**上批过→本批挂**）。改完提示词先看 `broken` 有没有变长，比看总通过率更能定位回归。
 - **零侵入**：不碰对话链路 —— 评测复用现成的路由 / 规划能力，只是换个入口调用并断言结果。用例集是 `classpath:eval-cases.yaml`，加用例不改代码。
 - **仅 ADMIN**：`/api/eval/**` 整类带 `@RequireRole(ADMIN)` —— 「跑一批」发起的是**真实模型调用**（13 条用例 = 13 次 LLM 请求），消耗计入 `llm_usage` 成本流水，与成本看板同一性质。只读的 `/cases`、`/batches`、`/compare` 本可单独放宽，但它们只服务于「跑批」这一件事，没有独立使用场景，故整类收敛；前端顶栏入口按同一角色显隐。
+- **消息反馈 → 回归用例（把线上翻车变成可重复跑的断言）**：助手回复上点 👎 并选问题分类（答非所问 / 编造内容 / 路由或规划不对 / 其他）+ 备注，必要时一键「保存为回归用例」。**反馈的价值不在「记录」，而在「可复用」**——一条躺在表里的点踩只是留档，转成断言之后它才会在下次改提示词时替用户把问题再问一遍。
+  - **一人对一条消息一票**（唯一键 `message_id + user_id`）：改主意是**改票**（原地覆盖）而不是追加历史——否则「先踩后赞」会在库里留下两条互相矛盾的记录，转用例时不知该信哪条。点赞会**清掉问题分类**，不留「点赞 + 编造」这种自相矛盾的组合。
+  - **能自动断言什么，必须说清（别高估）**：转出的用例只预填**可确定的部分**——那一轮实际路由到了哪个智能体 / 计划里包含哪几个智能体（按 `conversation_id + user_message` 匹配最近的 `agent_trace` 还原）。所以选「路由或规划不对」生成的用例**有真实断言价值**（把「这条输入以后不该再走那条路」钉住）；选「答非所问 / 编造」生成的用例天然**钉不住答案质量**，用户写的备注全程只作**人工排查线索**。理由与评测的既有立场一致：判答案好坏得让 LLM 当裁判，裁判自身不稳定，回归结果会失去可比性。
+  - **yaml 是只读种子，库内表承接增量**：`eval-cases.yaml` 打包进 jar 后运行时写不了，故新增 `eval_case` 表承接运行时用例；`/api/eval/cases` 返回两者**合并后**的视图，**同名以 yaml 为准**（种子是人工审校过的，不该被一条自动记录静默顶掉），`/api/eval/cases/db` 只看库内增量。
+  - 匹配不到追踪记录时**明确报错**而不是生成一条没有断言的用例——后者每次跑批都会红，用的人很快就学会无视它。转用例限 ADMIN（库内用例是全局资产，且只有能跑批的人才能验证它）。
 
 ## 技术栈
 
@@ -258,8 +278,10 @@ org.luo
 │   ├── trace/          # RoundTrace / TraceService(异步落库) / LlmUsageService
 │   ├── infrastructure/ # attachment / chroma(客户端+副本同步) / document / rerank / vision
 │   ├── config/         # ExecutorConfig(线程池) / ChatMemoryConfig / ToolCallingConfig 等 AI 专用
-│   ├── properties/     # MemoryProperties / RagProperties / VisionProperties / PromptProperties / QuotaProperties
-│   │                   # / SafetyProperties / ReviewProperties / CrossSessionProperties
+│   ├── properties/     # 全部 @ConfigurationProperties（14 个；由主类 @ConfigurationPropertiesScan 按包自动注册）：
+│   │                   # MemoryProperties / RagProperties / VisionProperties / PromptProperties / QuotaProperties
+│   │                   # / SafetyProperties / ReviewProperties / CrossSessionProperties / ToolCallProperties
+│   │                   # / PlannerProperties / EvalProperties / SelfEvalProperties
 │   └── entity/ mapper/ dto/ enums/ constant/
 ├── system/             # 用户管理系统（登录鉴权 + 用户/角色 CRUD）
 │   ├── security/       # JwtTokenService(签发/解析) / JwtAuthInterceptor(拦 /api/**)
@@ -330,8 +352,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 |---|---|
 | 绑定来源 `agent_bind_source` | `EXPLICIT`=用户显式选择（粘住不解绑）；`CLARIFY`=追问临时绑定（话题切换自动解绑）；空=自由路由 |
 | 智能路由 | 裸 ChatModel 三态 JSON 决策（`{"route":true,"agentCode":"..."}` / `{"route":false}` / `{"route":false,"continue":true}`），Hutool 解析 |
-| 参数追问 | `paramSchema` 声明参数；LLM 从有界历史抽取已确认取值；缺失必填生成 `🔎 还需补充信息`，上限 3 次；**状态每轮重放推导，不落库** |
-| 记忆体系 | 窗口 = 原文预算 + **条数下限**（防单条超预算导致窗口塌缩）+ 单条截断；`DbChatMemory` 与 `MemoryMergeService` 共用同一 `MemoryProperties` 口径。**记忆可视化编辑**（`GET/PUT/DELETE /api/chat/conversation/{id}/memory`）：可查看与订正 `summary` / `core_facts`；手改**只覆盖内容列、不动水位**（`summarized_count` 是执行游标不是展示字段，跟着手改会让下次自动压缩从错位继续），要回退水位只能走「重置全部记忆」（三列归零、消息保留） |
+| 参数追问 | `paramSchema` 声明参数；LLM 从有界历史抽取已确认取值；缺失必填生成 `🔎 还需补充信息`，上限 `ClarifyState.MAX_ASKED`（3 次，常量唯一来源，追问文案与前端展示共用）。**状态显式落库** `conversation.clarify_state`（`{agentId,asked,request,question,params}`），历史重放降级为兜底（老会话无该列时行为不回退）。参数累积语义：**已落库快照为底、本轮新抽取覆盖**（用户中途改口新值胜出）；`belongsTo(agentId)` 作「换智能体即作废」判据，`unbindAgent` / `clearMessages` 一并清列 |
+| 记忆体系 | 窗口 = 原文预算 + **条数下限**（防单条超预算导致窗口塌缩）+ 单条截断；`DbChatMemory` 与 `MemoryMergeService` 共用同一 `MemoryProperties` 口径。**记忆可视化编辑**（`GET/PUT/DELETE /api/chat/conversation/{id}/memory`）：可查看与订正 `summary` / `core_facts`；手改**只覆盖内容列、不动水位**（`summarized_count` 是执行游标不是展示字段，跟着手改会让下次自动压缩从错位继续），要回退水位只能走「重置全部记忆」（三列归零、消息保留）。**窗口构成与注入清单同源**：窗口切分只有 `DbChatMemory.snapshot(recent, props)` 一处实现，真实注入（`get`）与观测（`MemoryViewService`）都调它 —— 各写一份必然漂移，而错误的透明化比黑盒更糟。**单条禁用**（`PUT /api/chat/message/{id}/memory-excluded`）：`memory_excluded=1` 的条目不进记忆侧三处查询，但展示侧照常可见；改参与状态会**重置摘要游标、保留摘要内容**（可见序列变了、覆盖范围要重算，但内容清了用户会莫名丢事实） |
 | 对话分支 | 「重新生成」/「编辑重发」不再删历史，而是给该轮**再开一个版本**，旧版本留库可翻回。`chat_message` 三列：`turn_group_id` / `turn_version` / `turn_active`；`turn_group_id IS NULL` 即从未分叉（存量零回填）。**两段式**：`prepareBranch`（流式前只分组 + 算版本号，**不失效旧版本**）→ `markRoundBranch`（消息落库后打标，`marked == 0` 则旧版本保持生效）。**读取侧四处同口径**（`turn_group_id IS NULL OR turn_active = 1`）：`getHistory` / `getRecentHistory` / `countMessages` / `getMessagesRange`，漏一处即裂出记忆空洞。新版本 `created_at` 锚回该组首条时间以占回原位；切换 / 开版本重置记忆水位。重发**完全复用 `POST /api/chat/stream`**，不复制任何发送逻辑 |
 | 步骤间产物传递 | 前驱产出注入下一步输入时按配额截断（`min(upstream-max-chars, upstream-total-chars / 前驱个数)`），超额保留前段 + 显式省略标注 + WARN；只作用于**注入**，不影响 `task_step.output` 落库与最终回复 |
 | 规划模板 | 跑顺的规划可存成模板（`task_template.steps_json`）。**存快照 JSON、不引用 `task_step`**：那张表带 `status`/`output`/`retry_count` 等运行态列，且局部重规划（`replanTail`）会删改甚至重排行，引用式模板会被连带破坏。步骤只记 `agentCode` 不记展示名（智能体改名不该让模板失效），依赖落库前经 `TaskStep#strictPriorDeps` 净化 —— 只留严格前序，同时天然杜绝依赖环（所以不需要单独的环检测） |
@@ -410,15 +432,23 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | PUT | `/api/chat/conversation/{id}/cross-session` | 更新跨会话搜索开关 `{enabled}`（开启后每轮在本人其他会话里做关键词召回并注入；仅本人） |
 | DELETE | `/api/chat/conversation/{id}` | 删除会话及全部消息（仅本人） |
 | GET | `/api/chat/conversations` | **当前用户**的会话列表（按最近更新倒序） |
-| GET | `/api/chat/history?conversationId=` | 读取会话历史消息（仅本人） |
+| GET | `/api/chat/history?conversationId=` | 读取会话历史消息（仅本人）；每条带 `id` 与 `memoryExcluded`（供前端渲染单条「不参与记忆」开关） |
+| PUT | `/api/chat/message/{messageId}/memory-excluded` | 单条消息标记「不参与记忆」：body `{excluded}`（true=不参与 / false=恢复；**字段缺失返回 400**，显式 false 是正常取消标记）。此后该条既不进记忆窗口、也不参与摘要，但历史里仍可见。**副作用**：会重置该会话的摘要游标（`summarized_count` 归零，摘要与长期记忆内容保留），响应 `{excluded, memoryCursorReset}` 告知是否动了游标（幂等：同值重复设置返回 `memoryCursorReset=false`）。消息不属于本人会话一律 **404**（与「消息不存在」不可区分，避免用 ID 探测） |
 | POST | `/api/chat/conversation/{id}/branch` | **开新版本**：为第 `keepCount` 条（1 基，必须是 user 提问）那一轮分组并返回 `{groupId, version}`；未分组则新建组、旧轮记第 1 版、返回 `version=2`，已分组则 `max(turn_version)+1`。**只分组、不改生效版本**（失效延后到落库后）；缺请求体 400（分支位置没有安全默认值；仅本人） |
 | POST | `/api/chat/conversation/{id}/turn` | **切换版本**：body `{groupId, version}`，把该组其余版本 `turn_active` 置 0、目标置 1，并重置记忆水位；版本不存在 404（仅本人） |
+| PUT | `/api/chat/message/{messageId}/feedback` | **提交 / 改票**一条消息反馈：body `{rating, reason, comment}`（`rating` ∈ `UP`/`DOWN`，`reason` 仅 DOWN 时有意义 ∈ `ANSWERS_OFF`/`FABRICATED`/`ROUTING`/`OTHER`，`comment` ≤500 字；任一项非法 **400**）。**一人对一条消息一票，改票原地覆盖不追加**；`UP` 会把 `reason` 清空。首次提交时快照那一轮的用户输入（`userInput`，取不到即 null）。只接受**助手消息**（对 user 消息反馈 400）；消息不属于本人会话一律 **404** |
+| GET | `/api/chat/conversation/{id}/feedback` | 该会话下的全部反馈（按提交顺序），供前端按 `messageId` 合并到消息上回显「已反馈」与预填原因/备注。**刻意不做进 `/history` 响应**：历史是「说了什么」、反馈是「怎么看这句话」，变化频率与读取时机都不同，合成会让每次翻历史都白拉一遍反馈 |
 | GET | `/api/chat/conversation/{id}/export` | 导出会话为 Markdown，返回 `{filename, content}` 由前端拼 Blob 下载（仅本人） |
-| GET | `/api/chat/conversation/{id}/memory` | 读取长期记忆快照：摘要 / 核心事实 / 已压缩条数 / 消息总数（仅本人） |
-| PUT | `/api/chat/conversation/{id}/memory` | 覆写摘要与核心事实（body `{summary, coreFacts}`，**不动水位**；空白即清空该字段；仅本人） |
-| DELETE | `/api/chat/conversation/{id}/memory` | 重置长期记忆：摘要 / 核心事实 / 水位三列归零，历史消息保留（仅本人） |
-| POST | `/api/chat/task/resume` | SSE 流式续跑未完成任务（显式按钮触发）：回填已完成步骤、只跑剩余步骤 |
-| GET | `/api/chat/task/running?conversationId=` | 查询当前会话的 RUNNING 任务（无则 null，供「继续执行」提示条；仅本人） |
+| GET | `/api/chat/conversation/{id}/memory` | 读取记忆快照（仅本人）：`summary` / `coreFacts`（**旧版归档**，不再自动更新）/ `summarizedCount` / `messageCount` / `excludedCount`（被标「不参与记忆」的条数）/ `window`（**本轮会注入的窗口逐条**：`role` / `preview` / `chars`，与真实注入同一份 `DbChatMemory.snapshot`）/ `facts`（**长期事实逐条**：`id` / `topic` / `fact` / `source` / 时间） |
+| PUT | `/api/chat/conversation/{id}/memory` | 覆写摘要与旧版归档（body `{summary, coreFacts}`，**不动水位**；空白即清空该字段；仅本人） |
+| DELETE | `/api/chat/conversation/{id}/memory` | 重置长期记忆：摘要 / 旧版归档 / 水位三列归零，**并作废自动整理出的 `SOURCE_MERGE` 事实条目**，历史消息与**手动条目**保留（仅本人） |
+| POST | `/api/chat/conversation/{id}/facts` | 新增一条长期事实，body `{topic, fact}`（`topic` 归一到白名单：身份 / 偏好 / 待办 / 背景 / 其它；空或超长 **400**）。`source` 与 `fact_hash` 由服务端决定，**不接受客户端指定**。若与某条自动条目完全重合则把它**转成手动**（认领）而非报重复；仅与已有手动条目重复才 400（仅本人） |
+| PUT | `/api/chat/conversation/{id}/facts/{factId}` | 修改一条长期事实（主题与内容都可改）。**改过的条目从「自动」转为「手动」**，此后自动合并不再覆盖或淘汰它；条目不属于该会话一律 **404**（仅本人） |
+| DELETE | `/api/chat/conversation/{id}/facts/{factId}` | 删除一条长期事实（自动 / 手动都可删）。删掉自动条目后它**不会**被下一次合并自动加回（合并输入只含当前条目 + 新增内容）；条目不属于该会话一律 **404**（仅本人） |
+| POST | `/api/chat/task/resume` | SSE 流式续跑未完成任务（显式按钮触发）：回填已完成步骤、只跑剩余步骤。**五条通路共用它**；入口先清 `pause_requested` |
+| GET | `/api/chat/task/running?conversationId=` | 查询当前会话的 RUNNING 任务（无则 404）；返回 `RunningTaskView`（含**步骤明细**：每步 `index`/`agentCode`/`agentName`/`status`/`error`/`retryExhausted`，智能体名现查不落库快照），供「继续执行」提示条显示「卡在哪一步、能不能跳过」 |
+| POST | `/api/chat/task/pause` | 请求暂停 `{conversationId}`：置 `task.pause_requested=1`，执行循环在**下一个层边界**停止推进（任务仍 RUNNING、剩余步骤仍 PENDING）。回 `{ok, pauseRequested, message}`，**措辞刻意不说「已暂停」**（同层是并行 join，硬中断只会留下半截产出）；任务不存在 404 |
+| POST | `/api/chat/task/step/skip` | 人工跳过某步 `{conversationId, stepIndex}`（`PENDING`/`FAILED` → `SKIPPED`，跳过原因写入 `error` 列）；只改库**不自动开跑**，回 `{ok, stepIndex, doneSteps, totalSteps}`。状态不是 PENDING/FAILED 一律 400（带上当前状态） |
 | PUT | `/api/chat/task/step` | 就地编辑待确认计划中尚未执行的某一步 `{conversationId, stepIndex, agentCode, instruction, dependsOn, approvalRequired}`；只收 `PENDING` 步骤，依赖只能指向更早的步骤；`approvalRequired` 为空表示不改该列 |
 | POST | `/api/chat/task/approve` | 批准被审批关卡挡住的步骤 `{conversationId, stepIndex}`，然后由前端接着调 `/task/resume` 继续跑（此接口只落标记、不触发执行） |
 | POST | `/api/chat/task/cancel` | 终止当前会话的 RUNNING 任务 `{conversationId}`，置为 `CANCELLED`（审批卡片上的「终止计划」） |
@@ -462,7 +492,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | GET | `/api/kb/chunk/{chunkId}` | **单块原文**（引用回链「查看原文」用）→ `{chunkId, kbId, kbName, source, content}`，**不含 embedding**；块不存在 → 404 + 原因 |
 | POST | `/api/kb/{id}/chunks` | 手动追加知识块 |
 | DELETE | `/api/kb/{id}/chunks/{chunkId}` | 删除单个知识块（校验块归属） |
-| POST | `/api/kb/{id}/upload` | 上传文件（multipart `files` + `chunkStrategy` + `overlap`），同名重传=替换 |
+| POST | `/api/kb/{id}/upload` | 上传文件（multipart `files` + `chunkStrategy` + `overlap`），同名重传=替换。**支持图片**：png / jpg / jpeg / gif / webp / bmp / tif / tiff / heic / avif 先由视觉模型识别成文字描述再入库，**识别失败即该文件失败**（不落占位文本） |
 | GET | `/api/kb/{id}/files` | 文件列表 |
 | POST | `/api/kb/{id}/files/{fileId}/rechunk` | 重新分片 `{"strategy","overlap"}`（缺省沿用文件当前值） |
 | DELETE | `/api/kb/{id}/files/{fileId}` | 删除文件及其知识块 |
@@ -474,7 +504,7 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/trace?conversationId=&limit=` | 追踪列表（时间倒序，默认 50 条、上限 200）。**只回当前登录用户名下会话的记录**；不传 `conversationId` 表示「不限会话」，但**不是**「不限用户」 |
-| GET | `/api/trace/{traceId}` | 单轮追踪详情；不存在**或不属于当前用户**一律 404（二者不可区分，防拿 traceId 探测他人记录） |
+| GET | `/api/trace/{traceId}` | 单轮追踪详情；不存在**或不属于当前用户**一律 404（二者不可区分，防拿 traceId 探测他人记录）。响应含 `selfEval`（**线上回答自评**：`score` 取自 `self_eval_score` 列恒有值；`answered`/`grounded`/`issues`/`comment`/`trigger` 取自明细 JSON，**明细读不出来时 `answered`/`grounded` 为 `null` 而不是 `false`**）。`selfEval` 为 `null` = 该轮未自评 |
 
 > **可见性**：`ADMIN` 不受归属限制 —— 它走全量视角（可看所有人的追踪，含已删除会话遗留的记录），前端追踪弹窗会相应多出「本会话 / 全部会话」切换。
 > 归属判定在 SQL 层由 `JOIN conversation` 完成（`agent_trace` **没有** `user_id` 列 —— 加列就得把身份一路传进异步落库链路，会破坏「追踪是纯旁路、不影响对话逻辑」这条原则）。
@@ -496,13 +526,17 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/observability/summary?days=` | 近 N 天（默认 7、上限 90）运行质量聚合：总览（轮次/成功率/平均耗时/token）+ 按天·按形态·按来源·按智能体 + 慢轮 Top N |
+| GET | `/api/observability/summary?days=` | 近 N 天（默认 7、上限 90）运行质量聚合：总览（轮次/成功率/平均耗时/token）+ 按天·按形态·按来源·按智能体 + 慢轮 Top N + **回答质量（自评聚合：`evaluated`/`unevaluated`/`lowScore`/`avgScore`，`coverage` 与 `lowRate` 为派生值）+ `lowScoreThreshold`（低分线，由 `agent.self-eval.low-score-threshold` 下发）+ `lowRounds`（低分轮次，分数升序、最多 20 条，只给定位信息、不含自评明细）** |
 
 > **仅 ADMIN 可访问**（`ObservabilityController` 标 `@RequireRole(ADMIN)`）。与成本看板同一收敛逻辑：跨会话全站聚合，
 > 逐条看某会话的链路细节走「🔍 追踪」（已按归属隔离），全站质量看这里。独立页 `/observability.html`，
 > 顶栏「📊 可观测」入口按同一角色显隐。
 > 指标口径：成功率 = 1 − `error` 轮占比；耗时取 `elapsed_ms` 平均（本轮从进编排到产出回复的**总耗时**，
 > 不细分路由/改写/参数抽取的分段耗时 —— 那需要加列，暂不做）。
+> **自评口径**：「已自评 / 未自评 / 低分」三个数**并列**给出，**低分率的分母是"已自评"而非全量轮次** ——
+> 否则调低采样率会让低分率自动变好看，那是指标自欺。「未自评」（默认关闭时的常态）与「评了低分」（质量信号）
+> 是两件事，页面上有专门的一句说明，别把 `105` 读成「105 轮答得差」。空窗口时自评四数全 0、阈值照常返回
+> （阈值是配置不是数据），面板仍渲染 —— 藏掉面板就分不清「一次都没自评」和「后端没有这个字段」。
 
 ### 提示词回归评测（仅 ADMIN）
 
@@ -512,7 +546,10 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/eval/cases?scenario=` | 列出用例集（`scenario` 可筛 `ROUTE` / `PLAN`，不传即全部） |
+| GET | `/api/eval/cases?scenario=` | 列出用例集（`scenario` 可筛 `ROUTE` / `PLAN`，不传即全部）。**返回 yaml 种子与库内增量合并后的视图**，同名以 yaml 为准（解析失败 400，不当「0 条用例」静默放过） |
+| GET | `/api/eval/cases/db` | **只看库内用例**（含已停用，倒序）：`id` / `name` / `scenario` / `input` / `expectJson` / `source` / `feedbackId` / `enabled`。展示与删除的入口 |
+| POST | `/api/eval/cases/from-feedback` | 把一条用户反馈转成库内用例 `{feedbackId}` → 回新用例（`EvalCaseEntity`）。断言**自动预填但只填可确定的部分**（实际路由到哪个智能体 / 计划里有哪些智能体）；反馈不存在 404、**已转过 400**（不重复生成）、无用户输入快照或匹配不到追踪记录 400（不生成没有断言的用例） |
+| DELETE | `/api/eval/cases/db/{id}` | 删除库内用例（不存在 404）。只影响后续跑批，历史批次里已落库的结果不受影响 |
 | POST | `/api/eval/run?scenario=` | 跑一批：并发执行 + 单条超时（默认 60s），返回 `{batchId, total, passed, failed, configErrors, costMs, results[]}` |
 | GET | `/api/eval/batches` | 历史批次摘要（近 20 批，更旧的自动清理） |
 | GET | `/api/eval/batches/{batchId}` | 某批次的逐条结果 |
@@ -522,6 +559,9 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 > `name`（用例名）、`scenario`（`ROUTE` / `PLAN`）、`input`（用户输入）、`pendingQuestion`（可选，模拟上一轮追问）、
 > `expect`（断言 JSON）。**断言只写可确定的部分**——路由类断言 `{"noRoute":true}` 或 `{"agentCode":"A002"}`，
 > 规划类断言 `{"containsAgents":["A001"]}`，别断言模型措辞（那是在测模型，不是在测提示词）。
+> **用例有两个来源**：yaml 是打包进 jar 的**只读种子**（运行时写不了），`eval_case` 表承接运行时增量
+> （当前唯一入口是 `POST /api/eval/cases/from-feedback`，即「把一条用户反馈转成用例」）。
+> 同名以 yaml 为准，两侧在 `loadCases` 里合并、命中同名时记 WARN。
 
 ### 教务（仅需登录）
 
@@ -550,17 +590,20 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 | 表 | 关键列 | 说明 |
 |---|---|---|
-| `conversation` | id, **user_id**, title, agent_id, planner, **planner_confirm**, agent_bind_source, rag_enabled, **review_enabled**, **cross_session**, summary, summarized_count, core_facts | 会话：**归属用户（按 user_id 隔离，仅本人可见）**、绑定智能体、规划开关 / 规划「先看计划」开关、RAG 开关、并行评审开关、跨会话搜索开关、滚动摘要与核心事实。**规划与评审互斥**（都是编排形态，开启任一方会自动关掉另一方） |
-| `chat_message` | id, conversation_id, role, content, attachments_json, citations_json, **turn_group_id**, **turn_version**, **turn_active**, created_at | 消息明细；附件元数据与引用来源**独立列**，不进记忆、不占 token。**分支版本三列**：`turn_group_id`（同轮多版本共用 UUID，NULL=从未分叉）/ `turn_version`（组内序号，从 1 连续递增）/ `turn_active`（当前生效版本，同组至多一个为 1）；读取侧统一 `turn_group_id IS NULL OR turn_active = 1`，存量数据零回填 |
+| `conversation` | id, **user_id**, title, agent_id, planner, **planner_confirm**, agent_bind_source, rag_enabled, **review_enabled**, **cross_session**, summary, summarized_count, core_facts, **clarify_state** | 会话：**归属用户（按 user_id 隔离，仅本人可见）**、绑定智能体、规划开关 / 规划「先看计划」开关、RAG 开关、并行评审开关、跨会话搜索开关、滚动摘要与**旧版事实归档**（`core_facts` 自「长期事实条目」上线后**不再自动更新**，改由下表逐条承载；仍作为迁移输入与条目清空后的回退来源）。**规划与评审互斥**（都是编排形态，开启任一方会自动关掉另一方）。**`clarify_state`** 是参数追问（澄清）的显式状态 JSON（`{agentId,asked,request,question,params}`，NULL = 无进行中的追问）—— 落库以摆脱「每轮扫历史重放推导」：历史被摘要压缩或被标「不参与记忆」后，重放会算错已问次数与已确认参数；`agentId` 作「换智能体即作废」判据，`unbindAgent` / `clearMessages` 时清空 |
+| `conversation_fact` | id, conversation_id, topic, fact, **source**, **fact_hash**, created_at, updated_at | **长期事实逐条**（唯一键 `uk_conv_fact(conversation_id, fact_hash)`）。`topic` 归一白名单：身份 / 偏好 / 待办 / 背景 / 其它。**`source` 决定合并时怎么对待它**：`MERGE`（模型整理）每次合并**按 diff 重写**（不在新清单里的即视为过时删除 —— 这是淘汰旧事实的唯一通路）；`USER`（用户手加 / 手改 / 重合认领）**合并绝不覆盖也绝不删除**。`fact_hash = MD5(topic + fact)` 做同会话内去重 —— **不用 `fact` 本身做唯一键**：`VARCHAR(500) utf8mb4` 已超 InnoDB 索引键长上限。**无外键约束** ⇒ 删会话时由服务层显式清理 |
+| `chat_message` | id, conversation_id, role, content, attachments_json, citations_json, **turn_group_id**, **turn_version**, **turn_active**, **memory_excluded**, created_at | 消息明细；附件元数据与引用来源**独立列**，不进记忆、不占 token。**分支版本三列**：`turn_group_id`（同轮多版本共用 UUID，NULL=从未分叉）/ `turn_version`（组内序号，从 1 连续递增）/ `turn_active`（当前生效版本，同组至多一个为 1）；读取侧统一 `turn_group_id IS NULL OR turn_active = 1`，存量数据零回填。**`memory_excluded`**（默认 0）只作用于**记忆侧三处**（`getRecentHistory` / `countMessages` / `getMessagesRange` 统一走 `memoryVisible()`），展示侧 `getHistory` 与导出**刻意不过滤** —— 「不进记忆」不等于「删掉」 |
 | `agent` | id, name, agent_code, icon, description, system_prompt, param_schema, tools_json, model, temperature, avatar_color | 智能体：人设、参数清单、工具白名单、模型/温度覆盖 |
 | `kb` | id, name, agent_id, description, doc_count, chunk_strategy, chunk_overlap | 知识库；`agent_id` 为空即通用全局库 |
 | `kb_chunk` | id, kb_id, content, source, embedding, created_at | 知识块；`embedding` 为向量 JSON 文本（MySQL 源） |
 | `kb_file` | id, kb_id, file_name, file_type, chunk_strategy, chunk_overlap, size_bytes, chunk_count, raw_text | 以文件为管理单元；`raw_text` 支持不重传重新分片 |
-| `agent_trace` | trace_id, conversation_id, mode, route_source, agent_code, user_message, retrieval_query, plan_json, tool_calls, kb_hit_count, citations_json, prompt_tokens, completion_tokens, total_tokens, elapsed_ms, status | 纯旁路可观测表，删掉不影响对话。`mode` 现有 `agent` / `planner` / `review` 三态，`route_source` 相应有 `REVIEW`（并行评审），可观测面板的「按形态 / 按处理方来源」分布会自动多出这两档 |
+| `agent_trace` | trace_id, conversation_id, mode, route_source, agent_code, user_message, retrieval_query, plan_json, **memory_json**, tool_calls, kb_hit_count, citations_json, prompt_tokens, completion_tokens, total_tokens, elapsed_ms, **self_eval_score**, **self_eval_json**, status | 纯旁路可观测表，删掉不影响对话。`mode` 现有 `agent` / `planner` / `review` 三态，`route_source` 相应有 `REVIEW`（并行评审），可观测面板的「按形态 / 按处理方来源」分布会自动多出这两档。**`memory_json`** 是本轮注入的记忆构成快照（窗口逐条 + 三段字符数，事实段键名为 `factsChars`），**NULL = 未采集**（旁路观测，采集失败只记 WARN、留空即可）；只在 agent 形态采集，规划 / 评审留空。**`self_eval_score`**（1~5，`NULL` = 未自评：未命中采样 / 回答过短 / 调用失败）**单独成列**而非只塞 JSON —— 可观测面板的「低分轮次」要按它过滤与聚合，JSON 里解析不出索引；`self_eval_json` 存明细（`answered` / `grounded` / `issues` / `comment` / `trigger`），与分数同生共死，一列过滤一列细看。自评同样是旁路：失败只记 WARN |
 | `llm_usage` | trace_id, conversation_id, purpose, model, prompt_tokens, completion_tokens, total_tokens, created_at | 裸 LLM 调用成本流水（全量成本口径）：路由/参数抽取/查询改写/计划生成/视觉/记忆合并/智能体转交/跨会话召回/并行评审各记一条，按用途拆解 |
-| `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING |
-| `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, **approval_required**, **approved**, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败。`approval_required=1` 的步骤执行前先暂停等待批准（`approved` 记批准与否）—— 这两列**独立于 `status`**：status 说「跑到哪了」、审批说「允不允许跑」 |
+| `task` | id, conversation_id, user_goal, status, total_steps, done_steps, result, **pause_requested**, created_at, updated_at | 规划任务：一轮规划落库一条，状态机 `RUNNING→DONE/FAILED/CANCELLED`；单会话单 RUNNING。**`pause_requested` 不是状态、是「让执行循环在下一个层边界自停」的一次性信号**（与「单会话单 RUNNING」的不变量同处一张表，不引入第二种状态源）；清零责任在续跑入口 |
+| `task_step` | id, task_id, step_index, agent_code, instruction, depends_on, status, retry_count, output, error, citations_json, **approval_required**, **approved**, started_at, finished_at | 任务步骤：逐步增量提交产出；`FAILED` 续跑重试一次，累计 ≥2 判确定性失败。`approval_required=1` 的步骤执行前先暂停等待批准（`approved` 记批准与否）—— 这两列**独立于 `status`**：status 说「跑到哪了」、审批说「允不允许跑」。跳过（`SKIPPED`）另有两种来源：**智能体已被删除**（系统自动）与**用户手动跳过**，原因都写进 `error` 列 |
 | `task_template` | id, user_id, name, description, steps_json, source_task_id, use_count, created_at, updated_at | 规划模板：**按 user_id 隔离**（仅本人可见，越权一律 404）。`steps_json` 是步骤骨架的**快照**（`[{agentCode,instruction,dependsOn}]`），不引用 `task_step`——那张表会随局部重规划删改/重排行 |
+| `message_feedback` | id, **message_id**, conversation_id, user_id, rating, reason, comment, **user_input**, **eval_case_id**, created_at, updated_at | 消息反馈（👍/👎）：**一人对一条消息一票**（唯一键 `message_id + user_id`，改票原地覆盖不追加）。`user_input` 是那一轮的用户输入**快照**（与 `agent_trace.user_message` 同一取舍：会话被删、消息被改都不该让反馈失效）；`eval_case_id` 既是「已转成哪条用例」的记录，也是防重复转的标记 |
+| `eval_case` | id, name, scenario, input, pending_question, expect_json, **source**, feedback_id, enabled, created_at | **库内回归用例**（`eval-cases.yaml` 之外的运行时增量，唯一键 `name`）。`source` 区分 `YAML` / `FEEDBACK`。为什么要单独一张表：yaml 打包进 jar 后运行时写不了，而「点踩 → 转成回归用例」必须在运行时新增；yaml 退化为只读种子，本表承接增量，两者在 `/api/eval/cases` 合并、同名以 yaml 为准 |
 | `eval_result` | id, batch_id, case_name, scenario, input, expected, actual, passed, config_error, failure, detail, cost_ms, created_at | 提示词回归评测逐条结果；`batch_id` 分组一批，`config_error=1` 为「用例本身写错」单列一档；只保留最近 20 批，更旧的跑完即清 |
 | `sys_user` | id, username, password, nickname, email, status, last_login_at, created_at, updated_at | 登录账号；`password` 为 BCrypt 哈希（自带盐），`status=0` 停用后已签发 token 立即失效 |
 | `sys_role` | id, code, name, description | 角色；`code` 是授权判定依据（`@RequireRole` 比的是它），不可修改 |
@@ -584,18 +627,20 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
 
 - **顶栏**：会话列表（含 🧭 规划标记）、当前会话徽标（🧭 规划模式 / 📚 RAG）；右侧动作区**整体靠最右**，依次为 ⬇ 导出（无会话时不显示）、🧠 记忆（无会话时不显示）、🔍 追踪（无会话时不显示）、💰 成本（仅 ADMIN）、🧪 评测（仅 ADMIN）、📊 可观测（仅 ADMIN，跳 `/observability.html`）、🎓 教务系统（跳 `/edu.html`，与 edu 页的「前往 AI 对话」互为对称入口）、以及**登录用户区**。靠右由容器 `.header-actions` 统一负责（`margin-left:auto` + `gap`），各按钮不自带 `margin-left` —— 否则「追踪」这类条件渲染的按钮一缺席，整组就会塌回标题旁边。按角色显隐的入口读页面级 `isAdmin`（setup 时从 `Auth.hasRole('ADMIN')` 取一次存进 `ref`）—— `Auth.getUser()` 读 localStorage、不是响应式的，模板里直接调它只会求值一次。
 - **登录用户区（四页统一，只有一个用户名）**：顶栏不再出现裸露的「退出」按钮 —— 点击用户名展开下拉：**个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录**。四页（index / chat / edu / user）都是 `js/auth.js` 渲染到 `data-auth-nav` 挂载点的**同一份实现**，页面自身不含登录逻辑；细节见「登录」一节。
-- **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）、以及规划开关开启时出现的 **「先看计划」开关**（规划只产出计划并暂停，确认后才执行）。处于「编辑重发」态时，输入区顶部会出现**编辑提示条**（原消息已填回输入框，右侧一间取消按钮），发送即先截断再重发。输入区底部另有**配额刻度**（`v-if="quota.enabled && !quota.exempt"`）：显示「已用 / 上限」，用量到 90% 时整条转警示色 —— 只在配额开关打开且本人不豁免时出现，平时不占位置。
-- **对话分支（版本切换器）**：鼠标悬停任一消息气泡浮现动作区（默认 `opacity:0`，`.msg:hover` 才显示）—— assistant 消息给「重新生成」，user 消息给「编辑重发」，以及**该轮已有多版本时挂在提问上的「n / m ‹ ›」切换器**（切一次提问与回答一起换）。**重新生成** / **编辑重发**都先调 `POST …/branch` 开新版本，再走现成的流式通路发送（不复制发送逻辑）；开版本失败会中止并保留编辑态（不静默丢掉用户已改的内容）。**切换器只在 `versionCount > 1` 时出现**（未分叉的轮不挂），首 / 末版本对应的箭头置灰。生成中这些按钮一律不出现——正在写入的那一轮尚未落库，此时切换只能拿到一份对不上眼前所见的历史。
+- **输入区**：🖼 图片多选（≤5 张）、📎 文档上传、📚 RAG 开关、🧭 规划开关（绑定智能体的会话置灰）、以及规划开关开启时出现的 **「先看计划」开关**（规划只产出计划并暂停，确认后才执行）。处于「编辑重发」态时，输入区顶部会出现**编辑提示条**（原消息已填回输入框，右侧一个取消按钮），发送即先截断再重发。输入区底部另有**配额刻度**（`v-if="quota.enabled && !quota.exempt"`）：显示「已用 / 上限」，用量到 90% 时整条转警示色 —— 只在配额开关打开且本人不豁免时出现，平时不占位置。输入区底部还有**参数补全提示**（`⏳ 参数补全中（N/3）：补齐后自动继续`，数据来自会话列表返回的 `clarifyAsked` / `clarifyMax`）：这是「本轮停在一次追问上」的交互态，讲的是输入区的事，故**长在输入区而不在顶栏**——顶栏那排是会话级开关（规划 / 评审 / RAG / 跨会话），且顶部行已排满，塞进去会把标题挤折行；它与「智能体会话暂不支持规划模式」提示**互斥**（`v-else-if`，一条槽位只显示一条）。
+- **对话分支（版本切换器）**：鼠标悬停任一消息气泡浮现动作区（默认 `opacity:0`，`.msg:hover` 才显示）—— assistant 消息给「重新生成」，user 消息给「编辑重发」，以及**该轮已有多版本时挂在提问上的「n / m ‹ ›」切换器**（切一次提问与回答一起换）。**每条消息另有「不参与记忆」开关**（已标记时显示「不参与记忆 ✓」并高亮；未落库的消息 / 请求进行中一律置灰）。**助手回复上还有「👎 反馈」**：已评价时按钮高亮（点踩用危险色弱底，与「不参与记忆」的主色弱底区分开），点开展开问题分类 + 备注表单（表单就长在消息下方，不弹窗——评价的对象就在眼前，弹窗会把它挡掉）。**重新生成** / **编辑重发**都先调 `POST …/branch` 开新版本，再走现成的流式通路发送（不复制发送逻辑）；开版本失败会中止并保留编辑态（不静默丢掉用户已改的内容）。**切换器只在 `versionCount > 1` 时出现**（未分叉的轮不挂），首 / 末版本对应的箭头置灰。生成中这些按钮一律不出现——正在写入的那一轮尚未落库，此时切换只能拿到一份对不上眼前所见的历史。
+- **执行中干预（提示条上的暂停 / 跳过）**：有未完成任务时顶部提示条除「继续执行 / 重新规划」外，按状态多出两个动作。**某步重试用尽**时提示条右侧明确写出「第 N 步（某智能体）重试已用尽，不会自行恢复」，并给出「跳过第 N 步」（点击前弹确认，讲清「该步产出为空、依赖它的后续步骤拿不到这段输入」）。**执行中**（`canPause`）则出现琥珀色「暂停」，点击后回执写明这是「当前正在执行的那一层跑完后停止推进」而非立即暂停。两个动作都只改库，之后一律点「继续执行」走断点续跑。
 - **引用回链（气泡内）**：正文里的 `[n]` 是蓝色可点角标，点一下展开该轮「引用来源」并把第 n 条高亮（2 秒后自动褪去，用背景闪烁而非描边 —— 不改行高就不会让列表滚动位置跳动）；找不到对应序号会明确提示「可能是模型自行标注的角标」，而不是点了没反应。来源条目右侧的「原文」按钮打开**引用原文弹窗**（库名 / 文件名 / 块号 + 知识块正文按原样 `pre-wrap` 展示），取块失败时弹窗内显示后端给的原因；追踪弹窗的引用来源同样带这个入口。
 - **计划卡片（「先看计划」开启时）**：规划暂停后，AI 气泡内呈现计划卡片 —— 步骤清单（序号 / 智能体 / 指令 + 每步一个「需审批」勾选框）+ 「执行计划」按钮，右上角标 `待确认 / 执行中… / 已执行`。点按钮走的就是断点续跑通路。刷新后卡片消失（`plan` 事件不落库），但**顶部「执行计划」提示条仍在** —— 它是计划卡片之外的第二入口，保证刷新后仍能接着执行。**勾选「需审批」的步骤执行到时会停下来**，页面弹出**审批卡片**（刻意的琥珀色调，与蓝色计划卡片区分「等你决定」）：显示第几步 / 共几步、智能体名与指令，并提供「批准并继续」与「终止计划」两个动作。勾选状态**失败会回滚到原值**（不让界面显示成已生效）。
-- **记忆面板（🧠 记忆）**：把此前完全黑盒的双层记忆摊开 —— 显示滚动摘要、核心事实、覆盖度（`summarized_count` / 消息总数）与两个可编辑文本框（摘要在上、核心事实在下）。可**订正内容**（保存只覆盖这两个字段、不动水位），也可**重置全部记忆**（三列归零、历史消息保留）。面板内向用户明说：改内容不影响历史消息、重置后记忆会从头重新压缩。
+- **记忆面板（🧠 记忆）**：把此前完全黑盒的双层记忆摊开 —— 显示滚动摘要、旧版事实归档、覆盖度（`summarized_count` / 消息总数）与两个可编辑文本框（摘要在上、归档在下）。可**订正内容**（保存只覆盖这两个字段、不动水位），也可**重置全部记忆**（三列归零、**并作废自动整理出的事实条目**、历史消息与手动条目保留）。面板内向用户明说：改内容不影响历史消息、重置后记忆会从头重新压缩。**另有「当前窗口（本轮会注入的历史）」清单**：逐条显示角色 / 前 60 字预览 / **实际进上下文的字符数**（是截断之后的长度，不是库内原文长度），窗口构成由 `DbChatMemory.snapshot` 算 —— 与真实注入**同一份算法**，各写一份必然漂移，而错误的透明化比黑盒更糟。被标「不参与记忆」的条数在窗口下方单列提示。**面板最上方是「长期事实（逐条）」区块**：按主题分组列出每条事实，每条带**来源标签（手动 / 自动）**与行内「改 / 删」，底部一行是「主题下拉 + 输入框 + 添加」。**改一条自动条目后它的标签立刻翻成「手动」** —— 这是「我纠正过的事，别再给我改回去」在界面上的唯一证据；板块下写明注入优先级（「只要还有条目，下面的『旧版归档』就不再注入」）与淘汰规则（手动条目永不被删），否则「删掉一条自动条目」和「下次它又冒出来」在用户眼里是随机的。
 - **会话导出（⬇ 导出）**：把当前会话导出为 Markdown（含每轮的 user/assistant 正文、附件文件名、RAG 引用来源）。**不走 `/files/**` 文件通道** —— 下载要带 `Authorization`，而浏览器对 `<a href>` 导航带不上该头，走文件通道必 401；故后端只回 `{filename, content}`，前端拼 `Blob` 下载。
 - **智能体管理页**：智能体列表 / 新建 / 编辑（人设、参数 schema、工具勾选、模型与温度、配色）；工具栏右侧另有**导出 / 导入**，把智能体当资产搬进搬出。导出为 JSON 数组（`AgentPortable`，**不含 id / 时间戳、不含专属知识库内容**）；导入按 `agent_code` 匹配，冲突策略可选**跳过或覆盖**，且**逐条容错**（单条脏数据只记进 `errors`、不让整批失败）。`overwrite` 必须**保留本地 id**——`agent.id` 被 `conversation.agent_id` 引用，换 id 会切断会话归属。
-- **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。
-- **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时。**可见范围**：默认只显示当前登录用户名下会话的记录（后端按会话归属过滤，非本人记录按不存在处理）；**ADMIN 额外有一个「本会话 / 全部会话」切换**，可查看全站追踪。工具栏文案会随范围实时变化，空态也按范围给不同措辞——「本会话没有」和「全站都没有」是两回事。列表**每页 10 条**，底部页码条显示「共 N 轮 · 第 x / y 页」，翻页后自动滚回列表顶部；聚合统计条始终基于**全量**记录（它回答「这个范围的总体情况」，不是「这一页」）。明细展开态按 `traceId` 记录 —— 用列表下标记会在翻页后串页（第 1 页第 3 条与第 2 页第 3 条共用一个展开态）。**分页与范围无关**：本会话与全部会话共用同一套分页（后端也只有 `GET /api/trace` 一个接口，`conversationId` 只是过滤参数）；页码条按「有数据」渲染而不是「页数 > 1」—— 本会话多半不足一页，若按页数判断会整个不显示，看起来像「只有全部会话才分页」。1 页时只出页码信息、翻页按钮组隐藏。
+- **知识库页**：库/文件管理、上传与重新分片、分页查看知识块、Chroma 状态条与「同步本库」。上传 `accept` 含图片后缀（自动识别为文字描述再入库），空态与提示文案都写明「支持 txt / md / csv / pdf / docx / xlsx / 图片」。
+- **追踪弹窗**：路由来源、规划步骤、检索问句、RAG 命中、工具调用、token 与耗时，**本轮注入记忆**（窗口逐条 + 窗口 / 摘要 / 事实三段字符数；`memory_json` 为 NULL 时明确显示「未采集」，与「注入为空」是两种文案），以及**回答自评**（折叠行上先给一个 `⭐ N` 徽标，展开后是分数 + 触发来源标签「点踩强制 / 采样抽检」+ 是否答到问题 / 是否言之有据 / 问题短语 / 说明）。**未自评的那一轮显式显示「本轮未自评 —— 自评按采样率抽检（默认关闭），用户点踩会强制评一次」，不留白、不显示 0 分**（留白会被读成这轮答得很差）。**可见范围**：默认只显示当前登录用户名下会话的记录（后端按会话归属过滤，非本人记录按不存在处理）；**ADMIN 额外有一个「本会话 / 全部会话」切换**，可查看全站追踪。工具栏文案会随范围实时变化，空态也按范围给不同措辞——「本会话没有」和「全站都没有」是两回事。列表**每页 10 条**，底部页码条显示「共 N 轮 · 第 x / y 页」，翻页后自动滚回列表顶部；聚合统计条始终基于**全量**记录（它回答「这个范围的总体情况」，不是「这一页」）。明细展开态按 `traceId` 记录 —— 用列表下标记会在翻页后串页（第 1 页第 3 条与第 2 页第 3 条共用一个展开态）。**分页与范围无关**：本会话与全部会话共用同一套分页（后端也只有 `GET /api/trace` 一个接口，`conversationId` 只是过滤参数）；页码条按「有数据」渲染而不是「页数 > 1」—— 本会话多半不足一页，若按页数判断会整个不显示，看起来像「只有全部会话才分页」。1 页时只出页码信息、翻页按钮组隐藏。
+> **为什么规划 / 评审模式下注入清单留空（「未采集」）**：一轮内多步、多候选各自注入的是**同一个窗口**，一份清单代表不了任何一次；给个看着合理的数字比不给更糟。注入清单只在「整轮只注入一次」的形态（agent）采集，采集点在业务侧 `ChatService.runRound`（`ChatMemory.get` 只收 conversationId、拿不到追踪句柄），调的是与真实注入**同一个** `snapshot`，且采集时机紧贴模型调用、期间无写入。
 - **成本看板弹窗（💰 成本，仅 ADMIN）**：全量成本按天趋势（堆叠柱）+ 按用途拆解（饼图），近 7/30/90 天切换。入口按 ADMIN 角色显隐（后端 `@RequireRole(ADMIN)`，普通账号连入口都不渲染）。
-- **评测弹窗（🧪 评测，仅 ADMIN 可见）**：场景切换（全部 / 路由 / 规划）、用例条数、▶ 跑一批 → 三态统计（通过 / 失败 / 配置错误，逐条左边框绿 / 红 / 琥珀区分）+「最近两批对比」（`已修复` / `新增失败`，后者红底加粗，是改提示词后最先要看的一行）+ 历史批次列表。跑批走真实调用、计入成本看板。
-- **可观测面板（📊 可观测，独立页 `/observability.html`，仅 ADMIN）**：六张总览卡（轮次 / 成功率 / 平均耗时 / 平均 token / 总 token / 活跃天数）+ 按天趋势表 + 三个分布块（按形态 / 按处理方来源 / 按智能体，横向占比条）+「最慢的 N 轮」明细表（红/绿徽标区分失败/正常，`user_message` 截断展示）。近 7/30/90 天切换。非 ADMIN 打开只显示「仅管理员可用」提示，数据也不请求。
+- **评测弹窗（🧪 评测，仅 ADMIN 可见）**：场景切换（全部 / 路由 / 规划）、用例条数、▶ 跑一批 → 三态统计（通过 / 失败 / 配置错误，逐条左边框绿 / 红 / 琥珀区分）+「最近两批对比」（`已修复` / `新增失败`，后者红底加粗，是改提示词后最先要看的一行）+「**来自反馈的用例**」（库内增量，逐条显示输入与预填断言，可删除）+ 历史批次列表。跑批走真实调用、计入成本看板。
+- **可观测面板（📊 可观测，独立页 `/observability.html`，仅 ADMIN）**：六张总览卡（轮次 / 成功率 / 平均耗时 / 平均 token / 总 token / 活跃天数）+ **回答质量（模型自评）**（四张卡：已自评 / 未自评 / 低分 / 平均分，副标题给低分线 · 覆盖率 · 低分率，配一句「『未自评』与『低分』是两件事」的说明；下面接**低分轮次表**，分数升序、列出自评分 / 形态 / 来源 / 智能体 / 耗时 / 会话 / 用户输入，明细点进对话页看）+ 按天趋势表 + 三个分布块（按形态 / 按处理方来源 / 按智能体，横向占比条）+「最慢的 N 轮」明细表（红/绿徽标区分失败/正常，`user_message` 截断展示）。近 7/30/90 天切换。**空窗口时自评面板照常渲染四个 0**（藏掉面板就分不清「一次都没自评」和「后端没有这个字段」），低分轮次表则整块消失。非 ADMIN 打开只显示「仅管理员可用」提示，数据也不请求。
 - **教务系统**（`/edu.html`，独立入口）：10 张业务表（科目/老师/班级/学生/学期/课程/节次/排课/考试/成绩）的增删改查 + 4 个关联查询看板（学生成绩明细、成绩统计、班级课表、考试日程），复用深色色板，与 AI 对话页分离。单表页与关联查询页共用同一套顶部搜索条（文本输入 + 外键/枚举下拉 + 查询/重置，按 `tableMeta.search` / `queryMeta.search` 声明渲染）、序号列、右下分页（首页/上一页/下一页/尾页/跳页[/每页条数]）；新增与删除走自绘弹窗。
 
 - **登录**：登录界面全站只有一份 —— 结构在 `js/auth.js`（`Auth.openLogin()`），样式在 `css/auth.css`（`auth-` 前缀变量与类名，与各页样式互不污染）。
@@ -618,8 +663,8 @@ ChatService（编排门面，同步 chat() / 流式 stream()）
   ```
   （`-Dmaven.legacyLocalRepo=true` 用于绕过离线仓库对 `_remote.repositories` 来源的严格校验。）
 - **代码约定**：LLM 返回 JSON 的解析统一用 Hutool `cn.hutool.json.JSONUtil`，不引入 Jackson `ObjectMapper` 解析路径。
-- **配置约定**：新增自定义配置段必须写在**顶层**，并登记进 `MyAgentApplication` 的 `@EnableConfigurationProperties`；注释必须与事实一致（本项目已多次出现「注释与代码相反」的漂移）。
-- **DDL 约定**：变更表结构须同步更新 `sql/schema.sql`（建库权威定义）与 `sql/alter.sql`（存量库补列），两处列状态保持一致。
+- **配置约定**：新增自定义配置段必须写在**顶层**（历史上曾因缩进错误被挂到 `spring:` 下导致整段静默失效）；配置类只需是**顶层类 + `@ConfigurationProperties`**，放在 `org.luo` 包下即由主类的 `@ConfigurationPropertiesScan` **自动注册**，不必改任何清单。两条边界要记牢：**包外**（`org.luo` 以外）与**嵌套内部类**扫描不到，这两种情况需用 `@EnableConfigurationProperties(XxxProperties.class)` 显式补。约束的由来：本项目配置类都是 record / 普通类 + 构造器注入，**漏注册 = 没有 bean = 启动直接失败**，而 `mvn package` 仍 BUILD SUCCESS —— 编译验证挡不住，故新增 `*Properties` 后跑 `.workbuddy/tools/check_properties_registered.py`（判「是否落在扫描包内 / 是否显式登记」，含包外与嵌套两类漏网检测）。
+- **DDL 约定**：变更表结构须同步更新 `sql/schema.sql`（建库权威定义）与 `sql/alter.sql`（存量库补列），两处**列状态与建表定义保持一致**。**新增表也必须写进 `alter.sql`**（存量库不会重跑 `schema.sql`），且要放在**文件最前** —— 后段有 `ALTER TABLE task/task_step`，表不存在会先失败在那里。核对按「`schema.sql` 里有哪些表 / 列」全量过，不按「本轮改了几张表」抽查。
 - **生效方式**：改动 Java / 配置 / SQL 需重启服务；改动前端静态资源后 `mvn compile` 同步，浏览器 Ctrl+F5。
 - **已知缺陷**：Spring AI 2.0.0 的 `stream()` 合并工具调用分片时抛 `NoSuchElementException`（`OpenAiChatModel$ChunkMerger` 对工具调用 `Optional` 直接 `.get()`）。带工具的对话必须用 `call()` 走完工具循环再切片模拟流式。
 - `agent_code.md` 由系统自动生成（智能体提示词汇总，原子写入），修改请通过页面操作，勿直接编辑。

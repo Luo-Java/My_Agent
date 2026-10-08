@@ -8,7 +8,7 @@ package org.luo.ai.dto;
  * 保留游标」；要连游标一起归零请走 {@code DELETE …/memory}。
  *
  * @param summary   新的滚动摘要；null 或空白 = 清空该字段
- * @param coreFacts 新的核心事实；null 或空白 = 清空该字段
+ * @param coreFacts 新的「旧版事实归档」内容（逐条事实已迁到 {@code conversation_fact}，自动流程不再写它）；null 或空白 = 清空该字段
  */
 public record UpdateMemoryRequest(String summary, String coreFacts) {
 }

@@ -132,6 +132,26 @@ public class ExecutorConfig {
     }
 
     /**
+     * 线上回答自评专用线程池。自评是「回复已交付之后」的一次附加模型往返，绝不能占用对话执行线程、
+     * 也不能与追踪落库互抢（追踪要尽快可见）。核心 2 / 最大 4 / 队列 256：按采样跑时流量很低，
+     * 点踩强制自评是低频事件；队列满抛 {@link java.util.concurrent.RejectedExecutionException}，
+     * 由 {@code SelfEvalService} 捕获后放弃本次（自评可缺席，不影响任何主流程）。
+     * 用不等待关闭：停机时正在跑的自评丢掉即可。
+     */
+    @Bean("selfEvalExecutor")
+    public Executor selfEvalExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(2);
+        ex.setMaxPoolSize(4);
+        ex.setQueueCapacity(256);
+        ex.setKeepAliveSeconds(60);
+        ex.setThreadNamePrefix("self-eval-");
+        ex.setWaitForTasksToCompleteOnShutdown(false);
+        ex.initialize();
+        return ex;
+    }
+
+    /**
      * SSE 心跳专用调度器。原先心跳跑在 Reactor {@code Schedulers.parallel()} 上，与「打字机」的
      * {@code delayElements} 及 Reactor 内部操作共用同一批线程；而心跳要调 {@code SseEmitter.send()}，
      * 对慢客户端这是<b>阻塞</b>调用——只要几个连接卡在发送上，parallel 就被占满、把全站心跳一起拖死。

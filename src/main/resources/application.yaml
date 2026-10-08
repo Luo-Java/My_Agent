@@ -82,6 +82,20 @@ agent:
     upstream-total-chars: 12000  # 全部前驱产出合计上限，按前驱个数均分
     isolate-middle-steps: true   # 中间步骤(非首层非末步)不注入长期记忆(core_facts/summary)，避免被别的话题的摘要带偏
 
+  # 线上回答自评(SelfEvalProperties)：让模型给刚产出的回答打个 1~5 分，落 agent_trace.self_eval_*。
+  # 补的是「可观测面板只能回答跑成没跑成、快不快，回答对不对在线上没有信号」这个缺口。
+  # 默认关闭 —— 自评是一次额外的模型往返、按轮计费，默认打开等于给每条对话悄悄加一笔成本。
+  # 注意「默认关闭」不等于「零调用」：用户点踩时会对那一轮强制自评一次(不看 enabled / sample-rate)，
+  # 因为那是用户明确发出信号之后才发生的，一次调用有明确目的。详见 SelfEvalService 类注释。
+  # 采样判定由 traceId 哈希决定(不是随机数)，同一轮重放结论一致，便于复现「这轮为什么没被评到」。
+  # 未自评的轮次 self_eval_score 留 NULL，面板按「未自评」单独计数 —— 与「评了低分」分开，不混算。
+  self-eval:
+    enabled: false               # 是否开启常规按比例自评(点踩强制自评不受此项约束)
+    sample-rate: 0.1             # 采样比例 0~1(约每 10 轮评 1 轮)；越界会被夹到区间内并记 WARN
+    min-answer-chars: 80         # 回答短于此长度不自评(寒暄/短确认没有可评内容)
+    max-answer-chars: 2000       # 送进自评提示词的回答截断长度(自评只需判断是否答到点上)
+    low-score-threshold: 3       # 面板把 score <= 该值的轮次列为「低分」(只影响展示口径)
+
   # 提示词回归评测(EvalProperties)：跑固定用例集断言路由/规划决策，改完 prompts.yaml 跑一批并和上一批对比
   # 用例集位置用 Spring Resource 语法；想免重编译调试可改成 file:./eval-cases.yaml
   eval:
