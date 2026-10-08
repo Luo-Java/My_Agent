@@ -172,16 +172,11 @@ public class AgentService {
     /**
      * 导入智能体（按 {@code agentCode} 匹配既有记录）。
      * <p>
-     * <b>逐条容错</b>：某条不合规只记进 {@code errors} 并继续下一条 —— 导入是批量写入，不该因为包里
-     * 混进一条脏数据，让前面已经写进去的部分白做（它们确实已落库，整批回滚只会更糟）。
-     * <p>
-     * 冲突策略：
-     * <ul>
-     *   <li>{@code skip}（默认）—— 同编码已存在则跳过，包内定义不生效；</li>
-     *   <li>{@code overwrite} —— 用包内定义覆盖<b>内容列</b>，保留本地 {@code id} 与 {@code created_at}。
-     *       id 不能换：它被 {@code conversation.agent_id} 引用，换掉会让既有会话集体失绑。</li>
-     * </ul>
-     * 编码为空的条目按名称自动生成编码（{@link #genAgentCode}），因此这类条目每次导入都会新建一条。
+     * 红线：① <b>逐条容错</b> —— 某条不合规只记进 {@code errors} 并继续下一条；导入是批量写入，不该因为包里混进
+     * 一条脏数据就让前面已写进去的部分白做（它们确实已落库，整批回滚只会更糟）。② {@code overwrite} 只覆盖
+     * <b>内容列</b>，保留本地 {@code id} 与 {@code created_at} —— id 被 {@code conversation.agent_id} 引用，
+     * 换掉会让既有会话集体失绑。编码为空的条目按名称自动生成编码（{@link #genAgentCode}），
+     * 因此这类条目每次导入都会新建一条。
      *
      * @param items      可移植定义列表；null / 空 = 无事发生
      * @param onConflict 冲突策略；除 {@code overwrite} 外一律按 {@code skip} 处理

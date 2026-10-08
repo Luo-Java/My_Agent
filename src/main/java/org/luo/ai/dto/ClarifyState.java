@@ -11,20 +11,19 @@ import java.util.Map;
  * 澄清追问（参数补全）的显式状态：一个会话处于「追问中」时才有，落在 {@code conversation.clarify_state}。
  * <p>
  * <b>为什么要有它</b>：此前「已追问几次 / 已确认哪些参数 / 原始请求是什么」全靠每轮扫最近
- * {@code HISTORY_SCAN_LIMIT} 条 {@code chat_message} 重放推导。这在三种情况下会算歪 ——
- * ① 历史超窗被摘要压缩，原始请求那条消息滑出窗口，「任务范围」丢失；
- * ② 消息被用户标「不参与记忆」，重放侧看不到，追问次数凭空少一次；
- * ③ 长会话里最后一轮正式回答落在扫描范围之外，连续追问段的起点判断不到。
- * 落一列显式状态后这三项直接读，不再猜。<b>历史重放作为兜底保留</b>（老会话没有这一列，行为不回退）。
+ * {@code HISTORY_SCAN_LIMIT} 条 {@code chat_message} 重放推导，三种情况会算歪 ——
+ * ① 历史超窗被摘要压缩，原始请求滑出窗口、「任务范围」丢失；② 消息被标「不参与记忆」，重放侧看不到、
+ * 追问次数凭空少一次；③ 长会话里最后一轮正式回答落在扫描范围外，连续追问段的起点判断不到。
+ * 落显式状态后三项直接读、不再猜；<b>历史重放作为兜底保留</b>（老会话没有这一列，行为不回退）。
  * <p>
- * <b>{@link #agentId} 是「换智能体即作废」的判据</b>：路由转向别的智能体时本状态自然失效，
- * 不需要额外的清理动作（见 {@link #belongsTo}）。
+ * <b>{@link #agentId} 是「换智能体即作废」的判据</b>：路由转向别的智能体时本状态自然失效，无需额外清理动作
+ * （见 {@link #belongsTo}）。
  *
- * @param agentId 这份追问属于哪个智能体（关联 agent.id）；为空表示来源不明，一律不认
- * @param asked   已追问次数（0 = 尚未追问）。达到 {@link #MAX_ASKED} 即转交主模型尽力执行、不再追问
- * @param request 触发本次追问的<b>原始用户请求</b>：参数抽取的锚点，即使它已被摘要压缩出窗口也不丢
- * @param question 最近一次追问的原文：供编排层做话题切换预检（判断本轮消息是「回答追问」还是「开新话题」）
- * @param params  已确认参数快照（key = paramSchema 的 key，value = 用户明确给出的取值）
+ * @param agentId  这份追问属于哪个智能体（关联 agent.id）；为空=来源不明，一律不认
+ * @param asked    已追问次数（0=尚未追问）。达到 {@link #MAX_ASKED} 即转交主模型尽力执行、不再追问
+ * @param request  触发本次追问的<b>原始用户请求</b>：参数抽取的锚点，即使已被摘要压缩出窗口也不丢
+ * @param question 最近一次追问原文：供编排层做话题切换预检（判断本轮是「回答追问」还是「开新话题」）
+ * @param params   已确认参数快照（key = paramSchema 的 key，value = 用户明确给出的取值）
  */
 @Slf4j
 public record ClarifyState(Long agentId, int asked, String request, String question, Map<String, String> params) {

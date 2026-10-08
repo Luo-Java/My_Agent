@@ -1,17 +1,14 @@
 package org.luo.ai.dto;
 
 /**
- * 本轮要落的「对话分支版本」——编辑重发 / 重新生成时由前端带上，表示这次回答要作为某一轮的新版本。
+ * 本轮要落的「对话分支版本」—— 编辑重发 / 重新生成时由前端带上，表示这次回答要作为某一轮的新版本。
  * <p>
- * 一次完整的分支是<b>两步</b>，这个对象只承担第二步的输入：
- * <ol>
- *   <li>{@code POST …/{id}/branch} 先给目标轮分组并算出新版本号（无破坏性，见
- *       {@code ConversationService.prepareBranch}）；</li>
- *   <li>{@code POST /api/chat/stream} 带上本对象，等服务端跑完、消息确实落库后再打标并让旧版本失效
- *       （见 {@code ConversationService.markRoundBranch}）。</li>
- * </ol>
- * 之所以不在第一步就把旧版本置为 inactive：本轮有可能根本发不出去（附件处理失败、配额超限、内容安全
- * 拒绝），那时旧版本必须原样可见 —— 否则用户会看到那一轮凭空消失且没有任何报错。
+ * 一次完整的分支是<b>两步</b>，本对象只承担第二步的输入：① {@code POST …/{id}/branch} 先给目标轮分组并算出新
+ * 版本号（无破坏性，见 {@code ConversationService.prepareBranch}）；② {@code POST /api/chat/stream} 带上本对象，
+ * 等服务端跑完、消息确实落库后再打标并让旧版本失效（见 {@code ConversationService.markRoundBranch}）。
+ * <p>
+ * 红线：<b>第一步不得把旧版本置为 inactive</b> —— 本轮有可能根本发不出去（附件处理失败、配额超限、内容安全拒绝），
+ * 那时旧版本必须原样可见，否则用户会看到那一轮凭空消失且没有任何报错。
  *
  * @param groupId 分支组 ID（由 {@code /branch} 返回）
  * @param version 本轮要落的版本号（由 {@code /branch} 返回）

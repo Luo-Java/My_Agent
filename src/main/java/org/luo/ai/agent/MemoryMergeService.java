@@ -25,25 +25,18 @@ import org.luo.ai.service.ConversationFactService;
 import org.luo.ai.service.ConversationService;
 
 /**
- * 会话记忆合并服务：对话结束后把「溢出窗口的旧消息」与已有摘要/关键事实合并，一次 LLM 调用同时产出
- * 更新后的滚动摘要与用户核心信息，回写 conversation 表与 {@code conversation_fact} 表。
+ * 会话记忆合并服务：对话结束后把「溢出窗口的旧消息」与已有摘要 / 关键事实合并，一次 LLM 调用同时产出更新后的
+ * 滚动摘要与用户核心信息，回写 conversation 与 {@code conversation_fact}。
+ * 用裸 {@link ChatModel} 直接调用（不走 advisor，否则摘要指令会被当作对话消息写入记忆）；失败一律回退已有记忆，
+ * 不打断主流程。
  * <p>
- * 用裸 {@link ChatModel} 直接调用（不走 advisor，否则摘要指令会被当作对话消息写入记忆）；失败一律回退
- * 已有记忆，不打断主流程。
+ * 产出去向分两处、语义不同：摘要 → {@code conversation.summary}（覆盖写，附水位）；事实 →
+ * {@code conversation_fact} <b>逐条 diff</b>（{@link ConversationFactService#merge}：模型这次没列出的自动条目
+ * 视为过时并删除，用户手加的不动）。{@code conversation.core_facts} 退化为「旧版文本归档」，本类<b>不再写它</b>；
+ * 首次合并（条目表为空）会把旧 {@code core_facts} 喂给模型拆成条目，自动完成迁移。
  * <p>
- * <b>产出去向分成两处，语义不同</b>：
- * <ul>
- *   <li>摘要 → {@code conversation.summary}（覆盖写，附水位）；</li>
- *   <li>事实 → {@code conversation_fact} <b>逐条 diff</b>（{@link ConversationFactService#merge}）：模型
- *       这次没列出的自动条目即视为过时并删除，用户手加的条目不动。{@code conversation.core_facts}
- *       退化为「旧版文本归档」，本类<b>不再写它</b>（见 {@code ConversationService#updateSummary}）。</li>
- * </ul>
- * 首次合并（条目表为空）会把旧 {@code core_facts} 文本当输入喂给模型拆成条目，从而自动完成迁移。
- * <p>
- * <b>数据保留契约</b>：只把窗口外消息<b>排除出主模型上下文</b>，<b>不删除 chat_message 行</b>。
- * {@link ParamFillingService} 的参数抽取与澄清兜底路径依赖该语义——若改为物理归档旧消息，需同步其实现。
- * （澄清次数 / 原始请求 / 已确认参数已改为显式落库 {@code conversation.clarify_state}，不再受摘要压缩影响；
- * 但抽取范围仍读历史，故这条契约依然成立。）
+ * <b>数据保留契约</b>：只把窗口外消息<b>排除出主模型上下文</b>，<b>不删除 chat_message 行</b>。参数抽取与澄清兜底
+ * 路径依赖该语义 —— 若将来改为物理归档旧消息，必须同步 {@code ParamFillingService} 的实现。
  */
 @Slf4j
 @Service

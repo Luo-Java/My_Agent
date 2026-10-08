@@ -26,26 +26,17 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 提示词回归评测接口。用于回答「改了 {@code prompts.yaml} 之后到底变好还是变差」：跑一批固定用例，
- * 与上一次批次对比。
+ * 提示词回归评测接口：回答「改了 {@code prompts.yaml} 之后到底变好还是变差」。闭环 = 改提示词 →
+ * {@code POST /api/eval/run} → {@code GET /api/eval/compare?from=<上一批>&to=<本批>}，返回的 {@code broken} 即改坏的用例。
  * <p>
- * 用法闭环：改提示词 → {@code POST /api/eval/run} → {@code GET /api/eval/compare?from=<上一批>&to=<本批>}，
- * 返回的 {@code broken} 就是「这次改坏了哪些用例」。
+ * 红线：<b>整类限 ADMIN</b>。{@code /run} 会发起真实模型调用（一次跑批 13 条 = 13 次 LLM 请求）并计入成本流水，
+ * 与 {@link CostController} 同性质；只读的 {@code /cases}、{@code /batches}、{@code /compare} 本可放宽，
+ * 但它们只服务「跑批」这一件事，单独放开没有使用场景、反而多一处要解释的权限边界，故整类收敛。
+ * 校验 = 统一 {@code /api/**} 鉴权 + {@link RequireRole}（403），前端顶栏「🧪 评测」入口按同一角色显隐。
  * <p>
- * 返回体不做 {@code RestResult} 包装，与 {@link TraceController} 一致（AI 层只读/工具接口的既有风格）。
- * 走统一 {@code /api/**} 登录鉴权（JwtAuthInterceptor）。
- * <p>
- * <b>为什么是管理员专属</b>：{@code POST /run} 会发起<b>真实模型调用</b>（一次跑批 13 条用例 = 13 次 LLM 请求），
- * 消耗计入 {@code llm_usage}/{@code agent_trace} 成本流水。与 {@link CostController} 同一性质——
- * 都是「会花钱的运维动作」，不该交给任意登录用户。只读的 {@code /cases}、{@code /batches}、
- * {@code /compare} 本可放宽，但它们只服务于「跑批」这一件事，单独放开没有使用场景，
- * 反而多一处需要单独解释的权限边界，故整类收敛。
- * 校验走统一 {@code /api/**} 登录鉴权 + {@link RequireRole}（不通过返回 403），
- * 前端顶栏「🧪 评测」入口按同一角色显隐。
- * <p>
- * <b>用例有两个来源</b>：打包进 jar 的 {@code eval-cases.yaml}（只读种子）与库内 {@code eval_case} 表
- * （运行时新增，当前唯一入口是「把用户反馈转成用例」，见 {@code /cases/from-feedback}）。{@code /cases}
- * 返回的是两者<b>合并后</b>的视图（同名以种子为准），{@code /cases/db} 只看库内增量。
+ * 用例两个来源：jar 内 {@code eval-cases.yaml}（只读种子）与库内 {@code eval_case} 表（运行时新增，当前唯一入口是
+ * {@code /cases/from-feedback}）。{@code /cases} 回两者<b>合并</b>视图（同名以种子为准），{@code /cases/db} 只看库内增量。
+ * 返回体不做 {@code RestResult} 包装，与 {@link TraceController} 一致。
  */
 @RestController
 @RequestMapping("/api/eval")

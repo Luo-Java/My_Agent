@@ -31,19 +31,16 @@ import org.luo.ai.memory.MemoryViewService;
 
 /**
  * 对话编排服务（门面）：一轮对话统一走 {@link #runRound}，按会话形态选 {@link RoundHandler} 策略
- * （{@link AgentRoundHandler} / {@link PlannerRoundHandler} / {@link ReviewRoundHandler}）执行，
- * 产出 {@link RoundResult} 后统一输出收尾。
- * 请求组装、摘要合并、持久化、追踪分别委托 {@link ChatComposer} / {@link MemoryMergeService} /
- * {@link ConversationService} / {@link TraceService}，本类只做编排。
+ * （{@link AgentRoundHandler} / {@link PlannerRoundHandler} / {@link ReviewRoundHandler}）执行，产出
+ * {@link RoundResult} 后统一输出收尾。请求组装、摘要合并、持久化、追踪分别委托 {@link ChatComposer} /
+ * {@link MemoryMergeService} / {@link ConversationService} / {@link TraceService}，本类只做编排。
  * <p>
- * <b>收尾顺序（勿乱）</b>：推回复 → 推引用 → 落库附件/引用 → 异步落库追踪 → 异步合并记忆。
- * 一切旁路数据都排在用户看到答案<b>之后</b>。
- * <p>
- * <b>输出侧内容安全</b>：所有出口正文都过一遍 {@link ContentSafetyService#checkOutput}（护栏关闭时零开销）。
- * 命中即<b>替换为提示文案</b>并落 WARN，不静默放行、也不假装回答成功。
- * <b>已知边界</b>：替换只作用于本轮推送与展示；普通对话的助手消息由记忆 Advisor 在模型返回时即写入
- * {@code chat_message}，故<b>库里保留的仍是模型原始输出</b>。要让落库内容也同步替换，需把护栏下沉到
- * Advisor 层改写 response —— 那会牵动 token/工具元数据的重建，本版本刻意不做，此处如实标注。
+ * 红线：① <b>收尾顺序勿乱</b> —— 推回复 → 推引用 → 落库附件 / 引用 → 异步落库追踪 → 异步合并记忆；
+ * 一切旁路数据都排在用户看到答案<b>之后</b>。② 所有出口正文都过 {@link ContentSafetyService#checkOutput}
+ * （护栏关闭时零开销），命中即<b>替换为提示文案</b>并落 WARN，不静默放行、也不假装回答成功。
+ * 已知边界：替换只作用于本轮推送与展示；普通对话的助手消息由记忆 Advisor 在模型返回时即写入 {@code chat_message}，
+ * 故<b>库里保留的仍是模型原始输出</b>。要让落库内容同步替换，需把护栏下沉到 Advisor 层改写 response ——
+ * 那会牵动 token / 工具元数据的重建，本版本刻意不做，此处如实标注。
  */
 @Slf4j
 @Service

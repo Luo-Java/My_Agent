@@ -18,21 +18,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 链路追踪 Advisor：把「模型调用」这一层的事实采集进 {@link RoundTrace}——工具调用明细与 token 用量。
+ * 链路追踪 Advisor：把「模型调用」这一层的事实采集进 {@link RoundTrace} —— 工具调用明细与 token 用量。
  * <p>
- * <b>为什么必须由 Advisor 采集</b>：工具循环发生在 Spring AI 内部（反复调模型、执行工具、再调模型），
- * 业务代码只看得到最终结果；调了哪些工具、每次花多少 token 只有 Advisor 看得见。
- * <p>
- * <b>放在链最内层</b>（order 取最大值附近）：这样它在工具循环<b>之内</b>，每轮模型调用都会经过，
- * 明细与 token 才能随循环逐步累加，而不是只看到最终那一次。
- * <p>
- * <b>trace 从哪来</b>：ChatService 把当轮 {@link RoundTrace} 塞进 advisor 上下文（键
- * {@link RoundTrace#CONTEXT_KEY}，与 CONVERSATION_ID 同款机制），本 Advisor 在 {@link #before} 取回；
- * 取不到（如规划器内部的裸 ChatModel 调用）就整体跳过——追踪是旁路，缺数据可接受，报错不可以。
- * <p>
- * <b>token 为什么用 ThreadLocal 过渡</b>：用量只有在模型返回后才拿得到，而 {@code after} 只有响应对象。
- * Spring AI 保证 {@code before}/{@code after} 对同一次 advisor 调用<b>同线程同步</b>执行，故用 ThreadLocal
- * 把 trace 从 before 带到 after 最直接；该窗口仅限单次调用内，即便未来 DAG 并行也是每线程各持自己的 trace。
+ * 红线：① <b>必须由 Advisor 采集</b>：工具循环发生在 Spring AI 内部，业务代码只看得到最终结果，调了哪些工具、
+ * 每次花多少 token 只有 Advisor 看得见。② <b>放在链最内层</b>（order 取最大值附近）：这样它在工具循环<b>之内</b>，
+ * 每轮模型调用都经过，明细与 token 才能随循环逐步累加。③ trace 由 ChatService 塞进 advisor 上下文
+ * （键 {@link RoundTrace#CONTEXT_KEY}）并在 {@link #before} 取回；取不到（如规划器内部的裸 ChatModel 调用）就整体
+ * 跳过 —— 追踪是旁路，缺数据可接受、报错不可以。④ token 用 ThreadLocal 从 before 带到 after：Spring AI 保证两者
+ * 对同一次调用<b>同线程同步</b>执行；窗口仅限单次调用内，即便未来 DAG 并行也是每线程各持自己的 trace。
  */
 @Slf4j
 @Component

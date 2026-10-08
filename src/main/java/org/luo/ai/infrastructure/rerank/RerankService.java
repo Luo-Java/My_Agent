@@ -15,21 +15,18 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 精排（Rerank）服务：对向量粗排召回的候选做一次相关性精排，显著提升注入提示词的资料质量。
+ * 精排（Rerank）服务：对向量粗排召回的候选做一次相关性精排，提升注入提示词的资料质量。
  * <p>
- * <b>为什么需要精排</b>：向量检索是「双塔」式的——问题与知识块各自独立编码后比距离，对「关键词碰巧相近
- * 但语义无关」的块天然分不清。精排是「交叉编码」模型，把 query 与候选<b>一起</b>过模型打分，判相关性远比
- * 余弦精准——典型做法是「向量召回 20 条 → 精排取 3 条」。
+ * 为何需要：向量检索是「双塔」式（问题与知识块各自独立编码后比距离），对「关键词碰巧相近但语义无关」的块天然
+ * 分不清；精排是「交叉编码」模型，把 query 与候选<b>一起</b>过模型打分，判相关性远比余弦精准 —— 典型做法是
+ * 「向量召回 20 条 → 精排取 3 条」。
+ * 为何手写 HTTP：Spring AI 2.0 没有 Rerank 抽象，且 DashScope 的 text-rerank 不在 OpenAI 兼容路径下
+ * （{@code /api/v1/services/rerank/...}），无法复用自动装配的模型；故用 Hutool {@code HttpRequest} 直调
+ * （与 ChromaConnection 一致），api-key 复用 {@code spring.ai.openai.api-key}。
  * <p>
- * <b>为什么手写 HTTP</b>：Spring AI 2.0 没有 Rerank 抽象，而 DashScope 的 text-rerank 不在 OpenAI 兼容
- * 路径下（{@code /api/v1/services/rerank/...}），无法复用自动装配的 ChatModel/EmbeddingModel。故用 Hutool
- * {@code HttpRequest} 直调（与 ChromaConnection 一致），api-key 复用 {@code spring.ai.openai.api-key}。
- * <p>
- * <b>绝不阻断检索</b>：未开启 / 未配 key / 网络异常 / 非 200 / 响应结构不符一律返回 {@code null}，
- * 由 {@link org.luo.ai.service.KbSearchService} 降级为「按向量分截断」。精排是<b>增强</b>，不是依赖。
- * <p>
- * <b>阈值口径</b>：精排的 {@code relevance_score} 是 0~1 相关度，与余弦相似度<b>不同尺度</b>，
- * 故其下限（{@code agent.rag.rerank-min-score}）与向量分下限（{@code agent.rag.min-score}）是两套独立配置。
+ * 红线：① <b>绝不阻断检索</b> —— 未开启 / 未配 key / 网络异常 / 非 200 / 响应结构不符一律返回 {@code null}，
+ * 由 {@link org.luo.ai.service.KbSearchService} 降级为「按向量分截断」；精排是<b>增强</b>不是依赖。
+ * ② 精排的 {@code relevance_score}（0~1）与余弦相似度是<b>不同尺度</b>，故两者下限是两套独立配置。
  */
 @Slf4j
 @Service

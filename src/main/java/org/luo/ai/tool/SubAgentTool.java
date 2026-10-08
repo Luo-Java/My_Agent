@@ -19,28 +19,17 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 
 /**
- * 「把任务转交给另一个智能体」工具（工具名 {@value #TOOL_NAME}）—— 让多智能体协作不再只有「规划模式」一条路。
+ * 「把任务转交给另一个智能体」工具（{@value #TOOL_NAME}）—— 多智能体协作除规划模式外的另一条路。
  * <p>
- * <b>为什么是动态构造、而不是 {@link ToolProvider} 注解式</b>：智能体是<b>运行时数据</b>（agent 表里随时增删），
- * 而 {@code @Tool} 方法集合在编译期就固定、{@link ToolRegistry} 也只在<b>构造期</b>快照一次；两者对不上。
- * 因此本类不做成 Provider，而是由 {@link org.luo.ai.chat.ChatComposer} 在每轮组装请求时<b>现场构造</b>一个
- * {@link ToolCallback}（候选清单从库里现查），这样新建 / 删除智能体立刻生效、不需要重启，也不会有陈旧快照。
- * <p>
- * <b>为什么不让它出现在「全量工具」里</b>：{@code tools_json} 为 NULL/空 = 挂全量，但转交是<b>策略性能力</b>
- * 而非基础能力——翻译、闲聊类智能体凭空获得「可以把活推给别人」的选项，很容易被模型误用（明明自己就能答，
- * 却绕一圈转交），且会一次性改变所有既有智能体的行为。故本工具是<b>白名单专属</b>：必须在 {@code tools_json}
- * 里显式写出 {@code "call_agent"} 才会挂载（见 {@link ToolRegistry#dynamicToolRequested}）。
- * <p>
- * <b>只做一层，不嵌套</b>：子智能体执行时挂的是它的<b>静态工具</b>（{@link ToolRegistry#resolve}），而本工具不在
- * 静态池里，因此「A 转给 B，B 再转给 C」不会发生，天然不存在自递归与调用环。代价是子智能体不能继续向下转交，
- * 这在一层就够用的场景下是划算的取舍；若将来确实需要嵌套，必须补一套调用链追踪（深度上限 + 环路检测）才行。
- * <p>
- * <b>依赖为什么落在 Mapper 而不是 AgentService</b>：AgentService 间接依赖 {@code PlannerService → ChatComposer}，
- * 而 ChatComposer 又依赖本类，走 Service 会形成构造器循环依赖。此处直接操作数据层——与 AgentService 级联清理
- * 知识库时「避免循环依赖」的处理一致。
- * <p>
- * <b>转交对模型是「黑盒」</b>：主智能体只拿到子智能体的最终产出，看不到它的工具调用与中间过程。指令必须自包含
- * （子智能体看不到用户与原智能体的对话），这一点写进了工具描述，否则模型会写出「按上面说的做」这类无主语的指令。
+ * 红线：① <b>动态构造</b>而非 {@link ToolProvider} 注解式 —— 智能体是运行时数据（agent 表随时增删），而
+ * {@code @Tool} 集合在编译期固定、{@link ToolRegistry} 只在构造期快照一次，两者对不上；故由 ChatComposer 每轮
+ * 现场构造 {@link ToolCallback}（候选现查），新建 / 删除智能体立即生效。② <b>白名单专属</b>：转交是策略性能力
+ * 而非基础能力，放进「全量工具」会让翻译 / 闲聊类凭空获得「可以把活推给别人」的选项、且一次性改变所有既有
+ * 智能体行为，故必须在 {@code tools_json} 里显式写 {@code "call_agent"} 才挂载（{@link ToolRegistry#dynamicToolRequested}）。
+ * ③ <b>只做一层不嵌套</b>：子智能体挂的是静态工具池（{@link ToolRegistry#resolve}），本工具不在其中，故
+ * 「A→B→C」不会发生，天然无自递归与调用环；将来要嵌套必须另补调用链追踪（深度上限 + 环路检测）。
+ * ④ 依赖落 Mapper 而非 AgentService：后者间接依赖 {@code PlannerService → ChatComposer}，而 ChatComposer 依赖
+ * 本类，走 Service 会构造器循环依赖。⑤ 转交对模型是<b>黑盒</b>（只见子智能体最终产出），故指令必须自包含 —— 已写进工具描述。
  */
 @Slf4j
 @Service

@@ -15,20 +15,19 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 工具注册表：启动时把两类工具统一预解析为 {@link ToolCallback}[]，并建「工具名 → 回调」索引，
- * 供按智能体装配时按名过滤（见 {@link #resolve(String)}）。
+ * 工具注册表：启动时把两类工具统一预解析为 {@link ToolCallback}[]，并建「工具名 → 回调」索引，供按智能体装配时
+ * 按名过滤（见 {@link #resolve(String)}）。两类都只需 {@code @Component} + 实现接口，本类与业务代码均无需改动：
  * <ul>
  *   <li><b>注解式</b>：{@link ToolProvider} 实现类，方法标 {@code @Tool}，反射解析。</li>
  *   <li><b>动态式</b>：{@link ToolCallbackSource} 实现类，直接产出回调（远端工具运行时才知道有哪些）。</li>
  * </ul>
- * 两类都只需 {@code @Component} + 实现接口，本类与业务代码均无需改动。
  * <p>
- * 此外还有<b>第三类「动态工具」</b>：实例依赖调用方上下文、无法在构造期注册（如 {@link SubAgentTool}
- * 的候选清单随库变化），本类只为它登记元信息供前端勾选（见 {@link #DYNAMIC_TOOL_NAMES}），
- * 实例由调用方每轮现构，且需在白名单里显式声明才挂载（见 {@link #dynamicToolRequested}）。
+ * 另有<b>第三类「动态工具」</b>：实例依赖调用方上下文、无法在构造期注册（如 {@link SubAgentTool} 的候选清单随库
+ * 变化），本类只为它登记元信息供前端勾选（{@link #DYNAMIC_TOOL_NAMES}），实例由调用方每轮现构，且需在白名单里
+ * 显式声明才挂载（见 {@link #dynamicToolRequested}）。
  * <p>
- * <b>工具名</b>取 {@code ToolDefinition.name()}（{@code @Tool} 未指定 name 时即方法名），是 {@code agent.tools_json}
- * 白名单的匹配依据；同名工具保留先注册者（注解式优先）并告警，改动 {@code @Tool} 方法名会使既有白名单失配。
+ * 红线：工具名取 {@code ToolDefinition.name()}（{@code @Tool} 未指定 name 时即方法名），是 {@code agent.tools_json}
+ * 白名单的匹配依据；<b>同名工具保留先注册者（注解式优先）并告警</b>，改动 {@code @Tool} 方法名会使既有白名单失配。
  */
 @Getter
 @Slf4j

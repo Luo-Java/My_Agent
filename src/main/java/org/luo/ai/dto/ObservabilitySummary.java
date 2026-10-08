@@ -5,18 +5,13 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.List;
 
 /**
- * 可观测面板聚合视图（GET /api/observability/summary 的返回体）。
+ * 可观测面板聚合视图（GET /api/observability/summary 的返回体），聚合 {@code agent_trace} 回答
+ * 「最近 N 天整体跑得怎么样」。与 {@link CostSummary} 的分工：成本看板只讲花了多少 token，本面板讲运行质量。
+ * 仅 ADMIN 可访问（跨会话全站聚合）。
  * <p>
- * 聚合 {@code agent_trace}（一轮对话的链路留痕），回答「最近 N 天整体运行得怎么样」：
- * 多少轮、成功率、平均耗时、token 花费、按天/按模式/按路由来源/按智能体拆解、以及最慢的几轮。
- * 与 {@link CostSummary} 的分工：成本看板只讲「花了多少 token」；本面板讲「运行质量」——
- * 耗时、失败率、瓶颈在哪里。
- * <p>
- * <b>回答质量那一块单独占两个分量</b>（{@link #selfEval} 与 {@link #lowRounds}），没有塞进
- * {@link Overview}：自评只覆盖被抽检 / 被点踩的那部分轮次，把它混进「全站总览」会让成功率下面挂一个
- * 分母不同的百分比，看着像同一件事。分开摆，口径各自说清。
- * <p>
- * <b>仅 ADMIN 可访问</b>：跨会话全站聚合，天然运营视角（同成本看板）。
+ * 红线：{@link #selfEval} / {@link #lowRounds} 刻意不塞进 {@link Overview} —— 自评只覆盖被抽检 / 被点踩的轮次，
+ * 混进「全站总览」会让成功率下面挂一个分母不同的百分比。{@link #lowScoreThreshold} 必须由后端下发，
+ * <b>前端不得写死</b>（阈值改了后端判断，界面不改就会嘴上说 3 分、实际按别的分算）。
  *
  * @param overview      总览指标
  * @param daily         按天趋势（升序）
@@ -24,10 +19,9 @@ import java.util.List;
  * @param byRouteSource 按处理方来源拆解
  * @param byAgent       按智能体拆解（轮次降序）
  * @param slowest       最慢的几轮（耗时降序，便于定位瓶颈）
- * @param selfEval      回答自评覆盖与分数（窗口内全站）；未自评的轮次单独计数，不与低分混算
- * @param lowScoreThreshold 低分阈值（{@code agent.self-eval.low-score-threshold}）—— 面板要显示「≤ N 分」，
- *                      不能在前端写死：阈值改了后端判断，界面不改就会嘴上说 3 分、实际按别的分算
- * @param lowRounds     低分轮次（分数升序，同分取最近）；明细由追踪详情接口给
+ * @param selfEval      回答自评覆盖与分数（未自评轮次单独计数，不与低分混算）
+ * @param lowScoreThreshold 低分阈值（{@code agent.self-eval.low-score-threshold}）
+ * @param lowRounds     低分轮次（分数升序，同分取最近）
  */
 public record ObservabilitySummary(Overview overview,
                                    List<DailyBucket> daily,

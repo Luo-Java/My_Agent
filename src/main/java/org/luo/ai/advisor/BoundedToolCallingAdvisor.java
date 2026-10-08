@@ -17,30 +17,13 @@ import java.util.List;
 
 /**
  * 有界工具循环 Advisor：给 Spring AI 默认的「无限工具循环」装上刹车与可见性。
+ * 继承 {@link ToolCallingAdvisor} 并重写 {@link #doBeforeCall}（工具循环内每轮模型调用前触发）：轮数上限、
+ * 连续同名同参重复检测、单轮 token 预算（读 {@link RoundTrace#getTotalTokens()}，规划模式下跨步骤累加）。
+ * 最后一道拦的是「每步都合规、合起来烧穿一轮」—— 多步规划 + 长工具链可完全绕过前两道。都是<b>软刹车</b>
+ * （理由见 {@link ToolCallProperties}），故<b>不是硬上限</b>：刹车后仍会再调一次模型，用量可能高出上限一到两次。
  * <p>
- * Spring AI 2.0 的 {@link ToolCallingAdvisor} 用 {@code do...while(isToolCall)} 循环，只靠模型自己停止；
- * 模型反复调同一个工具就会死循环、token 无限累积直到全局超时。本类继承它并重写 {@link #doBeforeCall}
- * 钩子（该钩子在工具循环内<b>每轮模型调用前</b>触发），实现三道防线：
- * <ul>
- *   <li><b>轮数上限</b>：累计往返轮数超过 {@code maxIterations} 即软刹车（不抛错，让模型用已有信息作答）；</li>
- *   <li><b>连续重复检测</b>：模型连续 {@code repeatThreshold} 次请求「同名工具且入参相同」判定原地打转，提前软刹车；</li>
- *   <li><b>单轮 token 预算</b>：读本轮累计用量（{@link RoundTrace#getTotalTokens()}，规划模式下跨步骤累加），
- *       达到 {@code roundBudgetTokens} 即软刹车。轮数与重复检测拦的是「死循环」，这一道拦的是「每一步都合规、
- *       合起来烧穿一轮」——多步规划 + 长工具链可以完全绕过前两道而不违反其中任何一条。</li>
- * </ul>
- * <p>
- * <b>软刹车为什么不是硬中断</b>：见 {@link ToolCallProperties} 的类注释——已跑出的中间结果是花过钱的，
- * 硬中断等于全丢并只回一条错误；软刹车让本轮以「不完整但基于事实、且明确说明不完整」收场。
- * 代价是<b>它不是硬上限</b>：刹车后模型仍会被调用一次来产出最终答案（规划模式下每个被刹住的步骤各一次），
- * 真实用量可能高出上限一到两次调用。
- * <p>
- * <b>计数为何用 ThreadLocal</b>：工具循环的 {@code doBeforeCall} 在同一条执行链上反复触发，但每次都可能跨
- * advisor 调用（{@code adviseCall} 内部 {@code do...while} 同线程推进）；同时 ChatClient 是单例、被并发请求
- * 复用，成员变量计数会串号。ThreadLocal 保证每个请求各自计数，用完即清，避免线程池复用残留。
- * <p>
- * <b>可见性</b>：工具调用本身的进度播报已由 {@code RoundTraceAdvisor}（经 RoundTrace.syncToolCalls）完成；
- * 本类补「刹车」这条播报（含触发原因与用量），并在 WARN 日志里带上 traceId —— 进度只当轮可见，
- * 日志才是事后能检索到的那一份。<b>不落库</b>：为一项默认关闭的治理能力新增 {@code agent_trace} 列不划算。
+ * 计数用 ThreadLocal：ChatClient 是单例、被并发请求复用，成员变量会串号；用完即清，避免线程池复用残留。
+ * 刹车播报 + WARN（含 traceId）留痕，<b>不落库</b>（为默认关闭的治理能力新增 agent_trace 列不划算）。
  */
 @Slf4j
 public class BoundedToolCallingAdvisor extends ToolCallingAdvisor {

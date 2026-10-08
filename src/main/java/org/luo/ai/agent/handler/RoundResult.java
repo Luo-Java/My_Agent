@@ -5,29 +5,17 @@ import org.luo.ai.dto.KbCitation;
 import java.util.List;
 
 /**
- * 一轮对话的统一产出契约（各会话形态共用）。
- * <p>
- * 字段分三类：<b>结论</b>（{@code reply} / {@code clarified}）、<b>记忆契约</b>（{@code needSaveExchange}）、
- * 以及<b>可选通道</b>（{@code citations} 与四个 JSON 字段）——可选通道各自对应一类 SSE 事件，
- * 由 {@code ChatService} 在推正文前后按需取用，都为 null 时即「本轮没有这类附加内容」。
+ * 一轮对话的统一产出契约（各会话形态共用）：<b>结论</b>（reply / clarified）、<b>记忆契约</b>（needSaveExchange）、
+ * <b>可选通道</b>（citations + 四个 JSON 字段，各自对应一类 SSE 事件，由 ChatService 按需取用）。
  *
  * @param reply            本轮回复文本（clarified=true 时为追问文本）
- * @param clarified        true=本轮未给正式回答、返回的是追问；false=正式回答
- * @param needSaveExchange 是否需显式把「用户原话 → 最终回复」写入记忆：规划多步执行为 true；
- *                         普通对话由记忆 Advisor 自动落库，恒为 false
- * @param citations        本轮引用的 RAG 来源（与正文 [n] 角标对应）；未走 RAG / 无命中为空表
- * @param planJson         规划模式「先看计划」开关开启时产出的待确认计划（JSON 对象字符串：任务 id + 步骤清单）；
- *                         非规划暂停时为 null。仅流式接口会把它推成 {@code plan} 事件供前端渲染卡片
- *                         （同步接口无事件通道，计划明细已包含在 reply 文本里，故直接丢弃）
- * @param approvalJson     执行到「需审批」步骤而暂停时的待批步骤信息（JSON 对象字符串：任务 id + 步骤下标 +
- *                         智能体 + 指令）；未暂停时为 null。仅流式接口会把它推成 {@code approval} 事件供前端
- *                         渲染审批卡片；与 {@code planJson} 一样，暂停说明同时以文本形式跟着 token 推一遍
- * @param reviewJson       并行评审会话产出的候选答案（JSON 对象字符串：{@code {"candidates":[…]}}）；
- *                         非评审轮次为 null。<b>必须先于正文推送</b>（{@code review} 事件）——候选是
- *                         「结论怎么来的」，正文是结论，顺序反了用户会先看到一个没有出处的答案
- * @param recallJson       跨会话搜索召回的历史片段（JSON 数组字符串）；未开启/无命中为 null。
- *                         与上面三个不同，它<b>不是编排事件而是附加素材</b>，故可与其余通道并存，
- *                         由 {@link #withRecall(String)} 挂上去
+ * @param clarified        true=本轮是追问、未给正式回答
+ * @param needSaveExchange 是否需显式把「用户原话 → 最终回复」写入记忆：规划多步执行为 true；普通对话由记忆 Advisor 自动落库，恒为 false
+ * @param citations        本轮引用的 RAG 来源（对应正文 [n] 角标）；未走 RAG / 无命中为空表
+ * @param planJson         待确认计划（JSON 对象：任务 id + 步骤清单）；非规划暂停为 null。仅流式推成 {@code plan} 事件
+ * @param approvalJson     待批步骤信息（JSON 对象：任务 id + 步骤下标 + 智能体 + 指令）；未暂停为 null。仅流式推成 {@code approval} 事件
+ * @param reviewJson       并行评审候选（JSON 对象 {@code {"candidates":[…]}}）；非评审为 null。<b>必须先于正文推送</b>
+ * @param recallJson       跨会话召回片段（JSON 数组）；未开启/无命中为 null。是附加素材而非编排事件，可与其余通道并存
  */
 public record RoundResult(String reply, boolean clarified, boolean needSaveExchange, List<KbCitation> citations,
                           String planJson, String approvalJson, String reviewJson, String recallJson) {

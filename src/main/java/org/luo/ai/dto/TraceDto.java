@@ -5,21 +5,19 @@ import java.util.List;
 
 /**
  * 一轮对话的链路追踪视图（GET /api/trace 的返回项）。与实体 {@code AgentTrace} 的区别：把几个 JSON 字符串列
- * （工具调用、引用来源、记忆注入构成）解析成结构化列表，前端直接渲染即可；同时屏蔽自增主键等内部字段。
+ * （工具调用、引用来源、记忆注入构成）解析成结构化列表供前端直接渲染，并屏蔽自增主键等内部字段。
  * <p>
- * <b>token 口径</b>：只统计「回答本身」相关的模型调用——正式回答及其工具调用循环。路由判定、参数抽取、
- * 规划、记忆合并、视觉识别都走裸 {@code ChatModel}（不经 Advisor），不计入其中；故这里的数值是
- * 「回答成本」而非「本轮全部成本」，用作横向对比足够，别当账单。
+ * <b>token 口径</b>：只统计「回答本身」相关的模型调用（正式回答及其工具调用循环）。路由判定、参数抽取、规划、
+ * 记忆合并、视觉识别都走裸 {@code ChatModel}（不经 Advisor），不计入其中；故这些数值是「回答成本」而非
+ * 「本轮全部成本」，横向对比足够，<b>别当账单</b>。
  *
  * @param mode           agent=普通/智能体对话，planner=规划模式
  * @param routeSource    BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审
  * @param retrievalQuery 本轮实际用于检索的问题（多轮改写产物）；null=未改写
- * @param memory         本轮注入的记忆构成；<b>null=未采集</b>（规划模式各步分别注入、或采集失败）——
- *                       与「注入为空」不同，前端据此区分「没采到」与「这一轮真的什么都没注入」
+ * @param memory         本轮注入的记忆构成；<b>null=未采集</b>（规划模式各步分别注入、或采集失败）—— 与「注入为空」不同，前端据此区分
  * @param toolCalls      工具调用明细（无调用为空表）
  * @param citations      RAG 引用来源（无引用为空表）
- * @param selfEval       本轮回答自评；<b>null=未自评</b>（采样未命中 / 回答过短 / 调用失败），
- *                       与「自评给了低分」是两件事 —— 见 {@link SelfEvalDto}
+ * @param selfEval       本轮回答自评；<b>null=未自评</b>（采样未命中 / 回答过短 / 调用失败），与「自评给了低分」是两件事
  * @param status         ok / error
  */
 public record TraceDto(String traceId, String conversationId, String mode, String routeSource, String agentCode,

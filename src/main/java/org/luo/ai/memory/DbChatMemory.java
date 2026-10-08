@@ -115,16 +115,15 @@ public class DbChatMemory implements ChatMemory {
     }
 
     /**
-     * 计算 token 预算窗口的起点索引：先按预算从最新往前累计字符数（近似 token）得到「自然起点」，
-     * <b>再夹一次下限</b>（起点最多到 {@code size - minKeepMessages}）。
+     * 计算 token 预算窗口的起点索引：先按预算从最新往前累计字符数（近似 token）得到「自然起点」，<b>再夹一次下限</b>
+     * （起点最多到 {@code size - minKeepMessages}）。
      * <p>
-     * 下限是<b>关键防线</b>：若最新一条消息自己就超过预算（如上一轮是上万字符的数据表回复），
-     * 第一次累加就越界，起点被推到 {@code size} → 整段历史一条都不进上下文，用户看到模型「突然失忆」。
-     * 夹下限后窗口至少保留最近 {@code minKeepMessages} 条，退化为「上下文略超预算」而非「完全没有上下文」。
-     * <p>
-     * 该函数被 {@link #get} 与 {@code MemoryMergeService} 共用（同一函数 + 同一份 {@link MemoryProperties}），
-     * 两处必须一致，否则「被摘要掉的区间」会与实际窗口错位（记忆重复或静默丢失）。函数值对 {@code size}
-     * 单调不减，保证随历史增长窗口起点只前进不后退（合并侧的 summarizedCount 水位依赖此性质）。
+     * 红线：① 下限是<b>关键防线</b> —— 若最新一条消息自己就超过预算（如上一轮是上万字符的数据表回复），第一次累加
+     * 就越界、起点被推到 {@code size}，整段历史一条都不进上下文，用户看到模型「突然失忆」；夹下限后窗口至少保留
+     * 最近 {@code minKeepMessages} 条，退化为「上下文略超预算」而非「完全没有上下文」。② 本函数被 {@link #get} 与
+     * {@code MemoryMergeService} <b>共用，两处必须一致</b>，否则「被摘要掉的区间」会与实际窗口错位（记忆重复或静默
+     * 丢失）。③ 函数值对 {@code size} 单调不减，保证随历史增长窗口起点只前进不后退（合并侧的 summarizedCount
+     * 水位依赖此性质）。
      *
      * @param history 按时间正序的消息列表（可空）
      * @return 窗口起点索引（含）；0 表示全部历史都在窗口内

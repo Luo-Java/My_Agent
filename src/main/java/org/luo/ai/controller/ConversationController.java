@@ -49,30 +49,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 会话管理接口（与对话业务分离，send/stream 见 ChatController）。
+ * 会话管理接口（send/stream 见 ChatController）。基础：{@code /api/chat/conversation[/{id}]}、
+ * {@code …/{id}/planner|planner-confirm|rag|review|cross-session}、{@code /api/chat/conversations}、{@code /api/chat/history}。
+ * 扩展：{@code …/{id}/branch|turn}（消息重做，多版本并存）、{@code …/{id}/export}（回 Markdown 由前端拼 Blob ——
+ * 裸链接带不上 {@code Authorization}）、{@code …/{id}/memory} 与 {@code …/{id}/facts[/{factId}]}（长期记忆查看/编辑）、
+ * {@code …/message/{messageId}/memory-excluded}（单条不参与记忆：不进上下文与摘要，但<b>历史里照常可见</b>）。
  * <p>
- * 基础：POST/PUT/DELETE /api/chat/conversation[/{id}]、PUT …/{id}/planner、PUT …/{id}/planner-confirm、
- * PUT …/{id}/rag、PUT …/{id}/review、PUT …/{id}/cross-session、GET /api/chat/conversations、GET /api/chat/history。
- * <p>
- * <b>四个会话级开关</b>（RAG / 规划 / 评审 / 跨会话）都是「纯布尔偏好」，拨动即写回会话，刷新后保持：
- * 其中 <b>规划与评审互斥</b>（都是编排形态），开启任一方会自动关掉另一方。
- * <p>
- * 扩展三组：
- * <ul>
- *   <li><b>消息重做</b>：POST …/{id}/branch 开新版本 + POST …/{id}/turn 切换版本 —— 编辑重发 / 重新生成
- *       不再删掉旧的那一轮，而是让多个版本原地并存（消息上「1/2 ‹ ›」）。重发本身仍走
- *       {@code /api/chat/stream}，故不需要第二套执行逻辑；</li>
- *   <li><b>导出</b>：GET …/{id}/export —— 回 Markdown 文本，由前端拼 Blob 下载（裸链接带不上
- *       {@code Authorization}）；</li>
- *   <li><b>长期记忆</b>：GET/PUT/DELETE …/{id}/memory —— 把此前全黑盒的逐条事实 / 归档 / 摘要摊开给用户看与改；
- *       同一个 GET 还回「当前记忆窗口构成」（哪些历史会被注入），与追踪弹窗的「本轮注入」互为印证；
- *       逐条事实另有 POST / PUT / DELETE …/{id}/facts[/{factId}] 三个端点（功能 E）；</li>
- *   <li><b>记忆参与</b>：PUT …/message/{messageId}/memory-excluded —— 单条开关「不参与记忆」：不进上下文、
- *       不进摘要，但<b>历史里照常可见</b>（「不进记忆」不等于「删掉」）。</li>
- * </ul>
- * <p>
- * <b>会话按用户隔离</b>：每个端点先经 {@link AuthContext#require()} 取当前登录用户，所有读写都带该用户；
- * 列表只回本人会话，操作他人会话一律 404（与「不存在」不可区分）。
+ * 红线：四个会话级开关（RAG / 规划 / 评审 / 跨会话）都是纯布尔偏好，拨动即写回；<b>规划与评审互斥</b>（同为编排形态），
+ * 开一个自动关另一个。会话按用户隔离：先取 {@link AuthContext#require()}，列表只回本人会话，操作他人会话一律 404
+ * （与「不存在」不可区分）。
  */
 @RestController
 @RequestMapping("/api/chat")

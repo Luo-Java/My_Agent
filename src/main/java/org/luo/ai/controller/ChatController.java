@@ -57,34 +57,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 对话接口（与会话管理业务分离，后者见 ConversationController）。
+ * 对话接口（会话管理见 ConversationController）。端点：{@code /send} 同步、{@code /stream} SSE 流式、
+ * {@code /task/{resume,running,step,step/skip,approve,cancel,pause,replan}} 与 {@code /task/template/**} 规划任务运维。
  * <p>
- * POST /api/chat/send   - 同步返回完整回复；POST /api/chat/stream - SSE 流式返回；
- * POST /api/chat/task/resume - SSE 流式续跑未完成任务；GET /api/chat/task/running - 查询当前会话的未完成任务；
- * PUT  /api/chat/task/step   - 就地编辑待确认计划中尚未执行的某一步（智能体 / 指令 / 依赖 / 审批标记）；
- * POST /api/chat/task/approve - 批准「待审批步骤」（写标记，随后由前端走 resume 继续执行）；
- * POST /api/chat/task/cancel - 终止当前会话未完成的任务（RUNNING → CANCELLED，剩余步骤不再执行）；
- * POST /api/chat/task/pause  - 请求暂停正在执行的计划（执行循环在下一个层边界停止推进；任务仍 RUNNING）；
- * POST /api/chat/task/step/skip - 人工跳过某一步（PENDING / FAILED → SKIPPED），越过反复失败的步骤继续跑；
- * POST /api/chat/task/replan - 局部重规划：只重排第一个未成功步骤及其之后的一段；
- * GET/POST/DELETE /api/chat/task/template/** - 规划模板：列表 / 存为模板 / 套用 / 删除（按用户隔离）。
- * <p>
- * <b>成本配额闸门</b>：{@code /send}、{@code /stream}、{@code /task/resume} 三个「会花 token 的入口」在开跑前
- * 检查当前用户的当日用量（{@link org.luo.ai.service.QuotaService}）；超限时<b>明确报错、不静默降级</b>——
- * 同步接口抛业务异常，流式接口推一条 {@code error} 事件（前端红字展示）。
- * <p>
- * <b>内容安全护栏（输入侧）</b>：{@code /send} 与 {@code /stream} 在模型调用前过一遍
- * {@link org.luo.ai.service.ContentSafetyService#checkInput}，命中即拒绝（422 / {@code error} 事件），
- * <b>本轮零模型调用</b>，绝不「悄悄过滤掉敏感词再问模型」。默认关闭（{@code agent.safety.enabled=false}）。
- * <p>
- * <b>传输层兜底</b>（与业务无关，纯防连接被静默挂死）：有限超时（{@code app.sse.timeout-seconds}，默认 300s，
- * 不用 {@code 0L} 永不超时——上游卡死会让连接与异步线程永久泄漏）；心跳（{@code app.sse.heartbeat-seconds}，
- * 默认 15s）——前置链（路由→参数抽取→改写→检索）期间无字节流出，反向代理会当空闲切断长连接，
- * 周期发 {@link StreamEvent#ping()} 保活。
- * <p>
- * <b>会话按用户隔离</b>：用户在 <b>HTTP 线程</b>取出（{@link AuthContext#require()}）后作为参数向下传 ——
- * 流式执行体跑在弹性线程上，ThreadLocal 在那里已经失效，不能在异步链路里再读。越权会话在 HTTP 线程
- * 就被 {@link ConversationService#checkAccess} 挡成 404，而不是退化成 SSE 里的一条 error 事件。
+ * 红线：{@code /send}、{@code /stream}、{@code /task/resume} 三个花钱入口先过当日配额闸门
+ * （{@link org.luo.ai.service.QuotaService}）与输入侧护栏（{@link org.luo.ai.service.ContentSafetyService#checkInput}），
+ * 超限 / 命中<b>明确报错、不静默降级</b>。SSE 必须有有限超时（<b>不要 0L 永不超时</b>：上游卡死会让连接与异步线程
+ * 永久泄漏）+ 心跳保活前置链静默期。身份在 <b>HTTP 线程</b>取出（{@link AuthContext#require()}）后当参数往下传，
+ * 越权会话在此处就被 {@link ConversationService#checkAccess} 挡成 404，而不是退化成 SSE 里的一条 error 事件。
  */
 @RestController
 @RequestMapping("/api/chat")

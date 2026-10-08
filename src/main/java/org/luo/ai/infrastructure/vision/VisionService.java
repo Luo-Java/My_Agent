@@ -31,32 +31,14 @@ import java.util.concurrent.TimeoutException;
 import org.luo.ai.controller.ChatController;
 
 /**
- * 多模态视觉识别服务：把图片转成文本描述（caption），供 ChatRequest.attachments 注入对话。
+ * 多模态视觉识别服务：把图片转成文本描述（caption），供 {@code ChatRequest.attachments} 注入对话。
+ * 用<b>裸 {@link ChatModel}</b> + per-request {@link OpenAiChatOptions} 覆盖视觉模型，绕开 advisor 与记忆
+ * （同步、单轮、无状态，不应污染会话记忆），也不动 yaml 里的主对话模型。
  * <p>
- * 采用 <b>Spring AI 原生多模态</b>：注入裸 {@link ChatModel} 直接 {@code call(Prompt)}，图片由
- * {@code UserMessage.builder().media(Media)} 承载，per-request {@link OpenAiChatOptions} 覆盖为视觉模型
- * （{@code agent.vision.model}，默认 {@link VisionProperties#DEFAULT_MODEL}）。
- * <p>
- * <b>为什么注入裸 ChatModel</b>（与 AgentRouter / MemoryMergeService / ParamFillingService / PromptService
- * 同一模式）：绕开 advisor 与记忆机制（视觉识别是同步、单轮、无状态的独立调用，不应污染会话记忆）；
- * per-request 覆盖 model，不动 yaml 里主对话模型，避免文本模型换视觉模型的兼容风险。
- * <p>
- * <b>并发 + 逐图调用</b>：多图在 {@code visionExecutor} 上并发执行（每图一次独立调用），结果按入参顺序回收，
- * 与 files <b>1:1 对齐</b>；单图失败/超时只影响该图（占位 caption），不抛错给调用方。
- * <p>
- * <b>为什么不是「一次请求传多图」</b>（设计决策，勿顺手改）：一次请求只返回一段合并文本，会丢失
- * 「哪段描述来自哪张图」的归属——而下游 {@link ChatController} 按
- * {@code 图片N（文件名）：caption} 逐条带标注抽取（如「工资条」与「聊天记录」需区分各自内容）。
- * 逐图调用保住了归属标注与单图失败隔离；延迟由并发压平（N×t → ≈t），每图同样只传一次、仅短指令重复 N 遍。
- * 仅当未来需要<b>跨图联合对比</b>时才应改为合并调用。
- * <p>
- * <b>两条消费路径，失败语义刻意不同</b>（见 {@link #describeAll} 与 {@link #describeStrict}）：
- * <ul>
- *   <li><b>对话附件</b>（{@link #describeAll}）：caption 仅当轮注入上下文，不写 chat_message、不入 kb_chunk。
- *       单图失败降级为占位文本 —— 一张图没认出来不该让整轮对话失败。</li>
- *   <li><b>知识库入库</b>（{@link #describeStrict}）：caption 会被切块写进 kb_chunk、长期参与检索。
- *       失败直接抛错 —— 把占位文本当知识存进去，等于往检索结果里灌噪声。</li>
- * </ul>
+ * 红线：<b>逐图调用，不能合并成「一次请求传多图」</b> —— 合并会丢失「哪段描述来自哪张图」的归属，而下游按
+ * {@code 图片N（文件名）：caption} 抽取。多图在 {@code visionExecutor} 上并发（N×t → ≈t），结果按入参顺序 1:1 回收。
+ * 两条消费路径失败语义刻意不同：{@link #describeAll}（对话附件）单图失败降级为占位文本、不拖垮整轮；
+ * {@link #describeStrict}（知识库入库）失败直接抛错 —— 占位文本当知识存进去等于往检索结果里灌噪声。
  */
 @Slf4j
 @Service

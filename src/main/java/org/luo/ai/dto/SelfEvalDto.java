@@ -11,11 +11,10 @@ import java.util.List;
 /**
  * 一轮回答的自评结果（追踪详情 / 低分轮次视图）。
  * <p>
- * <b>{@code score} 与其余明细来源不同</b>：{@code score} 取自 {@code agent_trace.self_eval_score} 这一列
- * （独立的列，面板要按它过滤与聚合，JSON 里解析不出索引），其余字段取自 {@code self_eval_json}。因此当
- * JSON 不可读时仍会有一个可信的分数、而明细为空 —— 那时 {@code answered} / {@code grounded} 是
- * <b>{@code null} 而不是 {@code false}</b>：「明细缺失」与「模型明确说没答到点上」是两件事，
- * 用 {@code false} 顶替会把后者（一个真实结论）凭空造出来。
+ * 红线：{@code score} 与其余明细<b>来源不同</b> —— score 取自 {@code agent_trace.self_eval_score} 列（面板要按它
+ * 过滤与聚合，JSON 里解析不出索引），其余取自 {@code self_eval_json}。故 JSON 不可读时仍有一个可信分数、明细为空，
+ * 那时 {@code answered} / {@code grounded} 是 <b>null 而不是 false</b>：「明细缺失」与「模型明确说没答到点上」
+ * 是两件事，用 false 顶替会把后者（一个真实结论）凭空造出来。
  *
  * @param score    1~5 的自评分（来自列，恒有值）
  * @param answered 明细里的「是否回答了用户的问题」；null = 明细不可读
@@ -23,7 +22,7 @@ import java.util.List;
  * @param issues   问题短语（最多 3 条，可能为空表）
  * @param comment  模型给的一句话说明
  * @param trigger  触发来源：{@code SAMPLE}=按比例抽检，{@code FEEDBACK}=用户点踩强制
- * @param at       自评发生时间（ISO 字符串；相对那一轮本身是后补的，故单独记）
+ * @param at       自评发生时间（ISO 字符串；相对那一轮是后补的，故单独记）
  */
 public record SelfEvalDto(int score, Boolean answered, Boolean grounded, List<String> issues,
                           String comment, String trigger, String at) {

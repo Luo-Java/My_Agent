@@ -8,14 +8,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 一条 RAG 引用来源（知识块级溯源），只服务「展示」：让用户看到回答里的 {@code [1]} 角标来自哪个库的
- * 哪个文件，从而把「模型自己编的」与「文档里写的」区分开。
+ * 一条 RAG 引用来源（知识块级溯源），只服务「展示」：让用户看到回答里的 {@code [1]} 角标来自哪个库的哪个文件，
+ * 从而把「模型自己编的」与「文档里写的」区分开。
  * <p>
- * 生命周期与附件元数据同构——落库在独立列 {@code chat_message.citations_json}（仅 assistant 消息），
+ * 生命周期与附件元数据同构 —— 落库在独立列 {@code chat_message.citations_json}（仅 assistant 消息），
  * <b>不参与记忆读取</b>（DbChatMemory.get 只读 content），对 LLM 上下文与 token 零影响。
- * <p>
- * 序列化 / 反序列化收在本记录里（{@link #toJson}/{@link #parse}）：同一份 JSON 有三处消费方——历史展示、
- * agent_trace 可观测、SSE citations 事件实时展示，放一处才能保证三处格式永远一致。JSON 用 Hutool（不用 Jackson）。
+ * 序列化 / 反序列化收在本记录里（{@link #toJson}/{@link #parse}）：同一份 JSON 有三处消费方（历史展示、
+ * agent_trace 可观测、SSE citations 事件），放一处才能保证三处格式永远一致。JSON 用 Hutool。
  *
  * @param index   引用序号（从 1 开始，与正文 [n] 角标、资料块 [n] 行首编号一致）
  * @param chunkId 命中的知识块 ID（kb_chunk.id）

@@ -24,19 +24,14 @@ import java.util.Set;
 /**
  * 会话长期事实条目服务：逐条事实的读写、注入文本渲染，以及「按一次合并产出重写自动条目」。
  * <p>
- * <b>职责边界</b>：本类只碰 {@code conversation_fact} 一张表，<b>不做归属校验</b> —— 校验由 Controller 调
- * {@code ConversationService.requireOwned} 完成，再按 conversationId 调进来。原因是依赖方向：
- * {@code ConversationService} 需要在「重置记忆 / 清空消息 / 删会话」时清理条目（见其
- * {@code resetMemoryWatermark}），若本类反过来依赖它就会成环。会话归属已是 Controller 那一层的既有职责
- * （{@code GET /memory}、{@code GET /export} 都是同样的形状）。
+ * <b>职责边界</b>：本类只碰 {@code conversation_fact} 一张表、<b>不做归属校验</b> —— 校验由 Controller 调
+ * {@code ConversationService.requireOwned} 完成后按 conversationId 调进来。原因是依赖方向：
+ * {@code ConversationService} 需要在「重置记忆 / 清空消息 / 删会话」时清理条目，若本类反过来依赖它就会成环。
  * <p>
- * <b>两条来源的待遇差异是本类的核心不变量</b>：
- * <ul>
- *   <li>{@link ConversationFact#SOURCE_MERGE}：每次合并按 diff 重写 —— 模型这次没输出的条目视为过时并删除
- *       （这是淘汰旧事实的<b>唯一</b>通路，见 {@link #merge}）；</li>
- *   <li>{@link ConversationFact#SOURCE_USER}：<b>合并绝不覆盖也绝不删除</b>。用户明确写下的东西不该被
- *       一次自动整理悄悄抹掉；同理，用户手改过的条目会从 MERGE <b>转为</b> USER（见 {@link #update}）。</li>
- * </ul>
+ * 红线（本类核心不变量）：两种来源待遇不同 —— {@code SOURCE_MERGE} 每次合并按 diff 重写，<b>模型这次没输出的
+ * 条目视为过时并删除</b>（这是淘汰旧事实的唯一通路，见 {@link #merge}）；{@code SOURCE_USER} <b>绝不覆盖也绝不
+ * 删除</b>（用户明确写下的东西不该被一次自动整理悄悄抹掉），且用户手改过的条目会从 MERGE <b>转为</b> USER
+ * （见 {@link #update}）。
  */
 @Slf4j
 @Service

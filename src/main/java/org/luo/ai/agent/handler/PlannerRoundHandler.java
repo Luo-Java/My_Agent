@@ -31,28 +31,16 @@ import java.util.function.Consumer;
 import org.luo.ai.service.KbSearchService;
 
 /**
- * 规划模式会话策略：动态规划器（PlannerService）在运行时根据用户目标产出多智能体步骤，再顺序执行
- * （前一步输出作为后一步输入）；不预配置步骤、不追问参数。
+ * 规划模式会话策略：动态规划器（PlannerService）运行时按用户目标产出多智能体步骤，再顺序执行
+ * （前一步输出作后一步输入）；不预配置步骤、不追问参数。
  * <p>
- * 与普通对话策略的关键差异在<b>记忆写入契约</b>：本策略全程用无记忆的
- * {@link ChatComposer#internalChatClient()}（避免「指令+上一步输出」这类合成串污染历史），
- * 回复产出后由 {@link #savePlannerExchange} 显式补写「用户原话 → 最终回复」整对。
- * 执行过程经 {@code progress} 回调实时播报，<b>只用于展示、不写入记忆</b>。
- * <p>
- * <b>RAG 引用只取最后一步</b>：每步各自检索、各自从 [1] 编号，跨步合并会出现重复序号、与最终回答角标对不上。
- * <p>
- * <b>跨轮任务状态持久化</b>：一轮规划落库为一条 {@code task} + 若干 {@code task_step}，每步执行完即增量提交
- * 状态与产出（{@link TaskService}），服务重启 / 中断后可由 {@link #resumeTask} 显式续跑剩余步骤（不重新规划）。
- * 单会话单 RUNNING 任务，开新规划前自动结旧（见 {@link TaskService#cancelRunning}）。
- * <p>
- * <b>前驱产出有配额上限</b>：步骤间产物传递经 {@link #truncateUpstream} 按 {@link PlannerProperties} 的配额截断，
- * 超额保留前段 + 显式省略标注 + WARN。配额只作用于「注入下一步的输入」，不影响 {@code task_step.output} 落库
- * 与最终回复——用户看到的始终是完整产出。
- * <p>
- * <b>审批关卡</b>：步骤可带 {@code approvalRequired} 标记（计划卡片上勾选）；执行到「需审批且未批准」的一步时
- * <b>整条流水线暂停</b>（本层其余步骤也不跑，剩余步骤保持 {@code PENDING}、task 保持 {@code RUNNING}），
- * 暂停信息经 {@code approval} 事件推给前端渲染审批卡片。用户批准后走的就是 {@link #resumeTask} —— 与「先看计划」、
- * 「局部重规划」、「套用模板」共用同一条执行通路，因此这里同样<b>不需要第二套执行逻辑</b>。
+ * 红线：全程用无记忆的 {@link ChatComposer#internalChatClient()}（避免「指令+上一步输出」这类合成串污染历史），
+ * 回复后由 {@link #savePlannerExchange} 显式补写「用户原话 → 最终回复」整对；{@code progress} 只展示、不写记忆。
+ * RAG 引用<b>只取最后一步</b>（每步各自从 [1] 编号，跨步合并会出现重复序号、与最终回答角标对不上）。
+ * 一轮规划落库为一条 {@code task} + 若干 {@code task_step}，每步完即增量提交，重启后可经 {@link #resumeTask} 续跑
+ * （<b>不重新规划</b>）；单会话单 RUNNING，开新规划前自动结旧（{@link TaskService#cancelRunning}）。
+ * 审批关卡：{@code approvalRequired=1} 且未批准时整条流水线暂停（本层其余也不跑，剩余 PENDING、task 仍 RUNNING），
+ * 批准后走的还是 {@link #resumeTask} —— 与「先看计划」「局部重规划」「套用模板」共用同一条通路，<b>无第二套执行逻辑</b>。
  */
 @Slf4j
 @Service
@@ -121,15 +109,13 @@ public class PlannerRoundHandler implements RoundHandler {
     }
 
     /**
-     * 规划模式会话处理：规划为空或计划中的智能体全不存在 → 回退通用助手直接回答（走带记忆的 chatClient，
-     * 记忆由 Advisor 自动落库）；否则顺序执行 spec，记忆由 {@link #savePlannerExchange} 统一补写。
+     * 规划模式会话处理：规划为空或计划中的智能体全不存在 → 回退通用助手直接回答（走带记忆的 chatClient，记忆由
+     * Advisor 自动落库）；否则顺序执行 spec，记忆由 {@link #savePlannerExchange} 统一补写。
      * <p>
-     * 本方法<b>不写记忆</b>：是否需显式落库由返回值的 {@code needSaveExchange} 告知调用方。
-     * <p>
-     * 有可执行计划时，先把计划落库为 task + task_step（开新任务前自动结旧），再执行并逐步提交状态。
-     * <p>
-     * 会话开启「先看计划」（{@code conversation.planner_confirm}）时<b>只落库、不执行</b>：本轮返回计划清单，
-     * 计划留在 RUNNING/PENDING 由用户在卡片上确认后走续跑通路执行（见 {@link #resumeTask}）。
+     * 红线：① 本方法<b>不写记忆</b> —— 是否需显式落库由返回值的 {@code needSaveExchange} 告知调用方。
+     * ② 有可执行计划时，先把计划落库为 task + task_step（开新任务前自动结旧），再执行并逐步提交状态。
+     * ③ 会话开启「先看计划」（{@code conversation.planner_confirm}）时<b>只落库、不执行</b>：本轮返回计划清单，
+     * 计划留在 RUNNING/PENDING，由用户在卡片上确认后走续跑通路执行（见 {@link #resumeTask}）。
      *
      * @param progress 进度回调（流式接口传事件推送，同步接口传空回调）
      * @param trace    本轮追踪上下文（可为 null）：记录计划与最终处理方
@@ -427,15 +413,13 @@ public class PlannerRoundHandler implements RoundHandler {
 
     /**
      * 套用规划模板：把模板的步骤骨架落库成该会话的新任务，<b>不执行</b>。
+     * 三条通路的关系说清楚，避免以后各写一套：套用<b>只做「落库」这一件事</b>，用户随后点「执行计划」走的仍是
+     * {@link #resumeTask}（落库的步骤就是执行侧要读的那份，所以不需要第二套执行逻辑）；与首次规划（→
+     * {@code persistPlan}）的唯一区别是<b>步骤从哪来</b> —— 一个来自模型，一个来自模板。
      * <p>
-     * 与另外两条通路的关系说清楚，避免以后各写一套：套用<b>只做「落库」这一件事</b>，用户随后点「执行计划」
-     * 走的仍是 {@link #resumeTask}（落库的步骤就是执行侧要读的那份，所以不需要第二套执行逻辑）；
-     * 与首次规划（{@link #handlePlannerConversation} → {@code persistPlan}）的唯一区别是<b>步骤从哪来</b> ——
-     * 一个来自模型，一个来自模板。
-     * <p>
-     * <b>刻意不校验智能体是否存在</b>：模板记的是 {@code agentCode}，智能体可能事后被改名或删除。这里照落即可，
-     * 执行侧对「agent 不存在」已有明确处理（标 {@code SKIPPED} 并向用户播报，见 {@link #resumeTask}）；
-     * 在此再加一道校验只会多出一处会漏的边界，也拦不住「套用时尚在、执行时已删」的竞态。
+     * 红线：<b>刻意不校验智能体是否存在</b> —— 模板记的是 {@code agentCode}，智能体可能事后被改名或删除；这里照落即可，
+     * 执行侧对「agent 不存在」已有明确处理（标 {@code SKIPPED} 并向用户播报）。在此再加一道校验只会多出一处会漏的
+     * 边界，也拦不住「套用时尚在、执行时已删」的竞态。
      *
      * @param tpl 模板（归属校验已由调用方完成）
      * @return 计划 JSON（与 {@code plan} 事件同构，前端按同一套渲染）+ 文案；模板无可用步骤时返回 null
@@ -535,18 +519,16 @@ public class PlannerRoundHandler implements RoundHandler {
     }
 
     /**
-     * 分层并行执行的统一实现：{@code preOutputs/preDone/preCitations} 为已回填状态（续跑时传入，首次执行传
-     * null），其余步骤（未 done）按拓扑分层并行执行并逐步落库。
-     * <ul>
-     *   <li>分层推进：每轮找出「依赖均已满足」的未执行步骤，用 {@code CompletableFuture} 并行执行；</li>
-     *   <li>输入构造：第 1 层（无依赖）输入 = 用户原始目标 + 附件（若有）；有依赖的步骤输入 = 其指令 +
-     *       {@code dependsOn} 指向的前驱输出（多个前驱按序拼接）；</li>
-     *   <li>所有步骤均用无记忆 ChatClient（中间产物不写历史）；最后一个完成层注入近期窗口历史；</li>
-     *   <li>某步骤失败/返回空则其输出记为 null，依赖它的步骤回落原始目标作答；全部失败返回 null；</li>
-     *   <li>防御：依赖下标非法（越界 / 指向自身或后序）按「无依赖」处理；若某层无步骤可推进（依赖环）则断环跳出。</li>
-     *   <li><b>审批闸门</b>：本层只要有一步「{@code approvalRequired} 且未 {@code approved}」，<b>整条流水线</b>
-     *       在此暂停（本层其余可执行步骤也不跑），返回 {@code pausedAt} 指向该步；剩余步骤保持未执行。</li>
-     * </ul>
+     * 分层并行执行的统一实现：{@code preOutputs/preDone/preCitations} 为已回填状态（续跑时传入，首次执行传 null），
+     * 其余未 done 的步骤按拓扑分层并行执行并逐步落库。
+     * 每轮找出「依赖均已满足」的未执行步骤，用 {@code CompletableFuture} 并行执行；第 1 层（无依赖）输入 = 用户原始
+     * 目标 + 附件，有依赖的步骤输入 = 其指令 + {@code dependsOn} 指向的前驱输出（多个按序拼接）；全程用无记忆
+     * ChatClient（中间产物不写历史），最后一个完成层注入近期窗口历史；某步失败 / 返回空则其输出记为 null、依赖它的
+     * 步骤回落原始目标作答，全部失败返回 null。
+     * <p>
+     * 红线：① 依赖下标非法（越界 / 指向自身或后序）按「无依赖」处理；某层无步骤可推进（依赖环）则断环跳出。
+     * ② <b>审批闸门</b>：本层只要有一步「{@code approvalRequired} 且未 {@code approved}」，<b>整条流水线</b>在此暂停
+     * （本层其余可执行步骤也不跑），返回 {@code pausedAt} 指向该步，剩余步骤保持未执行。
      *
      * @param gate 审批闸门（null = 全部步骤都无需审批）；暂停判定的唯一依据
      */
