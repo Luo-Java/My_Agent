@@ -42,6 +42,7 @@
         <nav class="um-tabs">
             <button class="um-tab" :class="{ 'is-active': tab === 'user' }" @click="switchTab('user')">用户管理</button>
             <button class="um-tab" :class="{ 'is-active': tab === 'role' }" @click="switchTab('role')">角色管理</button>
+            <button class="um-tab" :class="{ 'is-active': tab === 'audit' }" @click="switchTab('audit')">操作审计</button>
         </nav>
 
         <main class="um-main">
@@ -179,6 +180,69 @@
                     <span>第 <b class="um-pager-num">{{ rolePage }}</b> / {{ rolePages }} 页</span>
                     <button class="um-pager-btn" :disabled="rolePage >= rolePages" @click="loadRoles(rolePage + 1)">下一页</button>
                     <select class="um-select" v-model.number="roleSize" @change="loadRoles(1)">
+                        <option :value="10">10 条/页</option>
+                        <option :value="20">20 条/页</option>
+                        <option :value="50">50 条/页</option>
+                    </select>
+                </div>
+            </section>
+
+            <!-- ==================== 操作审计 ==================== -->
+            <section v-show="tab === 'audit'" class="um-panel">
+                <div class="um-panel-head">
+                    <span class="um-panel-title">操作审计</span>
+                    <!-- 只增不改：这一点必须在界面上讲清楚，否则会被当成「为什么不能删旧记录」的缺陷 -->
+                    <span class="um-panel-hint">只读留痕，不提供修改/删除；明细中的手机号、证件号等已脱敏</span>
+                </div>
+
+                <div class="um-search">
+                    <select class="um-select" v-model="auditQuery.action" @change="loadAudit(1)">
+                        <option value="">全部动作</option>
+                        <option v-for="a in auditActions" :key="a.value" :value="a.value">{{ a.label }}</option>
+                    </select>
+                    <button class="um-btn" @click="loadAudit(1)">查询</button>
+                    <button class="um-btn" @click="resetAuditQuery">重置</button>
+                </div>
+
+                <div class="um-table-wrap">
+                    <table class="um-table">
+                        <thead>
+                        <tr>
+                            <th class="um-col-no">序号</th>
+                            <th class="um-col-time">时间</th>
+                            <th>操作者</th>
+                            <th>动作</th>
+                            <th>对象</th>
+                            <th>明细</th>
+                            <th>来源 IP</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr v-for="(row, i) in auditRows" :key="row.id">
+                            <td class="um-col-no">{{ rowNo(i, auditPage, auditSize) }}</td>
+                            <td class="um-col-time">{{ fmtTime(row.createdAt) }}</td>
+                            <td>{{ row.username || (row.userId ? ('#' + row.userId) : '系统') }}</td>
+                            <td><span class="um-tag is-action">{{ auditActionLabel(row.action) }}</span></td>
+                            <td>
+                                <span class="um-target">{{ row.targetType || '—' }}</span>
+                                <span v-if="row.targetId" class="um-target-id">#{{ row.targetId }}</span>
+                            </td>
+                            <td class="um-detail">{{ row.detail || '—' }}</td>
+                            <td class="um-col-ip">{{ row.ip || '—' }}</td>
+                        </tr>
+                        <tr v-if="!auditLoading && !auditRows.length">
+                            <td class="um-empty" colspan="7">暂无审计记录</td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="um-pager">
+                    <span>共 <b class="um-pager-num">{{ auditTotal }}</b> 条</span>
+                    <button class="um-pager-btn" :disabled="auditPage <= 1" @click="loadAudit(auditPage - 1)">上一页</button>
+                    <span>第 <b class="um-pager-num">{{ auditPage }}</b> / {{ auditPages }} 页</span>
+                    <button class="um-pager-btn" :disabled="auditPage >= auditPages" @click="loadAudit(auditPage + 1)">下一页</button>
+                    <select class="um-select" v-model.number="auditSize" @change="loadAudit(1)">
                         <option :value="10">10 条/页</option>
                         <option :value="20">20 条/页</option>
                         <option :value="50">50 条/页</option>

@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.common.result.PageResult;
+import org.luo.system.constant.AuditAction;
 import org.luo.system.constant.SysRoleCode;
 import org.luo.system.dto.SaveUserRequest;
 import org.luo.system.dto.SysUserDTO;
@@ -22,12 +23,15 @@ import org.luo.system.mapper.SysUserRoleMapper;
 import org.luo.system.security.AuthContext;
 import org.luo.system.security.LoginUser;
 import org.luo.system.security.PasswordHasher;
+import org.luo.system.service.AuditService;
 import org.luo.system.service.SysRoleService;
 import org.luo.system.service.SysUserService;
 import org.luo.system.vo.SysUserVO;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -60,6 +64,10 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
 
     @Resource
     private SysUserRoleMapper userRoleMapper;
+
+    /** 管理操作审计：本类的四个写方法（增 / 改 / 删 / 改口令）都是权限相关动作，逐条留痕。 */
+    @Resource
+    private AuditService auditService;
 
     // ==================== 查询 ====================
 
@@ -144,20 +152,32 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
 
         replaceRoles(user.getId(), roleIds);
         log.info("新增用户：{}（id={}），角色={}", username, user.getId(), roleIds);
+        auditService.record(AuditAction.CREATE_USER, AuditAction.TARGET_USER, user.getId(),
+                String.format("新增用户 %s；状态 %s；角色 %s",
+                        username, statusText(user.getStatus()), roleIdsText(roleIds)));
         return detail(user.getId());
     }
 
     @Override
     public SysUserVO updateUser(UpdateUserRequest req) {
         SysUser exist = requireUser(req.getId());
-        int newStatus = req.getStatus() == null ? defaultStatus(exist.getStatus()) : requireStatus(req.getStatus());
-        List<Long> newRoleIds = req.getRoleIds() == null ? roleIdsOfUser(exist.getId()) : distinctRoleIds(req.getRoleIds());
+        // 旧值必须先取：下面会把新值写进实体，之后就拿不到「改前是什么」了 —— 而审计的全部价值就在这个对比
+        int oldStatus = defaultStatus(exist.getStatus());
+        List<Long> oldRoleIds = roleIdsOfUser(exist.getId());
+        int newStatus = req.getStatus() == null ? oldStatus : requireStatus(req.getStatus());
+        List<Long> newRoleIds = req.getRoleIds() == null ? oldRoleIds : distinctRoleIds(req.getRoleIds());
 
         LoginUser current = AuthContext.get();
         if (current != null && current.id().equals(exist.getId()) && newStatus != 1) {
             throw new AiBusinessException(AiErrorCode.CONFLICT, "不能停用当前登录的账号");
         }
-        if (newStatus != 1 || !newRoleIds.contains(adminRoleId())) {
+        // ADMIN 角色不存在时（被删）不能做 contains 判定：newRoleIds 的兜底值是 List.of()，
+        // 而 JDK 的 List.of().contains(null) 直接抛 NPE（ArrayList/Stream.toList 返回 false 不抛）。
+        // 此时语义上「没有 ADMIN 可摘」⇒ 无需校验，直接放行，与 assertAdminRemains 的 null 早退一致。
+        Long adminId = adminRoleId();
+        if (adminId == null) {
+            assertAdminRemains(exist.getId());
+        } else if (newStatus != 1 || !newRoleIds.contains(adminId)) {
             assertAdminRemains(exist.getId());
         }
 
@@ -171,6 +191,8 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
             replaceRoles(exist.getId(), newRoleIds);
         }
         log.info("更新用户：{}（id={}），状态={}，角色={}", exist.getUsername(), exist.getId(), newStatus, newRoleIds);
+        auditService.record(AuditAction.UPDATE_USER, AuditAction.TARGET_USER, exist.getId(),
+                updateDetail(oldStatus, newStatus, oldRoleIds, newRoleIds, exist));
         return detail(exist.getId());
     }
 
@@ -188,6 +210,8 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
         userRoleMapper.delete(new LambdaQueryWrapper<SysUserRole>().eq(SysUserRole::getUserId, id));
         baseMapper.deleteById(id);
         log.info("删除用户：{}（id={}）", exist.getUsername(), id);
+        auditService.record(AuditAction.DELETE_USER, AuditAction.TARGET_USER, id,
+                "删除用户 " + exist.getUsername() + "（连同其角色关联）");
     }
 
     @Override
@@ -199,6 +223,9 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
                 .set(SysUser::getPassword, hashed)
                 .set(SysUser::getUpdatedAt, LocalDateTime.now()));
         log.info("更新口令：{}（id={}）", exist.getUsername(), userId);
+        // 口令本身绝不进明细：审计表要能公开查（ADMIN 面板），口令一旦落进去就是新的泄露面
+        auditService.record(AuditAction.UPDATE_PASSWORD, AuditAction.TARGET_USER, userId,
+                "更新口令：" + exist.getUsername());
     }
 
     @Override
@@ -210,6 +237,48 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
     }
 
     // ==================== 内部辅助 ====================
+
+    /** 状态码的可读文案（审计明细用，与界面口径一致）。 */
+    private static String statusText(int status) {
+        return status == 1 ? "启用" : "停用";
+    }
+
+    /**
+     * 角色 ID 列表的可读文案。<b>输出前排序</b>：两个列表只要元素集合相同就该被判定为「没变」，
+     * 而 SQL 返回的顺序不保证稳定 —— 不排序会让「只是顺序变了」被记成一次角色变更。
+     */
+    private static String roleIdsText(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return "无";
+        }
+        List<Long> sorted = new ArrayList<>(ids);
+        sorted.sort(Comparator.naturalOrder());
+        return sorted.toString();
+    }
+
+    /**
+     * 拼「修改用户」的审计明细：只写<b>真的变了</b>的项。
+     * 全量罗列会让明细里塞满无变化的噪声 —— 审计要的是一眼看出「这次改动到底动了什么」。
+     */
+    private static String updateDetail(int oldStatus, int newStatus, List<Long> oldRoleIds,
+                                       List<Long> newRoleIds, SysUser after) {
+        StringBuilder d = new StringBuilder();
+        if (oldStatus != newStatus) {
+            d.append("状态 ").append(statusText(oldStatus)).append("→").append(statusText(newStatus)).append("；");
+        }
+        String before = roleIdsText(oldRoleIds);
+        String now = roleIdsText(newRoleIds);
+        if (!before.equals(now)) {
+            d.append("角色 ").append(before).append("→").append(now).append("；");
+        }
+        d.append("昵称=").append(describe(after.getNickname())).append("，邮箱=").append(describe(after.getEmail()));
+        return d.toString();
+    }
+
+    /** 空值展示成「（空）」而不是 null：审计明细里的 null 分不清「没填」与「没读到」。 */
+    private static String describe(String s) {
+        return s == null || s.isBlank() ? "（空）" : s;
+    }
 
     /**
      * 保证系统至少剩一个「启用状态的 ADMIN」（排除 {@code excludedUserId} 后仍有）。

@@ -44,6 +44,22 @@ public class ConversationFact {
     /** 主题标签的字符上限（与 DDL 列宽一致）。 */
     public static final int TOPIC_MAX = 32;
 
+    /** 状态：生效中（会参与注入与合并）。 */
+    public static final String STATUS_ACTIVE = "ACTIVE";
+
+    /** 状态：已被同主题的新说法替代（不再注入，但留档可查「它曾经是什么」）。 */
+    public static final String STATUS_SUPERSEDED = "SUPERSEDED";
+
+    /** 置信度下限 / 上限（1~5）。 */
+    public static final int CONFIDENCE_MIN = 1;
+    public static final int CONFIDENCE_MAX = 5;
+
+    /** 用户手写条目的初始置信度（用户明确说的，天然最高）。 */
+    public static final int CONFIDENCE_USER = 5;
+
+    /** 合并产出条目的初始置信度（模型整理出来的，先按中性看待）。 */
+    public static final int CONFIDENCE_MERGE = 3;
+
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
@@ -61,6 +77,27 @@ public class ConversationFact {
 
     /** 来源：MERGE / USER（见类注释的待遇差异）。 */
     private String source;
+
+    /**
+     * 置信度 1~5。<b>不是模型打的分</b>，而是「这条事实被确认过几次」的可见化：用户手写的起始 5，
+     * 模型整理的起始 3，此后<b>每次合并里仍然被列出就 +1</b>（封顶 5）。于是「最近还在被反复确认」的条目
+     * 自然浮到高分区，只被提过一次的臆测停在低位 —— 面板据此排序，用户一眼看出哪条更可信。
+     */
+    private Integer confidence;
+
+    /**
+     * 有效期（可空 = 永不过期）。过期的条目<b>不再注入</b>，但仍留在面板上（标注「已过期」）。
+     * <p>
+     * 这是「下周三要交报告」这类<b>有时限的事实</b>的归宿：此前它们会一直躺在提示词里，
+     * 成了模型眼中永远的待办。注意过期只影响注入，<b>不自动删除</b> —— 删不删由用户决定。
+     */
+    private LocalDateTime expiresAt;
+
+    /** 状态：{@link #STATUS_ACTIVE} / {@link #STATUS_SUPERSEDED}。 */
+    private String status;
+
+    /** 被哪一条取代（{@code id}）：仅在 {@link #STATUS_SUPERSEDED} 时有值，用于面板上「被……取代」的回链。 */
+    private Long supersededBy;
 
     private LocalDateTime createdAt;
 

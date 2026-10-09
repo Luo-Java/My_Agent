@@ -134,6 +134,47 @@
                     <!-- 教务系统入口：跳 /edu.html（与 edu 页顶栏的「前往 AI 对话」互为对称入口） -->
                     <a class="nav-pill" href="/edu.html"
                        title="前往教务管理系统：学生/教师/班级/课程/成绩/课表">🎓 教务系统</a>
+                    <!-- 定时任务入口：把「一句话 + 一个周期」变成到点自动执行（执行体就是在本人的承载会话里把
+                         那句话问一遍，走完整对话链路）。任何登录用户都能建 —— 后端 /api/schedule 不做角色限制，
+                         因为它是「自己的会话自己排期」，天然按 user_id 隔离（越权一律 404）。
+                         与 💰/🧪/📊 的区别：那三个是跨会话的全站运营视角，故限管理员；这里只碰自己的数据。 -->
+                    <button class="nav-pill" @click="openSched"
+                            title="定时任务：让一句话按周期自动执行（每天 / 每小时 / 每周一 …），执行结果留在承载会话里">⏰ 定时</button>
+                    <!-- 通知出口：定时任务完成 / 阈值告警 / 提示词门禁的结论都落这张表。
+                         为什么要有它：这些事发生在「用户不在对话里」的时候，没有出口就只能靠人主动去翻。
+                         未读数走 /api/notification/unread 轮询（见 app.js 的 NOTIFY_POLL_MS）。
+                         这段整体是 span（不能塞 div）：它嵌在 <span class="header-actions"> 里，
+                         块级盒模型由 style.css 的 .notify-* 规则给（display:flex / block），不靠标签名。 -->
+                    <span class="notify-wrap">
+                        <button class="nav-pill notify-btn" @click="toggleNotify"
+                                :title="notifyState.unread ? ('有 ' + notifyState.unread + ' 条未读通知') : '通知（定时任务 / 告警 / 门禁）'">
+                            🔔<span v-if="notifyState.unread" class="notify-badge">{{ notifyState.unread > 99 ? '99+' : notifyState.unread }}</span>
+                        </button>
+                        <span class="notify-panel" v-if="notifyState.open" @click.stop>
+                            <span class="notify-head">
+                                <span>通知<span v-if="notifyState.unread">（{{ notifyState.unread }} 条未读）</span></span>
+                                <button class="notify-act" @click="markAllNotifyRead"
+                                        :disabled="!notifyState.unread">全部已读</button>
+                            </span>
+                            <span class="notify-list">
+                                <span v-if="notifyState.error" class="notify-empty">{{ notifyState.error }}</span>
+                                <span v-else-if="!notifyState.items.length" class="notify-empty">
+                                    暂无通知。<br>定时任务执行完成、聚合指标越线、提示词门禁出结论时会出现在这里。
+                                </span>
+                                <span v-for="n in notifyState.items" :key="n.id"
+                                      class="notify-item"
+                                      :class="{ 'is-unread': !n.readAt, 'is-clickable': notifyClickable(n) }"
+                                      @click="openNotify(n)">
+                                    <span class="notify-item-top">
+                                        <span class="notify-tag" :class="notifyLevelClass(n)">{{ notifyTypeLabel(n.type) }}</span>
+                                        <span class="notify-item-title">{{ n.title }}</span>
+                                        <span class="notify-item-time">{{ fmtTime(n.createdAt) }}</span>
+                                    </span>
+                                    <span class="notify-item-text" v-if="n.content">{{ n.content }}</span>
+                                </span>
+                            </span>
+                        </span>
+                    </span>
                     <!-- 登录用户区：内容全部由 js/auth.js 渲染（挂载点 data-auth-nav）——
                          用户名点击展开下拉：个人信息 / 修改口令 / 用户管理（仅 ADMIN）/ 退出登录。
                          四页顶栏共用同一实现，页面自身不含登录逻辑；顶栏不再有裸露的「退出」按钮。 -->
@@ -390,6 +431,9 @@
                                             <span class="recall-hits" :title="'命中 ' + h.hitCount + ' 个检索词'">
                                                 ×{{ h.hitCount }}
                                             </span>
+                                            <!-- 语义分：只在真的做了语义重排时显示（未重排 = 0，此时排序依据是命中检索词数） -->
+                                            <span v-if="h.score" class="recall-score"
+                                                  :title="'语义相关度 ' + h.score">语义 {{ h.score.toFixed(2) }}</span>
                                         </div>
                                         <div class="recall-snippet">{{ h.snippet }}</div>
                                     </div>
@@ -414,6 +458,12 @@
                                             {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
                                         </span>
                                         <span class="cite-score" :title="'相关度 ' + c.score">{{ fmtScore(c.score) }}</span>
+                                        <!-- 召回方式（混合检索可见化）：只给「关键词/双路」加标记 —— 向量是默认路径，
+                                             标出来只会让每行都多一个噪声徽章；而「词命中」「双路」是异常信号，值得一眼看见。 -->
+                                        <span v-if="c.matchedBy === 'both'" class="cite-match is-both"
+                                              title="向量检索与关键词检索两路都命中了这条（最可信）">双路</span>
+                                        <span v-else-if="c.matchedBy === 'keyword'" class="cite-match is-kw"
+                                              title="由关键词（字面）检索命中：向量没召回，是字面匹配补上来的">词命中</span>
                                         <button type="button" class="cite-open" title="查看这条来源的知识块原文"
                                                 @click.stop="openCite(c)">原文</button>
                                     </div>
@@ -525,6 +575,37 @@
                         正在编辑第 {{ editingIndex + 1 }} 条消息 —— 发送后作为该轮的新版本，旧版本保留可翻回
                     </span>
                     <button type="button" class="edit-banner-cancel" @click="cancelEditMessage">取消编辑</button>
+                </div>
+                <!-- 工具审批闸门待确认条：智能体要调用的工具落在审批清单里（agent.tool-approval.tools）时，
+                     这里列出「它到底要干什么」，点批准才真正执行。放在输入区上方而不是挂在某条消息上 ——
+                     授权粒度是「本会话 × 工具」，不随某一条消息存在，切走再回来、刷新页面都还在。
+                     批准后自动重跑刚才那一轮（复用「重新生成」通路：开新版本、重发同一提问）。 -->
+                <div v-if="toolApprovals.length" class="approve-bar">
+                    <div v-for="a in toolApprovals" :key="a.id" class="approve-item"
+                         :class="a.effective === 'REJECTED' ? 'is-rejected' : 'is-pending'">
+                        <div class="approve-main">
+                            <div class="approve-head">
+                                <span class="approve-tool">{{ a.toolName }}</span>
+                                <span class="approve-state">{{ approveStateText(a) }}</span>
+                                <span class="approve-meta" v-if="a.usedCount > 0">已放行 {{ a.usedCount }} 次</span>
+                            </div>
+                            <div class="approve-input" v-if="a.inputJson" :title="a.inputJson">{{
+                                approveInputText(a) }}</div>
+                            <div class="approve-note" v-if="a.note">备注：{{ a.note }}</div>
+                        </div>
+                        <div class="approve-actions">
+                            <template v-if="a.effective === 'PENDING'">
+                                <button type="button" class="approve-btn approve-ok" :disabled="a.busy"
+                                        title="批准后本会话内该工具可持续使用；会自动重跑刚才那一轮"
+                                        @click="approveTool(a)">{{ a.busy ? '处理中…' : '批准并执行' }}</button>
+                                <button type="button" class="approve-btn approve-no" :disabled="a.busy"
+                                        title="拒绝后本会话内该工具一直被挡住，可随时撤销"
+                                        @click="rejectTool(a)">拒绝</button>
+                            </template>
+                            <button v-else type="button" class="approve-btn approve-undo" :disabled="a.busy"
+                                    title="撤销拒绝，回到待确认" @click="resetTool(a)">撤销拒绝</button>
+                        </div>
+                    </div>
                 </div>
                 <!-- 附件预览：图片显示缩略图，文档显示文件 chip；发送时由后端 /api/chat/attachment/process
                      转成文本（当轮注入 LLM）+ 原文件落盘（供历史回看）。解析文本不进会话记忆，刷新后不重复消耗 token；
@@ -1482,19 +1563,32 @@
                             <span class="mem-fact-count">{{ (memoryModal.facts || []).length }} 条</span>
                         </div>
                         <ul class="mem-fact-list" v-if="memoryModal.facts && memoryModal.facts.length">
-                            <li v-for="f in memoryModal.facts" :key="f.id" class="mem-fact-item">
+                            <li v-for="f in memoryModal.facts" :key="f.id" class="mem-fact-item"
+                                :class="{ 'is-inactive': f.status === 'SUPERSEDED' || f.expired }">
                                 <template v-if="factEdit.id === f.id">
                                     <select v-model="factEdit.topic" class="mem-fact-topic">
                                         <option v-for="t in factTopics" :key="t" :value="t">{{ t }}</option>
                                     </select>
                                     <input v-model="factEdit.fact" class="mem-fact-input" maxlength="500"
                                            @keyup.enter="saveFact" />
+                                    <input v-model="factEdit.expiresAt" type="datetime-local" class="mem-fact-expires"
+                                           title="有效期（留空 = 永不过期）。到期后不再注入上下文，但不会自动删除。">
                                     <button class="mem-mini is-primary" :disabled="factBusy" @click="saveFact">保存</button>
                                     <button class="mem-mini" :disabled="factBusy" @click="cancelFactEdit">取消</button>
                                 </template>
                                 <template v-else>
                                     <span class="mem-fact-tag">{{ f.topic }}</span>
                                     <span class="mem-fact-text">{{ f.fact }}</span>
+                                    <!-- 置信度：不是模型打的分，而是「这条被确认过几次」的可见化。 -->
+                                    <span class="mem-fact-conf" :class="factConfClass(f)"
+                                          :title="'置信度 ' + f.confidence + '/5 —— 不是模型打的分，而是「这条被确认过几次」：手写起始 5，模型整理起始 3，此后每次合并里仍被列出 +1（封顶 5）'">置信 {{ f.confidence }}</span>
+                                    <!-- 只显示其中一种：已被取代优先于已过期（前者信息量更大，且带回链）。 -->
+                                    <span v-if="f.status === 'SUPERSEDED'" class="mem-fact-state is-superseded"
+                                          :title="'已被同主题的新说法取代（新条目 ID ' + f.supersededBy + '）：不再注入，但留档可查 —— 旧说法本身有价值'">已被取代</span>
+                                    <span v-else-if="f.expired" class="mem-fact-state is-expired"
+                                          :title="'有效期已过（' + fmtTime(f.expiresAt) + '）：不再注入，但不会自动删除'">已过期</span>
+                                    <span v-else-if="f.expiresAt" class="mem-fact-until"
+                                          :title="'有效期至 ' + fmtTime(f.expiresAt) + '，过期后不再注入'">至 {{ (fmtTime(f.expiresAt) || '').slice(0, 10) }}</span>
                                     <span class="mem-fact-src" :class="f.source === 'USER' ? 'is-user' : 'is-merge'"
                                           :title="f.source === 'USER'
                                               ? '手动添加 / 人工修正：自动整理绝不覆盖或删除'
@@ -1518,9 +1612,18 @@
                                    @keyup.enter="addFact" />
                             <button class="mem-mini is-primary" :disabled="factBusy" @click="addFact">添加</button>
                         </div>
+                        <div class="mem-fact-add-extra">
+                            <span>有效期</span>
+                            <input v-model="factAdd.expiresAt" type="datetime-local" class="mem-fact-expires"
+                                   title="留空 = 永不过期。给「下周三要交的报告」这类有时限的事实设一个，到期后它不再进上下文（也不会被删，只在面板上标「已过期」）。">
+                            <span v-if="!factAdd.expiresAt">留空 = 永不过期</span>
+                            <button v-else class="mem-mini" @click="factAdd.expiresAt = ''">清除</button>
+                        </div>
                         <div class="mem-hint">
                             注入时<b>以条目为准</b>：只要还有条目，下面的「旧版归档」就不再注入。
-                            手动条目永不被自动整理删除；自动条目被你改过之后会转为「手动」。
+                            手动条目永不被自动整理删除；自动条目被你改过之后会转为「手动」。<br>
+                            另有三档决定「现在还算不算数」：<b>已过期的</b>与<b>已被同主题新说法取代的</b>都不再注入
+                            （但仍留在上面，可查可删）；<b>置信度</b>低的条目说明它只被提过一次，可能是模型的臆测。
                         </div>
                     </div>
                     <label class="mem-field">
@@ -1706,6 +1809,10 @@
                                         {{ c.kbName || '知识库' }}<template v-if="c.source"> · {{ c.source }}</template>
                                     </span>
                                     <span class="cite-score">{{ fmtScore(c.score) }}</span>
+                                    <span v-if="c.matchedBy === 'both'" class="cite-match is-both"
+                                          title="向量检索与关键词检索两路都命中了这条（最可信）">双路</span>
+                                    <span v-else-if="c.matchedBy === 'keyword'" class="cite-match is-kw"
+                                          title="由关键词（字面）检索命中">词命中</span>
                                     <button type="button" class="cite-open" title="查看这条来源的知识块原文"
                                             @click.stop="openCite(c)">原文</button>
                                 </div>
@@ -1827,6 +1934,28 @@
                 </div>
                 <div v-if="evalModal.error" class="trace-empty">{{ evalModal.error }}</div>
 
+                <!-- 提示词门禁横幅：回答「现在跑的这版 prompts.yaml，验过没有 / 结论是什么」。
+                     放在跑批控件上方而不是下方：它的作用是**决定要不要按下这个按钮**，
+                     结论摆在结果区等于事后诸葛。四态配色见 style.css 的 .gate-bar 注释。 -->
+                <div v-if="evalModal.gate" class="gate-bar" :class="gateClass(evalModal.gate)">
+                    <span class="gate-verdict">{{ gateVerdictText(evalModal.gate) }}</span>
+                    <span class="gate-fp" v-if="evalModal.gate.fingerprint"
+                          title="prompts.yaml 内容的 SHA-256 定长前缀：只回答「变了没有」，不回答「改了哪句」">
+                        fp {{ evalModal.gate.fingerprint }}
+                    </span>
+                    <span class="gate-spacer"></span>
+                    <button class="btn-primary btn-sm" @click="runEvalGate" :disabled="evalModal.gateBusy">
+                        {{ evalModal.gateBusy ? '校验中…' : '✓ 校验并留档' }}
+                    </button>
+                    <span class="gate-detail" v-if="evalModal.gate.latest && evalModal.gate.latest.batchId">
+                        最近一次结论来自批次 {{ evalModal.gate.latest.batchId }} ·
+                        {{ evalModal.gate.latest.passed }}/{{ evalModal.gate.latest.total }} 通过
+                    </span>
+                    <span class="gate-detail" v-if="gateDetailText(evalModal.gate)">
+                        {{ gateDetailText(evalModal.gate) }}
+                    </span>
+                </div>
+
                 <!-- 本次跑批结果 -->
                 <div v-if="evalModal.result" class="eval-section">
                     <div class="trace-block-title">本次结果</div>
@@ -1924,6 +2053,113 @@
             <div class="modal-foot">
                 <span class="field-hint">评测跑的是真实调用，消耗计入成本看板且会话 ID 标记为 {{ '__eval__' }}，不与真实对话混算。</span>
                 <button class="btn-primary" @click="closeEval">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== 定时任务弹窗（P0-2）=====
+         把「一句话 + 一个周期」变成自动执行：到点后以本人身份，在承载会话里把那句话问一遍。
+         刻意不复用「规划任务」（task 表）—— 那是一轮规划的运行实例（有状态机、有起止），
+         本页管的是长期存在的**定义**（周期 / 开关 / 下次触发时间），到点才产生一次执行。
+         执行体也不另造一套：走的是同一个对话链路，故记忆、RAG、工具、成本统计一样都不少。
+         表单默认折叠：任务通常只有几条，列表与表单同屏比来回切更省事。 -->
+    <div class="modal-mask" v-if="schedModal.open" @click.self="closeSched">
+        <div class="modal modal-trace modal-sched">
+            <div class="modal-head">
+                <span>⏰ 定时任务</span>
+                <button class="modal-close" @click="closeSched">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="trace-toolbar">
+                    <span class="field-hint">
+                        到点后以你的身份、在承载会话里把提示词问一遍（走完整对话链路：记忆 / RAG / 工具 / 成本都算）
+                    </span>
+                    <button class="btn-primary btn-sm" @click="newSched" :disabled="schedModal.saving">+ 新建</button>
+                </div>
+                <div v-if="schedModal.error" class="trace-empty">{{ schedModal.error }}</div>
+
+                <div class="sched-list" v-if="schedModal.list.length">
+                    <div v-for="t in schedModal.list" :key="t.id" class="sched-item"
+                         :class="{ 'is-off': !t.enabled, 'is-error': t.lastStatus === 'ERROR', 'is-ok': t.lastStatus === 'OK' }">
+                        <div class="sched-item-main">
+                            <div class="sched-item-name">
+                                <span>{{ t.name }}</span>
+                                <span class="notify-tag" v-if="!t.enabled">已停用</span>
+                                <span class="notify-tag notify-lv-error" v-else-if="t.lastStatus === 'ERROR'">上次失败</span>
+                                <span class="notify-tag" v-else-if="t.lastStatus === 'RUNNING'">执行中</span>
+                            </div>
+                            <div class="sched-item-sub">
+                                <code>{{ t.cron }}</code> · {{ schedCronText(t.cron) }}
+                                <template v-if="t.nextRunAt && t.enabled"> · 下次 {{ fmtTime(t.nextRunAt) }}</template>
+                                <template v-if="t.lastRunAt"> · 上次 {{ fmtTime(t.lastRunAt) }}</template>
+                                <template v-if="!t.notifyOn"> · 不通知</template>
+                            </div>
+                            <div class="sched-item-sub" v-if="t.lastResult">结果：{{ t.lastResult }}</div>
+                        </div>
+                        <div class="sched-item-acts">
+                            <button class="sched-mini" @click="runSchedNow(t)" :disabled="schedModal.busyId === t.id"
+                                    title="立即执行一次（不影响既定排期）">
+                                {{ schedModal.busyId === t.id ? '执行中…' : '▶ 执行' }}
+                            </button>
+                            <button class="sched-mini" @click="toggleSched(t)" :disabled="schedModal.busyId === t.id">
+                                {{ t.enabled ? '停用' : '启用' }}
+                            </button>
+                            <button class="sched-mini" @click="editSched(t)">编辑</button>
+                            <button class="sched-mini is-danger" @click="deleteSched(t)" :disabled="schedModal.busyId === t.id">删除</button>
+                        </div>
+                    </div>
+                </div>
+                <div v-else-if="!schedModal.error" class="trace-empty">
+                    还没有定时任务。点「+ 新建」，写一句话 + 选个周期即可 ——
+                    例如「每天早上 9 点」+「汇总昨天的关键事项」。
+                </div>
+
+                <!-- 表单：新建 / 编辑共用。id 存在即编辑。 -->
+                <div class="sched-form" v-if="schedModal.form">
+                    <div class="trace-block-title">{{ schedModal.form.id ? '编辑任务' : '新建任务' }}</div>
+                    <label>任务名称 <span class="req">*</span></label>
+                    <input v-model="schedModal.form.name" maxlength="100" placeholder="例如：每日晨报">
+
+                    <label>触发周期（Spring Cron 六段式：秒 分 时 日 月 周） <span class="req">*</span></label>
+                    <input v-model="schedModal.form.cron" maxlength="64" placeholder="0 0 9 * * ?">
+                    <div class="sched-presets">
+                        <button v-for="p in SCHED_PRESETS" :key="p.cron" type="button" class="sched-preset"
+                                @click="schedModal.form.cron = p.cron" :title="p.cron">{{ p.label }}</button>
+                    </div>
+                    <div class="sched-hint">
+                        周与日<b>不能同时</b>给具体值（一个写值、另一个必须写 <code>?</code>）——
+                        <code>0 0 9 * * MON</code> 解析会失败，正确写法是 <code>0 0 9 ? * MON</code>。
+                    </div>
+
+                    <label>绑定智能体</label>
+                    <ui-select v-model="schedModal.form.agentId" :options="schedAgentChoices"
+                               placeholder="不绑定（走智能路由）"></ui-select>
+
+                    <label>提示词（到点后发进对话的那句话） <span class="req">*</span></label>
+                    <textarea v-model="schedModal.form.prompt" rows="3" maxlength="2000"
+                              placeholder="例如：汇总我昨天会话里提到的待办，按优先级列出来"></textarea>
+
+                    <div class="sched-check">
+                        <input type="checkbox" id="sched-enabled" v-model="schedModal.form.enabled">
+                        <label for="sched-enabled">启用（取消勾选则保留定义但不再触发）</label>
+                    </div>
+                    <div class="sched-check">
+                        <input type="checkbox" id="sched-notify" v-model="schedModal.form.notifyOn">
+                        <label for="sched-notify">执行完成后发通知（不通知的定时任务等于跑给人看不见）</label>
+                    </div>
+                    <div class="sched-foot">
+                        <button class="btn-ghost" @click="schedModal.form = null">取消</button>
+                        <button class="btn-primary" @click="submitSched" :disabled="schedModal.saving">
+                            {{ schedModal.saving ? '保存中…' : '保存' }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <span class="field-hint">
+                    执行体是一次真实对话（消耗计入成本看板）；承载会话首次执行时自动创建，之后一直复用。
+                </span>
+                <button class="btn-primary" @click="closeSched">关闭</button>
             </div>
         </div>
     </div>

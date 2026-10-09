@@ -22,8 +22,14 @@ import java.util.List;
  * @param kbName  知识库名称（展示用，如「通用知识库」）
  * @param source  来源标注（通常是文件名，关联 kb_file.file_name；可能为空）
  * @param score   相关度分：启用精排时为精排 relevance_score（0~1），降级时为真实余弦相似度
+ * @param matchedBy 召回方式（混合检索的可见化）：{@code vector}=只被向量路命中、{@code keyword}=只被关键词路命中、
+ *                  {@code both}=两路都命中（最可信）。老数据没有该字段，解析时回落 {@code vector}（改造前只有向量一路）。
  */
-public record KbCitation(int index, Long chunkId, Long kbId, String kbName, String source, double score) {
+public record KbCitation(int index, Long chunkId, Long kbId, String kbName, String source, double score,
+                         String matchedBy) {
+
+    /** 召回方式缺省值（老数据 / 未走混合检索时）。 */
+    private static final String MATCHED_VECTOR = "vector";
 
     /**
      * 序列化为 JSON 数组字符串（落库 / SSE 事件用）。
@@ -41,6 +47,7 @@ public record KbCitation(int index, Long chunkId, Long kbId, String kbName, Stri
             o.set("kbName", c.kbName());
             o.set("source", c.source());
             o.set("score", c.score());
+            o.set("matchedBy", c.matchedBy());
             arr.add(o);
         }
         return arr.toString();
@@ -63,7 +70,8 @@ public record KbCitation(int index, Long chunkId, Long kbId, String kbName, Stri
                         o.getLong("kbId"),
                         o.getStr("kbName"),
                         o.getStr("source"),
-                        o.getDouble("score", 0.0)));
+                        o.getDouble("score", 0.0),
+                        o.getStr("matchedBy", MATCHED_VECTOR)));
             }
             return out;
         } catch (Exception e) {

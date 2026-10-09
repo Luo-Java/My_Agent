@@ -390,7 +390,8 @@ public class ConversationController {
         if (request == null) {
             throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少事实内容（fact）");
         }
-        return ConversationFactDto.of(factService.add(conversationId, request.topic(), request.fact()));
+        return ConversationFactDto.of(factService.add(conversationId, request.topic(), request.fact(),
+                request.expiresAt()));
     }
 
     /**
@@ -407,7 +408,8 @@ public class ConversationController {
             throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "缺少事实内容（fact）");
         }
         return ConversationFactDto.of(
-                factService.update(factId, conversationId, request.topic(), request.fact()));
+                factService.update(factId, conversationId, request.topic(), request.fact(),
+                        request.expiresAt()));
     }
 
     /**

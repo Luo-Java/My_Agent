@@ -52,7 +52,7 @@ public class ToolRegistry {
      * <p>
      * 出现在 {@code tools_json} 白名单里时，{@link #resolve} 静默跳过而不告警——它不是「配错了的名字」。
      */
-    private static final Set<String> DYNAMIC_TOOL_NAMES = Set.of(SubAgentTool.TOOL_NAME);
+    private static final Set<String> DYNAMIC_TOOL_NAMES = Set.of(SubAgentTool.TOOL_NAME, HandoffTool.TOOL_NAME);
 
     /** 工具元信息；{@code group} 为来源（ToolProvider 类名或 ToolCallbackSource 分组名），前端按此分组展示。 */
     public record ToolInfo(String name, String description, String group) {}
@@ -78,6 +78,9 @@ public class ToolRegistry {
         // 动态工具只登记「元信息」供前端勾选，不登记实例：它的候选清单依赖调用方智能体，只能每轮现构。
         if (!index.containsKey(SubAgentTool.TOOL_NAME)) {
             infos.add(SubAgentTool.toolInfo());
+        }
+        if (!index.containsKey(HandoffTool.TOOL_NAME)) {
+            infos.add(HandoffTool.toolInfo());
         }
         this.availableTools = List.copyOf(infos);
         log.info("工具注册完成：{} 个注解式 Bean + {} 个动态来源，共 {} 个 ToolCallback：{}",

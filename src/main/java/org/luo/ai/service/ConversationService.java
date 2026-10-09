@@ -10,8 +10,11 @@ import org.luo.ai.dto.KbCitation;
 import org.luo.ai.dto.TurnBranch;
 import org.luo.ai.entity.ChatMessage;
 import org.luo.ai.entity.Conversation;
+import org.luo.ai.properties.PiiProperties;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
+import org.luo.common.util.PiiJsonMasker;
+import org.luo.common.util.PiiMasker;
 import org.luo.ai.mapper.ChatMessageMapper;
 import org.luo.ai.mapper.ConversationMapper;
 import org.springframework.stereotype.Service;
@@ -49,12 +52,37 @@ public class ConversationService {
      * 归属校验放在 Controller），故不会成环。
      */
     private final ConversationFactService factService;
+    private final PiiProperties piiProperties;
 
     public ConversationService(ConversationMapper conversationMapper, ChatMessageMapper chatMessageMapper,
-                               ConversationFactService factService) {
+                               ConversationFactService factService, PiiProperties piiProperties) {
         this.conversationMapper = conversationMapper;
         this.chatMessageMapper = chatMessageMapper;
         this.factService = factService;
+        this.piiProperties = piiProperties;
+    }
+
+    /**
+     * 落库前的 PII 脱敏；开关关闭时原样返回。
+     * <p>
+     * 放在<b>持久化边界</b>而不是「拿到用户输入的那一刻」：工具调用、检索、本轮 prompt 都要用原文，
+     * 提前脱敏会让模型这一轮就看不到号码。代价（也是必须知道的后果）是脱敏后的正文会被
+     * {@link org.luo.ai.memory.DbChatMemory} 读回、注入<b>下一轮</b>上下文 —— 见 {@link PiiProperties#enabledOn()}。
+     */
+    private String maskForStore(String text) {
+        return piiProperties.enabledOn() ? PiiMasker.mask(text) : text;
+    }
+
+    /**
+     * 同样只对<b>字符串值</b>脱敏，但用于 JSON 列（{@code clarify_state}）。
+     * <p>
+     * 不能整串遮：{@code request}（原始用户请求）与 {@code question}（追问文案）都是用户文本，
+     * 但 {@code asked}、{@code params} 的键与结构必须原样可解析，否则下一轮 {@link #getClarifyState}
+     * 读出来就是坏数据、参数补全直接失效。故复用与 {@code agent_trace.plan_json} 同一份实现
+     * （见 {@link org.luo.common.util.PiiJsonMasker}）—— 两处对 JSON 的要求完全一致，不该各写一份。
+     */
+    private String maskStateJson(String json) {
+        return piiProperties.enabledOn() ? PiiJsonMasker.mask(json) : json;
     }
 
     /** 创建新会话：可绑定智能体或标记为规划模式（planner 优先，与 agentId 互斥）。会话归属 {@code userId}。 */
@@ -474,12 +502,18 @@ public class ConversationService {
         return c;
     }
 
-    /** 批量落库消息（DbChatMemory 在 ChatMemory.add 时调用）。 */
+    /**
+     * 批量落库消息（DbChatMemory 在 ChatMemory.add 时调用）。
+     * <p>
+     * 落库前过 {@link PiiMasker}：这里是 {@code chat_message} 的<b>唯一</b>写入口（另一处是
+     * {@link #saveClarifyExchange}），守住这两处即守住整张表。
+     */
     @Transactional
     public void saveMessages(List<ChatMessage> messages) {
         if (messages == null || messages.isEmpty()) return;
         log.debug("落库消息：{} 条", messages.size());
         for (ChatMessage m : messages) {
+            m.setContent(maskForStore(m.getContent()));
             chatMessageMapper.insert(m);
         }
     }
@@ -703,11 +737,13 @@ public class ConversationService {
     @Transactional
     public void updateMemoryFields(String conversationId, String summary, String coreFacts, Long userId) {
         requireOwned(conversationId, userId);
+        // 用户手写的内容同样过脱敏：这与消息正文是同一份信任级别（都是「用户输入」），
+        // 而这两列会被注入后续每一轮的上下文，不遮就等于把号码主动喂回给模型。
         conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
                 .eq(Conversation::getUserId, userId)
-                .set(Conversation::getSummary, blankToNull(summary))
-                .set(Conversation::getCoreFacts, blankToNull(coreFacts)));
+                .set(Conversation::getSummary, blankToNull(maskForStore(summary)))
+                .set(Conversation::getCoreFacts, blankToNull(maskForStore(coreFacts))));
         log.info("手动更新长期记忆：会话={}，摘要长度={}，关键事实长度={}",
                 conversationId, lengthOf(summary), lengthOf(coreFacts));
     }
@@ -863,7 +899,9 @@ public class ConversationService {
         if (c == null) return;
         boolean autoRenamed = false;
         if ("新对话".equals(c.getTitle()) && userText != null && !userText.isBlank()) {
-            c.setTitle(userText.length() > 20 ? userText.substring(0, 20) : userText);
+            // 标题取自输入前 20 字，同样会落库 ⇒ 一并脱敏（否则「我的手机号是 138…」会成为会话标题里的明文）
+            String safe = maskForStore(userText);
+            c.setTitle(safe.length() > 20 ? safe.substring(0, 20) : safe);
             autoRenamed = true;
         }
         c.setUpdatedAt(LocalDateTime.now());
@@ -881,12 +919,12 @@ public class ConversationService {
         ChatMessage u = new ChatMessage();
         u.setConversationId(conversationId);
         u.setRole("user");
-        u.setContent(userText);
+        u.setContent(maskForStore(userText));
         u.setCreatedAt(now);
         ChatMessage a = new ChatMessage();
         a.setConversationId(conversationId);
         a.setRole("assistant");
-        a.setContent(assistantText);
+        a.setContent(maskForStore(assistantText));
         // 与 user 共用同一时间：created_at 是秒级 DATETIME，纳秒偏移会被静默截断；
         // user 早于 assistant 的顺序由自增主键 id 兜底（读取一律 ORDER BY created_at, id）。
         a.setCreatedAt(now);
@@ -906,8 +944,7 @@ public class ConversationService {
         log.info("绑定智能体：会话={}，agentId={}，来源=CLARIFY", conversationId, agentId);
     }
 
-    /** 解绑追问期临时绑定的智能体（给正式回答后调用）；显式绑定不应调用。 */
-    @Transactional
+    /** 解绑追问期临时绑定的智能体（给正式回答后调用）；显式绑定不应调用。 */    @Transactional
     public void unbindAgent(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
         Conversation c = conversationMapper.selectById(conversationId);
@@ -921,6 +958,54 @@ public class ConversationService {
                 .set(Conversation::getClarifyState, null);
         conversationMapper.update(null, wrapper);
         log.info("解绑智能体：会话={}", conversationId);
+    }
+
+    /**
+     * 智能体主动转交（handoff）：把会话交给目标智能体，来源标记为 {@link AgentBindSource#HANDOFF}。
+     * <p>
+     * <b>为什么与 CLARIFY 分开</b>：{@link #unbindAgent} 会把「来源=CLARIFY」的绑定在话题切换时清掉；
+     * 转交是<b>智能体基于专长做出的判断</b>，与用户显式选择具有同等持久性（用户没推翻它之前不该被自动解绑），
+     * 故用独立取值：语义上粘住，同时让追踪能区分「这轮为什么是它在答」——是用户点的，还是上一个智能体交的。
+     */
+    @Transactional
+    public void bindAgentHandoff(String conversationId, Long agentId) {
+        if (conversationId == null || conversationId.isBlank() || agentId == null) return;
+        conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
+                .eq(Conversation::getId, conversationId)
+                .set(Conversation::getAgentId, agentId)
+                .set(Conversation::getAgentBindSource, AgentBindSource.HANDOFF));
+        log.info("智能体转交绑定：会话={}，agentId={}", conversationId, agentId);
+    }
+
+    /**
+     * 覆盖「最新一条助手消息」的正文（转交接力专用）。
+     * <p>
+     * <b>为什么需要它</b>：记忆 Advisor 会在模型返回时立刻把「原智能体的转交说明」写进 {@code chat_message}；
+     * 接力回答随后由目标智能体产出。若不覆盖，库里留着转交说明、界面上显示目标智能体的答案 ——
+     * 同一个位置两个版本，正是本项目最忌讳的事实漂移（下次读记忆时模型会看到一段用户从没见过的内容）。
+     * <p>
+     * 只改 {@code content}：工具调用明细 / 引用 / 附件等元数据由各自链路维护，与本方法无关。
+     *
+     * @return true=已覆盖；false=没有可覆盖的助手消息（本轮未落库，调用方无须处理）
+     */
+    @Transactional
+    public boolean overwriteLatestAssistantMessage(String conversationId, String content) {
+        if (conversationId == null || conversationId.isBlank() || content == null) return false;
+        QueryWrapper<ChatMessage> qw = new QueryWrapper<>();
+        qw.eq("conversation_id", conversationId).eq("role", "assistant").orderByDesc("id").last("LIMIT 1");
+        ChatMessage last = chatMessageMapper.selectOne(qw);
+        if (last == null) {
+            log.warn("转交接力：未找到可覆盖的助手消息，会话={}", conversationId);
+            return false;
+        }
+        // 必须过脱敏：目标智能体的回答可能复述本轮用户输入里的号码，
+        // 而这里走的是 update 直写、绕过 saveMessages 的 masker ⇒ 不遮就会在 chat_message 里
+        // 留下一条明文，破坏「该表正文一律已遮」这条不变量（下次读回注入上下文时也会带出去）。
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .eq(ChatMessage::getId, last.getId())
+                .set(ChatMessage::getContent, maskForStore(content)));
+        log.debug("转交接力：助手消息 {} 已改写为目标智能体的回答", last.getId());
+        return true;
     }
 
     // ===== 澄清（参数补全）状态：让「问到第几次 / 原请求是什么 / 已确认哪些参数」跨轮稳定 =====
@@ -947,7 +1032,7 @@ public class ConversationService {
         if (conversationId == null || conversationId.isBlank()) return;
         conversationMapper.update(null, new LambdaUpdateWrapper<Conversation>()
                 .eq(Conversation::getId, conversationId)
-                .set(Conversation::getClarifyState, state == null ? null : state.toJson()));
+                .set(Conversation::getClarifyState, state == null ? null : maskStateJson(state.toJson())));
         // 清除是常规动作（「参数已齐」的每一轮都会走到，见 AgentRoundHandler），不记 INFO，免得刷屏；
         // 真正「写入一段进行中的追问」才值得留痕。
         if (state == null) {
@@ -975,7 +1060,9 @@ public class ConversationService {
                 conversationId, summarizedCount, summary != null ? summary.length() : 0);
         Conversation c = conversationMapper.selectById(conversationId);
         if (c == null) return;
-        c.setSummary(summary);
+        // 摘要是模型对历史消息的复述，而历史消息里就有用户随口报的号码 ⇒ 摘要同样要脱敏。
+        // 且它的留存期比消息更长（无删除入口，resetMemory 只清空不删记录），还每轮被注入 prompt。
+        c.setSummary(maskForStore(summary));
         c.setSummarizedCount(summarizedCount);
         conversationMapper.updateById(c);
     }

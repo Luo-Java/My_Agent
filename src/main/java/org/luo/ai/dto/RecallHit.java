@@ -25,10 +25,12 @@ import java.util.List;
  * @param role              消息角色：{@code user}=用户说过 / {@code assistant}=助手说过
  * @param createdAt         该消息的写入时间（给「多久以前」一个锚点）
  * @param snippet           命中内容片段（已按 {@code agent.cross-session.snippet-chars} 截断）
- * @param hitCount          命中的关键词个数（排序依据，也便于用户判断相关度）
+ * @param hitCount          命中的检索词个数（字面排序依据）
+ * @param score             语义相关度分（精排 relevance_score，0~1）；<b>0 表示未做语义重排</b>
+ *                          （开关关闭 / 精排不可用 / 该条未参与重排），此时排序依据是 {@code hitCount}
  */
 public record RecallHit(int index, String conversationId, String conversationTitle, String role,
-                        LocalDateTime createdAt, String snippet, int hitCount) {
+                        LocalDateTime createdAt, String snippet, int hitCount, double score) {
 
     /** 时间展示格式（只到分钟：召回片段的时间精度不需要秒）。 */
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
@@ -50,6 +52,7 @@ public record RecallHit(int index, String conversationId, String conversationTit
             o.set("createdAt", h.createdAt() == null ? null : h.createdAt().format(TIME_FMT));
             o.set("snippet", h.snippet());
             o.set("hitCount", h.hitCount());
+            o.set("score", h.score());
             arr.add(o);
         }
         return arr.toString();
@@ -71,7 +74,8 @@ public record RecallHit(int index, String conversationId, String conversationTit
                         o.getStr("role"),
                         time == null || time.isBlank() ? null : LocalDateTime.parse(time, TIME_FMT),
                         o.getStr("snippet"),
-                        o.getInt("hitCount", 0)));
+                        o.getInt("hitCount", 0),
+                        o.getDouble("score", 0.0)));
             }
             return out;
         } catch (Exception e) {

@@ -7,8 +7,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.luo.ai.dto.ConversationFactDto;
 import org.luo.ai.entity.ConversationFact;
 import org.luo.ai.mapper.ConversationFactMapper;
+import org.luo.ai.properties.PiiProperties;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
+import org.luo.common.util.PiiMasker;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -48,10 +50,15 @@ public class ConversationFactService {
     /** 模型表达「没有事实」的几种写法（整段为「无」时不能当成一条事实名叫「无」的条目）。 */
     private static final Set<String> EMPTY_TOKENS = Set.of("无", "（无）", "(无)", "-", "none");
 
-    private final ConversationFactMapper mapper;
+    /** 每个会话最多留档多少条「已被取代」的旧说法（更早的清理掉，避免死数据无限堆积）。 */
+    private static final int KEEP_SUPERSEDED = 20;
 
-    public ConversationFactService(ConversationFactMapper mapper) {
+    private final ConversationFactMapper mapper;
+    private final PiiProperties piiProperties;
+
+    public ConversationFactService(ConversationFactMapper mapper, PiiProperties piiProperties) {
         this.mapper = mapper;
+        this.piiProperties = piiProperties;
     }
 
     // ==================================================================
@@ -69,9 +76,10 @@ public class ConversationFactService {
                 .orderByAsc(ConversationFact::getId));
     }
 
-    /** 同上，转页面视图。 */
+    /** 同上，转页面视图。批量渲染共用同一个「当前时刻」，避免同一列表里两条条目得出不同的过期结论。 */
     public List<ConversationFactDto> listDto(String conversationId) {
-        return list(conversationId).stream().map(ConversationFactDto::of).toList();
+        LocalDateTime now = LocalDateTime.now();
+        return list(conversationId).stream().map(f -> ConversationFactDto.of(f, now)).toList();
     }
 
     /**
@@ -112,7 +120,19 @@ public class ConversationFactService {
 
     /** 条目渲染成「一条一行」的裸文本（不含块头）；无条目返回空串。 */
     private String linesText(String conversationId) {
-        return renderLines(list(conversationId));
+        LocalDateTime now = LocalDateTime.now();
+        // 只注入「生效中且未过期」的条目：被新说法替代的（SUPERSEDED）与已过期的都不该再进上下文 ——
+        // 这正是本次改造要解决的问题（此前它们一律照常注入，模型于是把过期待办当成永远的待办）。
+        List<ConversationFact> injectable = list(conversationId).stream()
+                .filter(ConversationFactService::isActive)
+                .filter(f -> f.getExpiresAt() == null || f.getExpiresAt().isAfter(now))
+                .toList();
+        return renderLines(injectable);
+    }
+
+    /** 是否「生效中」（存量行的 status 可能为 NULL，按生效处理 —— 不因加了列就让老数据凭空消失）。 */
+    private static boolean isActive(ConversationFact f) {
+        return f.getStatus() == null || ConversationFact.STATUS_ACTIVE.equals(f.getStatus());
     }
 
     /**
@@ -150,21 +170,39 @@ public class ConversationFactService {
      * 静默成功会让用户以为加了两条）。
      */
     public ConversationFact add(String conversationId, String topic, String fact) {
+        return add(conversationId, topic, fact, null);
+    }
+
+    /**
+     * 手动新增一条事实（可带有效期）。
+     *
+     * @param expiresAt 有效期（可空 = 永不过期）；已写下的「下周三要交报告」这类事实靠它自动退场
+     */
+    public ConversationFact add(String conversationId, String topic, String fact, LocalDateTime expiresAt) {
         requireConversationId(conversationId);
         String t = topicOf(topic);
         String text = requireFact(fact);
         ConversationFact exist = findByHash(conversationId, hash(t, text));
         if (exist != null) {
-            if (ConversationFact.SOURCE_USER.equals(exist.getSource())) {
+            if (ConversationFact.SOURCE_USER.equals(exist.getSource()) && isActive(exist)) {
                 throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "该事实已存在（同主题同内容）");
             }
+            // 认领：把模型整理的条目转成手动来源（此后合并不再淘汰它）；被替代/过期的条目则重新激活 ——
+            // 用户又写了一遍，就是明确表示「这条现在有效」，此时把 expires_at 一并按本次请求覆盖。
             mapper.update(null, new LambdaUpdateWrapper<ConversationFact>()
                     .eq(ConversationFact::getId, exist.getId())
                     .set(ConversationFact::getSource, ConversationFact.SOURCE_USER)
+                    .set(ConversationFact::getConfidence, ConversationFact.CONFIDENCE_USER)
+                    .set(ConversationFact::getStatus, ConversationFact.STATUS_ACTIVE)
+                    .set(ConversationFact::getSupersededBy, null)
+                    .set(ConversationFact::getExpiresAt, expiresAt)
                     .set(ConversationFact::getUpdatedAt, LocalDateTime.now()));
-            log.info("手动添加的事实与自动条目重合，已转为手动来源（此后合并不再淘汰它）：会话={}，条目={}",
+            log.info("手动添加的事实与既有条目重合，已转为手动来源并重新激活：会话={}，条目={}",
                     conversationId, exist.getId());
             exist.setSource(ConversationFact.SOURCE_USER);
+            exist.setConfidence(ConversationFact.CONFIDENCE_USER);
+            exist.setStatus(ConversationFact.STATUS_ACTIVE);
+            exist.setExpiresAt(expiresAt);
             return exist;
         }
         LocalDateTime now = LocalDateTime.now();
@@ -174,28 +212,52 @@ public class ConversationFactService {
         f.setFact(text);
         f.setFactHash(hash(t, text));
         f.setSource(ConversationFact.SOURCE_USER);
+        f.setConfidence(ConversationFact.CONFIDENCE_USER);
+        f.setExpiresAt(expiresAt);
+        f.setStatus(ConversationFact.STATUS_ACTIVE);
         f.setCreatedAt(now);
         f.setUpdatedAt(now);
         mapper.insert(f);
-        log.info("手动新增长期事实：会话={}，主题={}，长度={}", conversationId, t, text.length());
+        log.info("手动新增长期事实：会话={}，主题={}，长度={}，有效期={}", conversationId, t, text.length(),
+                expiresAt == null ? "永久" : expiresAt);
         return f;
     }
 
+    /** 修改一条事实（主题与内容都可改），有效期保持不变。 */
+    public ConversationFact update(Long id, String conversationId, String topic, String fact) {
+        return update(id, conversationId, topic, fact, null);
+    }
+
     /**
-     * 修改一条事实（主题与内容都可改）。
+     * 修改一条事实（主题与内容都可改，可同时改有效期）。
      * <p>
      * <b>改过的条目一律转为 {@code USER} 来源</b>：用户为什么要改它？因为模型记错了。那么这条就不该再
-     * 由模型下一次整理去覆盖或删除 —— 来源从「自动」变「手动」正是这个意思。
+     * 由模型下一次整理去覆盖或删除 —— 来源从「自动」变「手动」正是这个意思。置信度同步提到用户档（5）：
+     * 人手写下的东西不需要靠「被反复确认」来挣信用。
+     * <p>
+     * <b>顺带复活</b>：如果这条此前已被新说法取代（SUPERSEDED）或已过期，人工改完即视为重新生效 ——
+     * 用户专门去改一条死条目，只可能是「它现在又对了」。同理，若改后的内容与另一条<b>已失效</b>的条目撞车，
+     * 不是报错而是把那条标成「被本条取代」（复用合并侧的冲突策略），避免留下两条同 hash 的行让后续查询二义。
+     *
+     * @param expiresAt 有效期；<b>传 null 表示清除有效期</b>（重新变成永久有效），不是「保持原值」
      */
-    public ConversationFact update(Long id, String conversationId, String topic, String fact) {
+    public ConversationFact update(Long id, String conversationId, String topic, String fact, LocalDateTime expiresAt) {
         ConversationFact exist = require(id, conversationId);
         String t = topicOf(topic);
         String text = requireFact(fact);
         String h = hash(t, text);
         ConversationFact other = findByHash(conversationId, h);
         if (other != null && !other.getId().equals(exist.getId())) {
-            throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "已存在相同的事实条目（同主题同内容）");
+            if (isActive(other)) {
+                throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "已存在相同的事实条目（同主题同内容）");
+            }
+            // 撞上一条已失效的旧行：把它标成「被本条取代」，与合并侧的冲突策略同一口径。
+            mapper.update(null, new LambdaUpdateWrapper<ConversationFact>()
+                    .eq(ConversationFact::getId, other.getId())
+                    .set(ConversationFact::getStatus, ConversationFact.STATUS_SUPERSEDED)
+                    .set(ConversationFact::getSupersededBy, exist.getId()));
         }
+        LocalDateTime now = LocalDateTime.now();
         boolean promoted = !ConversationFact.SOURCE_USER.equals(exist.getSource());
         mapper.update(null, new LambdaUpdateWrapper<ConversationFact>()
                 .eq(ConversationFact::getId, exist.getId())
@@ -203,15 +265,25 @@ public class ConversationFactService {
                 .set(ConversationFact::getFact, text)
                 .set(ConversationFact::getFactHash, h)
                 .set(ConversationFact::getSource, ConversationFact.SOURCE_USER)
-                .set(ConversationFact::getUpdatedAt, LocalDateTime.now()));
+                .set(ConversationFact::getConfidence, ConversationFact.CONFIDENCE_USER)
+                .set(ConversationFact::getStatus, ConversationFact.STATUS_ACTIVE)
+                .set(ConversationFact::getSupersededBy, null)
+                .set(ConversationFact::getExpiresAt, expiresAt)
+                .set(ConversationFact::getUpdatedAt, now));
         if (promoted) {
             log.info("自动整理条目被人工修正，已转为手动来源：会话={}，条目={}", conversationId, exist.getId());
         }
-        log.info("修改长期事实：会话={}，条目={}，主题={}，长度={}", conversationId, exist.getId(), t, text.length());
+        log.info("修改长期事实：会话={}，条目={}，主题={}，长度={}，有效期={}", conversationId, exist.getId(), t,
+                text.length(), expiresAt == null ? "永久" : expiresAt);
         exist.setTopic(t);
         exist.setFact(text);
         exist.setFactHash(h);
         exist.setSource(ConversationFact.SOURCE_USER);
+        exist.setConfidence(ConversationFact.CONFIDENCE_USER);
+        exist.setStatus(ConversationFact.STATUS_ACTIVE);
+        exist.setSupersededBy(null);
+        exist.setExpiresAt(expiresAt);
+        exist.setUpdatedAt(now);
         return exist;
     }
 
@@ -244,16 +316,21 @@ public class ConversationFactService {
      */
     public MergeOutcome merge(String conversationId, List<FactLine> wanted) {
         if (isBlank(conversationId)) return new MergeOutcome(0, 0, 0);
+        List<ConversationFact> existing = list(conversationId);
         Map<String, ConversationFact> byHash = new HashMap<>();
-        for (ConversationFact f : list(conversationId)) {
+        for (ConversationFact f : existing) {
             byHash.put(f.getFactHash(), f);
         }
         LocalDateTime now = LocalDateTime.now();
         Set<String> desired = new LinkedHashSet<>();
         List<Long> refreshed = new ArrayList<>();
+        // 本轮该主题「换了新说法」的记录：主题 → 新条目 id。用于把同主题下没被复述的旧说法标成「已被取代」。
+        Map<String, Long> replacedByTopic = new LinkedHashMap<>();
         int inserted = 0;
         for (FactLine line : (wanted == null ? List.<FactLine>of() : wanted)) {
-            String text = oneLine(line.fact());
+            // 与 requireFact 同一个口径：合并产出的事实也是从用户消息里复述出来的，同样要遮。
+            // hash 用的是脱敏后的 text ⇒ 「同内容同 hash」的重语义不因脱敏而破裂。
+            String text = maskForStore(oneLine(line.fact()));
             if (text.isEmpty()) continue;
             if (text.length() > ConversationFact.FACT_MAX) {
                 log.warn("合并产出的单条事实超长（{} 字 > {}），已截断：会话={}", text.length(),
@@ -271,14 +348,20 @@ public class ConversationFactService {
                 f.setFact(text);
                 f.setFactHash(h);
                 f.setSource(ConversationFact.SOURCE_MERGE);
+                f.setConfidence(ConversationFact.CONFIDENCE_MERGE);
+                f.setStatus(ConversationFact.STATUS_ACTIVE);
                 f.setCreatedAt(now);
                 f.setUpdatedAt(now);
                 mapper.insert(f);
                 inserted++;
+                replacedByTopic.put(t, f.getId());
             } else {
                 refreshed.add(hit.getId());
             }
         }
+        // 1) 刷新：本轮仍被列出的条目 → 刷新时间、置信度 +1（封顶 5），并把「已被取代」的重新激活 ——
+        //    模型这次又列出它，说明那个新说法没站住，旧的回来了。置信度用 SQL 自增而非「读出再写回」，
+        //    免得合并线程与用户手改并发时互相覆盖。LEAST/COALESCE 兜住存量行 confidence 为 NULL 的情况。
         int touched = 0;
         if (!refreshed.isEmpty()) {
             // 一次批量更新而不是逐条：条目数量本就很少，但逐条 UPDATE 会让「合并一次 = N 条 SQL」，
@@ -286,20 +369,74 @@ public class ConversationFactService {
             touched = mapper.update(null, new LambdaUpdateWrapper<ConversationFact>()
                     .eq(ConversationFact::getConversationId, conversationId)
                     .in(ConversationFact::getId, refreshed)
-                    .set(ConversationFact::getUpdatedAt, now));
+                    .set(ConversationFact::getUpdatedAt, now)
+                    .setSql("confidence = LEAST(" + ConversationFact.CONFIDENCE_MAX
+                            + ", COALESCE(confidence, " + ConversationFact.CONFIDENCE_MERGE + ") + 1)")
+                    .set(ConversationFact::getStatus, ConversationFact.STATUS_ACTIVE)
+                    .set(ConversationFact::getSupersededBy, null));
         }
-        LambdaQueryWrapper<ConversationFact> stale = new LambdaQueryWrapper<ConversationFact>()
-                .eq(ConversationFact::getConversationId, conversationId)
-                .eq(ConversationFact::getSource, ConversationFact.SOURCE_MERGE);
-        if (!desired.isEmpty()) {
-            stale.notIn(ConversationFact::getFactHash, desired);
+        // 2) 冲突消解：某个主题本轮出现了新说法，而该主题下还有没被复述的旧说法 → 标「已被取代」留档。
+        //    这里刻意<b>不删除</b>：旧说法与新说法是同一件事的两个时间点，「它曾经是什么」本身有价值
+        //    （用户会对着面板问「我上周不是改过吗」）。不注入即可，见 linesText 的过滤。
+        int superseded = replacedByTopic.isEmpty() ? 0 : markSuperseded(existing, desired, replacedByTopic, now);
+        // 3) 淘汰：模型这次完全没提、且所属主题也没有新说法的自动条目 → 删除。
+        //    这才是「淘汰旧事实的唯一通路」，与上一轮的语义完全一致；用户手加条目永不在候选内。
+        List<Long> staleIds = new ArrayList<>();
+        for (ConversationFact f : existing) {
+            if (!ConversationFact.SOURCE_MERGE.equals(f.getSource())) continue;
+            if (desired.contains(f.getFactHash())) continue;
+            if (replacedByTopic.containsKey(f.getTopic())) continue;   // 已标「被取代」，留档不删
+            staleIds.add(f.getId());
         }
-        int removed = mapper.delete(stale);
-        if (inserted > 0 || removed > 0) {
-            log.info("长期事实条目按合并结果重写：会话={}，新增={}，刷新={}，淘汰={}",
-                    conversationId, inserted, touched, removed);
+        int removed = staleIds.isEmpty() ? 0 : mapper.delete(new LambdaQueryWrapper<ConversationFact>()
+                .in(ConversationFact::getId, staleIds));
+        if (superseded > 0) pruneSuperseded(conversationId);
+        if (inserted > 0 || removed > 0 || superseded > 0) {
+            log.info("长期事实条目按合并结果重写：会话={}，新增={}，刷新={}，取代={}，淘汰={}",
+                    conversationId, inserted, touched, superseded, removed);
         }
         return new MergeOutcome(inserted, touched, removed);
+    }
+
+    /**
+     * 把「同主题下已被新说法顶替」的旧条目标为 {@link ConversationFact#STATUS_SUPERSEDED}，返回条数。
+     * <p>
+     * 判据是<b>主题相同 + 本轮没被复述 + 该主题本轮产出了新条目</b>三件事同时成立。只对 {@code MERGE} 来源生效 ——
+     * 用户手加的条目即使与模型的新说法同主题也不动它（那是两码事，用户写的可能一直在用）。
+     */
+    private int markSuperseded(List<ConversationFact> existing, Set<String> desired,
+                               Map<String, Long> replacedByTopic, LocalDateTime now) {
+        int n = 0;
+        for (ConversationFact f : existing) {
+            if (!ConversationFact.SOURCE_MERGE.equals(f.getSource())) continue;
+            if (!isActive(f)) continue;
+            if (desired.contains(f.getFactHash())) continue;
+            Long newId = replacedByTopic.get(f.getTopic());
+            if (newId == null || newId.equals(f.getId())) continue;
+            mapper.update(null, new LambdaUpdateWrapper<ConversationFact>()
+                    .eq(ConversationFact::getId, f.getId())
+                    .set(ConversationFact::getStatus, ConversationFact.STATUS_SUPERSEDED)
+                    .set(ConversationFact::getSupersededBy, newId)
+                    .set(ConversationFact::getUpdatedAt, now));
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * 给「已被取代」的留档行收口：只保留最近 {@link #KEEP_SUPERSEDED} 条，更早的删掉。
+     * <p>
+     * 留档不是无限留 —— 同一主题改来改去，一次改一行会攒成几百行死数据。代价是「很久以前的旧说法查不到」，
+     * 这个取舍是明确的：面板要回答的是「我最近一次改了什么」，不是「三年前是什么」。
+     */
+    private int pruneSuperseded(String conversationId) {
+        List<ConversationFact> sup = mapper.selectList(new LambdaQueryWrapper<ConversationFact>()
+                .eq(ConversationFact::getConversationId, conversationId)
+                .eq(ConversationFact::getStatus, ConversationFact.STATUS_SUPERSEDED)
+                .orderByDesc(ConversationFact::getId));
+        if (sup.size() <= KEEP_SUPERSEDED) return 0;
+        List<Long> drop = sup.subList(KEEP_SUPERSEDED, sup.size()).stream().map(ConversationFact::getId).toList();
+        return mapper.delete(new LambdaQueryWrapper<ConversationFact>().in(ConversationFact::getId, drop));
     }
 
     /**
@@ -396,14 +533,25 @@ public class ConversationFactService {
      * <b>换行必须折掉</b>：注入文本是「一条一行」的列表格式，用户从别处粘一段多行文本进来会把它撑成
      * 好几行、破坏格式（后几行看起来像没有主题前缀的条目）。
      */
+    /** 落库前脱敏；开关与消息正文共用同一个（{@code agent.pii.enabled}），不允许单独关。 */
+    private String maskForStore(String text) {
+        return piiProperties.enabledOn() ? PiiMasker.mask(text) : text;
+    }
+
     private static String oneLine(String s) {
         if (s == null) return "";
         return s.replaceAll("\\s+", " ").strip();
     }
 
-    /** 校验并规范化事实内容：空报 400、超长报 400（<b>不静默截断</b>——用户能改短，何必替他丢字）。 */
-    private static String requireFact(String fact) {
-        String text = oneLine(fact);
+    /**
+     * 校验并规范化事实内容：空报 400、超长报 400（<b>不静默截断</b>——用户能改短，何必替他丢字）。
+     * <p>
+     * <b>顺带脱敏</b>：用户在长期记忆面板手写的内容与消息正文是同一份信任级别（都是「用户输入」），
+     * 而 {@code SOURCE_USER} 条目<b>合并不删不改</b>、事实上永久留存，还在每轮被注入上下文 ——
+     * 不遮就等于用户主动把号码写进了永久记忆。故脱敏在「规范化」这一步做，{@code add}/{@code update} 两条路径共用。
+     */
+    private String requireFact(String fact) {
+        String text = maskForStore(oneLine(fact));
         if (text.isEmpty()) {
             throw new AiBusinessException(AiErrorCode.BAD_REQUEST, "事实内容不能为空");
         }

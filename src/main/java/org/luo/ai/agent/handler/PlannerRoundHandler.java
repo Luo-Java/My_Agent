@@ -679,7 +679,10 @@ public class PlannerRoundHandler implements RoundHandler {
                     + (isLastStep && !historyContext.isBlank() ? historyContext : ""));
             ChatClient.ChatClientRequestSpec spec = composer.internalChatClient()
                     .prompt().system(system).user(userInput);
-            spec = composer.decorateRequest(spec, s.agent(), trace, conversationId);
+            // 审批闸门：规划步骤同样会调工具（查库/画图），过同一把闸门；用户原话取「原始目标」——
+            // 批准后前端据它重跑整轮，而不是拿某一步的合成输入去重跑
+            spec = composer.decorateRequest(spec, s.agent(), trace, conversationId, null,
+                    composer.approvalContext(conversationId, s.agent(), firstInput));
             String out = spec.call().content();
             if (out != null && !out.isBlank()) {
                 outputs[idx] = out;

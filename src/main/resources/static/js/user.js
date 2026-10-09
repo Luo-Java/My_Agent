@@ -9,6 +9,19 @@ if (typeof Vue === 'undefined') {
 }
 const { createApp, ref, reactive, computed, onMounted } = Vue;
 
+// 审计动作编码 → 界面文案。取值与后端 org.luo.system.constant.AuditAction 一一对应：
+// 后端加动作时这里要同步补，否则新动作会在界面上显示成原始编码（不会报错，但可读性掉档）。
+const AUDIT_ACTIONS = [
+    { value: 'CREATE_USER', label: '新增用户' },
+    { value: 'UPDATE_USER', label: '修改用户' },
+    { value: 'DELETE_USER', label: '删除用户' },
+    { value: 'UPDATE_PASSWORD', label: '重置口令' },
+    { value: 'CREATE_ROLE', label: '新增角色' },
+    { value: 'UPDATE_ROLE', label: '修改角色' },
+    { value: 'DELETE_ROLE', label: '删除角色' }
+];
+const AUDIT_LABELS = Object.fromEntries(AUDIT_ACTIONS.map(a => [a.value, a.label]));
+
 // ==================== API 封装（与 edu.js 同一套） ====================
 function apiFetch(url, options) {
     const opts = Object.assign({}, options || {});
@@ -67,6 +80,16 @@ createApp({
         const roleLoading = ref(false);
         const roleQuery = reactive({ keyword: '' });
 
+        // ==================== 审计列表 ====================
+        const auditRows = ref([]);
+        const auditPage = ref(1);
+        const auditSize = ref(20);
+        const auditTotal = ref(0);
+        const auditPages = ref(0);
+        const auditLoading = ref(false);
+        const auditQuery = reactive({ action: '' });
+        const auditActions = AUDIT_ACTIONS;
+
         // ==================== 弹窗 ====================
         const userModal = reactive({
             open: false, mode: 'create', saving: false, error: '',
@@ -114,6 +137,10 @@ createApp({
             if (!value) return '—';
             return String(value).replace('T', ' ').slice(0, 16);
         }
+        /** 动作编码 → 文案；未登记的新编码原样显示（宁可露出编码，也别显示成空白）。 */
+        function auditActionLabel(action) {
+            return AUDIT_LABELS[action] || action || '—';
+        }
 
         // ==================== 加载 ====================
         async function loadRoles() {
@@ -156,6 +183,21 @@ createApp({
             rolePage.value = data.page || target;
         }
 
+        async function loadAudit(page) {
+            const target = Number(page) || 1;
+            auditLoading.value = true;
+            // 审计接口是 GET + query（分页/筛选都走参数），与用户/角色的 POST body 口径不同
+            const qs = new URLSearchParams({ page: String(target), size: String(auditSize.value) });
+            if (auditQuery.action) qs.set('action', auditQuery.action);
+            const data = await request('/api/audit/page?' + qs.toString(), { method: 'GET' }, '审计记录加载失败');
+            auditLoading.value = false;
+            if (!data) return;
+            auditRows.value = data.records || [];
+            auditTotal.value = data.total || 0;
+            auditPages.value = data.pages || 0;
+            auditPage.value = data.page || target;
+        }
+
         function resetUserQuery() {
             userQuery.keyword = '';
             userQuery.status = '';
@@ -166,14 +208,20 @@ createApp({
             roleQuery.keyword = '';
             loadRolesPage(1);
         }
+        function resetAuditQuery() {
+            auditQuery.action = '';
+            loadAudit(1);
+        }
         /** 切视图：只加载目标视图，避免每次切换都打两组请求 */
         function switchTab(name) {
             tab.value = name;
             if (name === 'user') {
                 loadRoles();
                 loadUsers(userPage.value);
-            } else {
+            } else if (name === 'role') {
                 loadRolesPage(rolePage.value);
+            } else {
+                loadAudit(auditPage.value);
             }
         }
 
@@ -359,6 +407,8 @@ createApp({
             userRows, userPage, userSize, userTotal, userPages, userLoading, userQuery, loadUsers, resetUserQuery,
             roleRows, rolePage, roleSize, roleTotal, rolePages, roleLoading, roleQuery,
             loadRolesPage, resetRoleQuery,
+            auditRows, auditPage, auditSize, auditTotal, auditPages, auditLoading, auditQuery, auditActions,
+            loadAudit, resetAuditQuery, auditActionLabel,
             rowNo, fmtTime,
             userModal, openUserCreate, openUserEdit, closeUserModal, saveUser,
             pwdModal, openResetPassword, closePwdModal, submitPassword,

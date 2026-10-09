@@ -26,6 +26,8 @@ import java.util.PriorityQueue;
 import org.luo.ai.chat.ChatComposer;
 import org.luo.ai.infrastructure.chroma.ChromaVectorStoreService;
 import org.luo.ai.infrastructure.rerank.RerankService;
+import org.luo.ai.util.Rrf;
+import org.luo.ai.util.TermExtractor;
 
 /**
  * 知识库检索服务（RAG 检索收敛点，只读不写；写入/管理侧见 {@link KbService}）。
@@ -34,9 +36,10 @@ import org.luo.ai.infrastructure.rerank.RerankService;
  * （{@link KbCitation}）。开启后自动多库检索：全局「通用知识库」（{@code kb.agent_id IS NULL}）
  * + 本轮路由/绑定智能体的专属库。
  * <p>
- * <b>三段式检索</b>：① 粗排召回（多库合并一次检索，宽松下限）→ ② 精排（{@link RerankService}，
- * 不可用则降级为向量分 + 严格 {@code min-score} 截断）→ ③ 编号注入（套 {@code agent.prompt.kb-context}
- * 模板，同趟产出与编号一一对应的引用）。注入点：{@link ChatComposer#buildKbContext} 透传。
+ * <b>三段式检索（第一段为混合召回）</b>：① 粗排召回 —— <b>向量 + 关键词两路</b>（见 {@link #searchAll}，
+ * 用 {@link Rrf} 融合）→ ② 精排（{@link RerankService}，不可用则降级为向量分 + 严格 {@code min-score} 截断）
+ * → ③ 编号注入（套 {@code agent.prompt.kb-context} 模板，同趟产出与编号一一对应的引用）。
+ * 注入点：{@link ChatComposer#buildKbContext} 透传。
  * 任何一步失败都只降级、绝不阻断对话——RAG 是增强，不是依赖。
  */
 @Slf4j
@@ -83,7 +86,7 @@ public class KbSearchService {
                 log.debug("知识库检索：RAG 已开启，但无可用知识库（无全局库 / 无该智能体专属库），本轮不带资料");
                 return KbContext.EMPTY;
             }
-            List<Hit> recalled = searchAll(targets, query);   // ① 粗排召回（recallK 条，宽松下限）
+            List<Hit> recalled = searchAll(targets, query);   // ① 混合粗排召回（向量+关键词，RRF 融合，收敛到 recallK）
             if (recalled.isEmpty()) return KbContext.EMPTY;
             List<Hit> picked = refine(recalled, query);       // ② 精排（不可用则降级为向量分截断）
             if (picked.isEmpty()) return KbContext.EMPTY;
@@ -119,19 +122,66 @@ public class KbSearchService {
                 .isNull("agent_id").last("LIMIT 1"));
     }
 
-    /** 检索命中的一条：知识块 + 所属库 + 分数（精排前为真实余弦，精排后被替换为 relevance_score）。 */
-    private record Hit(KnowledgeBase kb, KnowledgeChunk chunk, double score) {
-        /** 用新分数换出一个同源命中（精排分覆盖向量分，元数据保持不变）。 */
+    /**
+     * 检索命中的一条：知识块 + 所属库 + 两个分数 + 被几路命中。
+     * <p>
+     * <b>为何两个分数</b>：{@code score} 是本条<b>在向量路的相关度</b>（真实余弦或精排分；只被关键词打中的
+     * 候选没有余弦，记 0），{@code rrf} 是融合分（未融合＝0）。两者不可互相换算，也不混排 ——
+     * {@link #rank()} 只在「融合过」时用 rrf，否则用 score。保留 {@code score} 的意义在于<b>降级可回退</b>：
+     * 精排恰好调用失败时，兜底分支靠它筛出「向量本来就认」的候选，行为与改造前完全一致。
+     */
+    private record Hit(KnowledgeBase kb, KnowledgeChunk chunk, double score, double rrf, int routes,
+                       boolean kwHit) {
+
+        /** 向量路命中（余弦分）。 */
+        static Hit vector(KnowledgeBase kb, KnowledgeChunk chunk, double score) {
+            return new Hit(kb, chunk, score, 0, 1, false);
+        }
+
+        /** 关键词路命中：这一路不产生相似度，只比名次，故向量分记 0。 */
+        static Hit keyword(KnowledgeBase kb, KnowledgeChunk chunk) {
+            return new Hit(kb, chunk, 0, 0, 1, true);
+        }
+
+        /** 用精排分换出同源命中（精排分覆盖 score；元数据与融合信息保持不变）。 */
         Hit withScore(double newScore) {
-            return new Hit(kb, chunk, newScore);
+            return new Hit(kb, chunk, newScore, rrf, routes, kwHit);
+        }
+
+        /**
+         * 打上融合分与命中路数（score 不变：融合不改变「本条在向量路有多大相关度」这个事实）。
+         * <p>
+         * {@code routeCount > 1} 说明两路都命中了，此时<b>必须把 kwHit 补上</b> —— 融合保留的是
+         * 「先出现的那一路」的实例（向量路在前），若不补，两路都命中的条目会被误报成「只被向量命中」。
+         */
+        Hit withFused(double fusedScore, int routeCount) {
+            return new Hit(kb, chunk, score, fusedScore, routeCount, kwHit || routeCount > 1);
+        }
+
+        /** 排序键：融合过用 RRF 分，单路用本路相关度分。两类不会混排（融合时全部 rrf > 0）。 */
+        double rank() {
+            return rrf > 0 ? rrf : score;
+        }
+
+        /** 召回方式（引用列表展示用）：{@code both}=两路都命中，{@code keyword}=只被字面命中。 */
+        String matchedBy() {
+            if (kwHit && routes > 1) {
+                return "both";
+            }
+            return kwHit ? "keyword" : "vector";
         }
     }
 
     /**
-     * 多库统一粗排召回：一次跨全部目标库，召回 {@code recall-k} 条候选。
-     * Chroma 优先（kb_id 过滤 + 余弦 TopK），失败/无命中回退 MySQL 余弦（<b>有界扫描</b>，
-     * 上限 {@code agent.rag.fallback-max-chunks}，避免把整库向量文本拉进堆）。
-     * 下限用宽松的 {@code recall-min-score}：这一阶段目标是「别漏」，判相关性交给精排。
+     * 多库统一粗排召回（<b>混合检索</b>）：向量一路 + 关键词一路，两路融合后收敛到 {@code recall-k} 条。
+     * <p>
+     * 两路各治一种病：向量路抓「说法不同但意思相近」，关键词路抓「术语/专有名词/数字等字面精确的东西」——
+     * 「Q3 营收是多少」这类问题向量常常召回不准，字面反而一击即中。融合用 {@link Rrf}（只看名次，
+     * 免疫两路分数尺度差异）。
+     * <p>
+     * <b>关键词一路只在精排可用时参与</b>：融合后必须靠精排收敛，因为 RRF 分不是相似度，无法直接和余弦阈值
+     * 比。若精排不可用，兜底分支只有余弦可分（关键词专有候选的 score 是 0），等于白融合一场；与其如此，
+     * 不如干脆退回纯向量 —— 降级路径要的是「行为可预期」，不是「多一路不确定性」。
      */
     private List<Hit> searchAll(List<KnowledgeBase> targets, String query) {
         Map<Long, KnowledgeBase> byId = new LinkedHashMap<>();
@@ -139,6 +189,96 @@ public class KbSearchService {
             byId.put(kb.getId(), kb);
         }
         List<Long> kbIds = new ArrayList<>(byId.keySet());
+
+        List<Hit> vectorHits = vectorRecall(kbIds, byId, query);
+        if (!props.keywordRecallOn() || !rerankService.available()) {
+            return vectorHits;
+        }
+        List<Hit> keywordHits = keywordRecall(kbIds, byId, query);
+        if (keywordHits.isEmpty()) {
+            return vectorHits;
+        }
+        if (vectorHits.isEmpty()) {
+            return keywordHits;
+        }
+        return fuse(vectorHits, keywordHits);
+    }
+
+    /**
+     * 关键词召回：切词 → 有界 {@code LIKE} 查询（按命中词项数降序）→ 收敛到 {@code keyword-recall-k} 条。
+     * 任何失败都只返回空表（本轮退化为纯向量一路），绝不阻断对话。
+     */
+    private List<Hit> keywordRecall(List<Long> kbIds, Map<Long, KnowledgeBase> byId, String query) {
+        List<String> terms = TermExtractor.extract(query, TermExtractor.DEFAULT_MAX_TERMS);
+        if (terms.isEmpty()) {
+            return List.of();
+        }
+        int limit = props.keywordRecallScanCap();
+        List<KnowledgeChunk> rows;
+        try {
+            rows = chunkMapper.searchByKeyword(kbIds, terms, limit);
+        } catch (Exception e) {
+            log.warn("知识库关键词召回失败（本轮只用向量一路）：词项={}，原因={}", terms, e.getMessage());
+            return List.of();
+        }
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        if (rows.size() >= limit) {
+            // 截断会影响召回完整性，必须留痕（与 MySQL 向量回退同一口径：降级不静默）
+            Long total = chunkMapper.selectCount(new QueryWrapper<KnowledgeChunk>().in("kb_id", kbIds));
+            log.warn("关键词召回已按上限截断：本次仅取 {} 块（上限 {}），目标库实际共 {} 块，命中可能不完整。"
+                            + "如需提升可调大 agent.rag.keyword-recall-scan-cap",
+                    rows.size(), limit, total);
+        }
+        int k = props.keywordRecallK();
+        List<Hit> hits = new ArrayList<>(Math.min(k, rows.size()));
+        for (KnowledgeChunk c : rows) {
+            KnowledgeBase kb = byId.get(c.getKbId());
+            if (kb == null) {
+                continue;   // 归属库不在目标内，防御跳过
+            }
+            hits.add(Hit.keyword(kb, c));
+            if (hits.size() >= k) {
+                break;
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("RAG 关键词召回：词项={}，候选 {} 块 → 取 {} 块", terms, rows.size(), hits.size());
+        }
+        return hits;
+    }
+
+    /**
+     * RRF 融合两路召回并按 {@code recall-k} 收敛。收敛是必要的：融合后候选是两路之和，
+     * 而精排<b>按文档条数计费</b>，无界放大等于让检索成本翻倍；{@code recall-k} 本就是「交给精排的候选量」。
+     */
+    private List<Hit> fuse(List<Hit> vectorHits, List<Hit> keywordHits) {
+        List<Rrf.Fused<Hit>> fused = Rrf.fuse(List.of(vectorHits, keywordHits),
+                h -> String.valueOf(h.chunk().getId()), props.rrfK());
+        int cap = props.recallK();
+        List<Hit> out = new ArrayList<>(Math.min(cap, fused.size()));
+        for (Rrf.Fused<Hit> f : fused) {
+            out.add(f.item().withFused(f.score(), f.routes()));
+            if (out.size() >= cap) {
+                break;
+            }
+        }
+        if (log.isDebugEnabled()) {
+            long both = out.stream().filter(h -> h.routes() > 1).count();
+            log.debug("RAG 混合召回：向量 {} 块 + 关键词 {} 块 → 融合取 {} 块（其中 {} 块两路都命中）",
+                    vectorHits.size(), keywordHits.size(), out.size(), both);
+        }
+        return out;
+    }
+
+    /**
+     * 向量一路（<b>改造前的全部召回逻辑</b>，逐字保留）：一次跨全部目标库召回 {@code recall-k} 条候选。
+     * Chroma 优先（kb_id 过滤 + 余弦 TopK），失败/无命中回退 MySQL 余弦（<b>有界扫描</b>，
+     * 上限 {@code agent.rag.fallback-max-chunks}，避免把整库向量文本拉进堆）。
+     * 下限用宽松的 {@code recall-min-score}：这一阶段目标是「别漏」，判相关性交给精排。
+     */
+    private List<Hit> vectorRecall(List<Long> kbIds, Map<Long, KnowledgeBase> byId, String query) {
         int recall = props.recallK();
         double floor = props.recallMinScore();
 
@@ -156,11 +296,11 @@ public class KbSearchService {
                 c.setKbId(kb.getId());
                 c.setContent(h.content());
                 c.setSource(h.source());
-                hits.add(new Hit(kb, c, h.score()));
+                hits.add(Hit.vector(kb, c, h.score()));
             }
             if (log.isDebugEnabled()) {
                 log.debug("RAG 粗排：Chroma 跨 {} 库召回 {} 块（下限 {}，目标 {}），库={}",
-                        kbIds.size(), hits.size(), floor, recall, kbNames(targets));
+                        kbIds.size(), hits.size(), floor, recall, kbNames(new ArrayList<>(byId.values())));
             }
             return hits;
         }
@@ -202,7 +342,7 @@ public class KbSearchService {
             if (kb == null) {
                 continue;
             }
-            heap.offer(new Hit(kb, c, s));
+            heap.offer(Hit.vector(kb, c, s));
             if (heap.size() > recall) {
                 heap.poll();   // 弹出最小，堆内恒为 top-recall
             }
@@ -226,7 +366,8 @@ public class KbSearchService {
      */
     private List<Hit> refine(List<Hit> recalled, String query) {
         List<Hit> sorted = new ArrayList<>(recalled);
-        sorted.sort((a, b) -> Double.compare(b.score(), a.score()));   // 兜底顺序 = 向量分降序
+        // 兜底顺序 = 「本路相关度」降序：融合结果按 RRF 名次分，纯向量结果按余弦（与改造前逐字一致）
+        sorted.sort((a, b) -> Double.compare(b.rank(), a.rank()));
         int topK = props.topK();
 
         // 不按候选条数走不同阈值：早期写 size() > 1，导致「仅 1 条候选」落到兜底分支、
@@ -261,9 +402,14 @@ public class KbSearchService {
             log.debug("RAG 精排不可用或调用失败，降级为向量分截断（{} 块）", sorted.size());
         }
 
-        // 兜底：向量分降序 + 严格阈值，取 topK（精排上线前的原始行为）
+        // 兜底：向量分降序 + 严格阈值，取 topK（精排上线前的原始行为）。
+        // 这里**重排一次**而非沿用入参顺序：入参可能来自 RRF 融合（顺序按名次，与余弦无关），而本分支
+        // 只有余弦可判相关 —— 重排后「只被关键词打中」的候选（余弦 0）会被阈值自然滤掉，于是
+        // 「精排调用失败」精确退化为改造前的纯向量行为，降级路径不因新增一路而变得更宽松。
+        List<Hit> byVector = new ArrayList<>(recalled);
+        byVector.sort((a, b) -> Double.compare(b.score(), a.score()));
         List<Hit> picked = new ArrayList<>(topK);
-        for (Hit h : sorted) {
+        for (Hit h : byVector) {
             if (h.score() < props.minScore()) break;   // 已降序，首个不达标即全不达标
             picked.add(h);
             if (picked.size() >= topK) break;
@@ -290,7 +436,8 @@ public class KbSearchService {
                 items.append("|").append(source);
             }
             items.append("] ").append(h.chunk().getContent()).append("\n");
-            citations.add(new KbCitation(no, h.chunk().getId(), h.kb().getId(), h.kb().getName(), source, h.score()));
+            citations.add(new KbCitation(no, h.chunk().getId(), h.kb().getId(), h.kb().getName(), source, h.score(),
+                    h.matchedBy()));
         }
         String block = PromptProperties.render(promptProperties.kbContext(),
                 Map.of("items", items.toString().strip()));

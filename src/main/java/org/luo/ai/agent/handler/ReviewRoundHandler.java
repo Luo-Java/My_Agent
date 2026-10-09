@@ -288,7 +288,9 @@ public class ReviewRoundHandler implements RoundHandler {
         ChatClient.ChatClientRequestSpec spec = composer.internalChatClient().prompt()
                 .system(system)
                 .user(message);
-        spec = composer.decorateRequest(spec, agent, trace, conversationId);
+        // 审批闸门：候选作答同样可能调工具，过同一把闸门（并行候选撞同一工具时由唯一键去重，只留一行待确认）
+        spec = composer.decorateRequest(spec, agent, trace, conversationId, null,
+                composer.approvalContext(conversationId, agent, message));
         ChatResponse response = spec.call().chatResponse();
         llmUsageService.recordAsync("REVIEW", conversationId, null, response);
         return text(response);

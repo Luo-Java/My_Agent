@@ -2,6 +2,7 @@ package org.luo.ai.trace;
 
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
+import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import lombok.extern.slf4j.Slf4j;
@@ -9,10 +10,14 @@ import org.luo.ai.dto.InjectedMessage;
 import org.luo.ai.dto.KbCitation;
 import org.luo.ai.entity.AgentTrace;
 import org.luo.ai.mapper.AgentTraceMapper;
+import org.luo.ai.properties.PiiProperties;
+import org.luo.common.util.PiiJsonMasker;
+import org.luo.common.util.PiiMasker;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -35,10 +40,37 @@ public class TraceService {
 
     private final AgentTraceMapper mapper;
     private final Executor traceExecutor;
+    private final PiiProperties piiProperties;
 
-    public TraceService(AgentTraceMapper mapper, @Qualifier("traceExecutor") Executor traceExecutor) {
+    public TraceService(AgentTraceMapper mapper, @Qualifier("traceExecutor") Executor traceExecutor,
+                        PiiProperties piiProperties) {
         this.mapper = mapper;
         this.traceExecutor = traceExecutor;
+        this.piiProperties = piiProperties;
+    }
+
+    /**
+     * 落库前的 PII 脱敏；开关关闭时原样返回。
+     * <p>
+     * 与 {@code chat_message} 侧共用<b>同一个开关</b>：存在跨表逐字匹配契约（见 {@link PiiProperties}），
+     * 两处必须同开同关，否则「反馈转用例」「点踩自评」的匹配会静默失效。
+     */
+    private String mask(String text) {
+        return piiProperties.enabledOn() ? PiiMasker.mask(text) : text;
+    }
+
+    /**
+     * JSON 串脱敏：委托 {@link PiiJsonMasker} 做<b>结构化</b>处理（只替换字符串值，null 与数字原样）。
+     * <p>
+     * 本项目的 JSON 列都<b>不能</b>整串替换 —— 前端 {@code JSON.parse} 消费的那些（{@code plan_json}）
+     * 一旦在数字值位置被替换就产出非法 JSON，面板直接解析失败；{@code clarify_state} 那类则要保持
+     * 可解析、可比对。实现与理由见 {@link PiiJsonMasker}，不在这儿重复一份。
+     */
+    private String maskJson(String json) {
+        if (!piiProperties.enabledOn() || json == null || json.isBlank()) {
+            return json;
+        }
+        return PiiJsonMasker.mask(json);
     }
 
     /**
@@ -75,19 +107,20 @@ public class TraceService {
             t.setMode(trace.getMode());
             t.setRouteSource(trace.getRouteSource());
             t.setAgentCode(trace.getAgentCode());
-            t.setUserMessage(trace.getUserMessage());
-            t.setRetrievalQuery(trace.getRetrievalQuery());
-            t.setPlanJson(trace.getPlanJson());
+            t.setUserMessage(mask(trace.getUserMessage()));
+            t.setRetrievalQuery(mask(trace.getRetrievalQuery()));
+            t.setPlanJson(maskJson(trace.getPlanJson()));
             t.setMemoryJson(memoryJson(trace));
             t.setToolCalls(toolCallsJson(trace));
             t.setKbHitCount(trace.citationCount());
+            // 引用片段来自知识库文档（企业自有资料、另行管理），不在「用户随口说的个人信息」范围内，故不脱敏
             t.setCitationsJson(KbCitation.toJson(trace.getCitations()));
             t.setPromptTokens(trace.getPromptTokens());
             t.setCompletionTokens(trace.getCompletionTokens());
             t.setTotalTokens(trace.getTotalTokens());
             t.setElapsedMs(trace.getElapsedMs());
             t.setStatus(trace.getStatus());
-            t.setErrorMessage(trace.getErrorMessage());
+            t.setErrorMessage(mask(trace.getErrorMessage()));
             t.setCreatedAt(trace.getStartedAt() == null ? LocalDateTime.now() : trace.getStartedAt());
             mapper.insert(t);
             log.debug("追踪落库：traceId={}，会话={}，耗时={}ms，token={}，工具={}，RAG={}",
@@ -103,14 +136,16 @@ public class TraceService {
      * 对排查是两件事（前者是规划模式/采集失败，后者是首轮对话），不能都写成一个空对象。
      * 窗口逐条只留预览，长期记忆两段只留长度：追踪表是旁路留痕，不是第二份对话历史。
      */
-    private static String memoryJson(RoundTrace trace) {
+    private String memoryJson(RoundTrace trace) {
         RoundTrace.MemoryInjection mi = trace.getMemoryInjection();
         if (mi == null) return null;
         JSONArray items = new JSONArray(mi.window().size());
         for (InjectedMessage it : mi.window()) {
             JSONObject o = new JSONObject();
             o.set("role", it.role());
-            o.set("preview", it.preview());
+            // 预览取自历史正文。本轮之前的历史来自 DB（已脱敏），本轮注入的首轮内容可能含原文 ——
+            // 脱敏是幂等的（138****8000 不会被二次识别），故无条件再过一遍是安全的
+            o.set("preview", mask(it.preview()));
             o.set("chars", it.chars());
             items.add(o);
         }
@@ -123,15 +158,17 @@ public class TraceService {
     }
 
     /** 工具调用明细 → JSON 数组字符串；无调用返回 null（让列保持 NULL，便于「有没有调工具」直接判空）。 */
-    private static String toolCallsJson(RoundTrace trace) {
+    private String toolCallsJson(RoundTrace trace) {
         List<RoundTrace.ToolCall> calls = trace.getToolCalls();
         if (calls.isEmpty()) return null;
         JSONArray arr = new JSONArray(calls.size());
         for (RoundTrace.ToolCall c : calls) {
             JSONObject o = new JSONObject();
             o.set("name", c.name());
-            o.set("args", c.args());
-            o.set("result", c.result());
+            // 逐字段脱敏而非对最终 JSON 串整体替换：args/result 是自由文本（可能是数据库查询明细，
+            // 真的会带出学生/员工手机号），而最终串里还混着非字符串值，整体替换有破坏 JSON 的风险
+            o.set("args", mask(c.args()));
+            o.set("result", mask(c.result()));
             arr.add(o);
         }
         return arr.toString();
@@ -190,6 +227,10 @@ public class TraceService {
      * <p>
      * <b>匹配是近似的，必须当成可能失败来看</b>：{@code agent_trace.user_message} 落库时截断到 1000 字，
      * 而反馈里的 {@code user_input} 是消息原文 —— 超长输入会导致两者不相等。故调用方一致按
+     * <br>
+     * <b>脱敏不会额外破坏这个匹配</b>：{@code user_input} 取自 {@code chat_message}（已脱敏），
+     * {@code user_message} 在本类落库时脱敏，两边是<b>同一份原文、同一个 PiiMasker、同一个开关</b>，
+     * 结果必然相等（脱敏是确定性的）。这也是开关必须做成单一总开关的原因 —— 见 {@link PiiProperties}。
      * 「取不到就不做」处理（转用例报 400、自评记 WARN 后放过），而不是在这里做模糊匹配：
      * 模糊匹配可能把另一轮的事实挂到这条反馈上，那比匹配不上糟得多。
      *

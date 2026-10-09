@@ -6,9 +6,12 @@ import org.luo.ai.dto.EvalCase;
 import org.luo.ai.dto.EvalCaseResult;
 import org.luo.ai.dto.EvalCompare;
 import org.luo.ai.dto.PromoteFeedbackRequest;
+import org.luo.ai.dto.PromptGateStatus;
 import org.luo.ai.entity.EvalCaseEntity;
+import org.luo.ai.entity.PromptSnapshot;
 import org.luo.ai.service.EvalCaseService;
 import org.luo.ai.service.EvalService;
+import org.luo.ai.service.PromptGateService;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.system.constant.SysRoleCode;
@@ -45,10 +48,14 @@ public class EvalController {
 
     private final EvalService evalService;
     private final EvalCaseService evalCaseService;
+    /** 提示词改动门禁：回答「这一版提示词验没验过、结论是什么」。 */
+    private final PromptGateService promptGateService;
 
-    public EvalController(EvalService evalService, EvalCaseService evalCaseService) {
+    public EvalController(EvalService evalService, EvalCaseService evalCaseService,
+                          PromptGateService promptGateService) {
         this.evalService = evalService;
         this.evalCaseService = evalCaseService;
+        this.promptGateService = promptGateService;
     }
 
     /** 用例清单（只读用例集、不跑批），供前端预览「这次会跑哪些」。 */
@@ -82,6 +89,30 @@ public class EvalController {
     @GetMapping("/compare")
     public EvalCompare compare(@RequestParam String from, @RequestParam String to) {
         return evalService.compare(from, to);
+    }
+
+    // ===== 提示词改动门禁 =====
+
+    /**
+     * 当前门禁状态：当前提示词指纹 + 是否变更 + 最近一次结论 + 最近若干次快照。
+     * <p>
+     * 前端在评测面板顶部据此渲染一条横幅：「已改待验证」/「PASS」/「DEGRADED（含 broken 清单）」。
+     * 只读、零模型调用，可安全轮询。
+     */
+    @GetMapping("/gate")
+    public PromptGateStatus gate() {
+        return promptGateService.status();
+    }
+
+    /**
+     * 立即验证当前提示词：跑一批并与上一批对比，结论落 {@code prompt_snapshot}。
+     * <p>
+     * <b>会发起真实模型调用</b>（与 {@code /run} 同性质），故整类 ADMIN 的红线同样适用于此。
+     * 未开启 {@code agent.prompt-gate.auto-run} 时，这是唯一的验证入口。
+     */
+    @PostMapping("/gate")
+    public PromptSnapshot runGate() {
+        return promptGateService.verify(true);
     }
 
     // ===== 库内用例（运行时新增，当前唯一来源是用户反馈）=====

@@ -9,6 +9,7 @@ import org.luo.ai.service.AgentService;
 import org.luo.ai.chat.ChatComposer;
 import org.luo.ai.service.ConversationService;
 import org.luo.ai.agent.ParamFillingService;
+import org.luo.ai.tool.HandoffTool;
 import org.luo.ai.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -38,6 +39,8 @@ public class AgentRoundHandler implements RoundHandler {
     private static final String SRC_BOUND = "BOUND";
     private static final String SRC_ROUTE = "ROUTE";
     private static final String SRC_NONE = "NONE";
+    /** 智能体主动转交（handoff）：本轮由「被交接的」智能体作答。 */
+    private static final String SRC_HANDOFF = "HANDOFF";
 
     private final ConversationService conversationService;
     private final AgentService agentService;
@@ -70,8 +73,11 @@ public class AgentRoundHandler implements RoundHandler {
             // 不在此回显结果——改写产物是「检索问题」，用户能感知的是「要不要检索 / 命中什么」，不是中间问句。
             progress.accept("🔎 正在改写检索问句…");
         }
-        // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定。
-        boolean explicitBinding = AgentBindSource.EXPLICIT.equals(conv.getAgentBindSource());
+        // 绑定来源：EXPLICIT=用户显式选择（保持粘住，不因话题切换解绑）；CLARIFY=追问流程临时绑定；
+        // HANDOFF=智能体主动转交（与显式绑定一样粘住 —— 用户没推翻这次交接之前，它就该继续负责）。
+        String bindSource = conv.getAgentBindSource();
+        boolean explicitBinding = AgentBindSource.EXPLICIT.equals(bindSource);
+        boolean stickyBinding = explicitBinding || AgentBindSource.HANDOFF.equals(bindSource);
         // 路由判定是前置链里最重的一段 LLM 往返（普通会话未绑定时每次都要跑），先给反馈，避免「发送后 2~3 秒空白」。
         if (conv != null && conv.getAgentId() == null) {
             progress.accept("🧭 正在判断走哪个智能体…");
@@ -83,7 +89,7 @@ public class AgentRoundHandler implements RoundHandler {
         // 原实现依赖「是否凑齐参数」判断，但新话题里若恰好含城市词会被直接凑齐参数，检测彻底进不去。
         // 由路由 LLM 语义判断三态：continueTask=在回答追问 → 继续补全；命中另一 agent → 转向解绑；
         // none（未命中且未在回答追问）= 新话题且无 agent 可接 → 转普通对话并解绑。
-        if (!explicitBinding && conv.getAgentId() != null && AgentBindSource.CLARIFY.equals(conv.getAgentBindSource())) {
+        if (!stickyBinding && conv.getAgentId() != null && AgentBindSource.CLARIFY.equals(conv.getAgentBindSource())) {
             String pendingQuestion = paramFillingService.lastClarifyQuestion(conversationId);
             AgentRouter.RouteDecision rd = agentRouter.route(message, pendingQuestion,
                     composer.buildHistoryContextText(conversationId, RECENT_TURNS, null), conversationId);
@@ -96,9 +102,11 @@ public class AgentRoundHandler implements RoundHandler {
             }
         }
 
-        // 追踪：处理方来源以「本轮实际生效的绑定」为准——显式绑定=BOUND；路由/追问命中=ROUTE；其余=通用助手。
+        // 追踪：处理方来源以「本轮实际生效的绑定」为准——显式绑定=BOUND；转交绑定=HANDOFF；
+        // 路由/追问命中=ROUTE；其余=通用助手。
         if (trace != null) {
-            trace.route(explicitBinding ? SRC_BOUND : (agent != null ? SRC_ROUTE : SRC_NONE),
+            trace.route(explicitBinding ? SRC_BOUND : (AgentBindSource.HANDOFF.equals(bindSource) ? SRC_HANDOFF
+                    : (agent != null ? SRC_ROUTE : SRC_NONE)),
                     agent == null ? null : agent.getAgentCode());
         }
 
@@ -117,7 +125,7 @@ public class AgentRoundHandler implements RoundHandler {
             // 进入追问：把正在补全参数的 agent 临时绑定（CLARIFY），使下一轮回答能复用同一 agent。
             // 状态与消息同一次落库（避免话题切换分支误落库失效的追问）：只落消息不落状态，下一轮就读不到
             // 「问到第几次 / 原始请求是什么 / 已确认哪些参数」——历史被摘要压缩或标记不参与记忆后必然算歪。
-            if (agent != null && !explicitBinding) {
+            if (agent != null && !stickyBinding) {
                 conversationService.bindAgent(conversationId, agent.getId());
             }
             conversationService.saveClarifyState(conversationId, decision.getNextState());
@@ -134,15 +142,39 @@ public class AgentRoundHandler implements RoundHandler {
         }
         // 常规单智能体回答（动态规划由 planner 会话单独处理，见 PlannerRoundHandler）。
         // message 为纯提问（不含附件），附件材料走 material 注入 system，不进会话记忆。
+        // 转交持有者：白名单声明 handoff_agent 时挂载该工具，命中即由目标智能体接力本轮。
+        HandoffTool.HandoffHolder handoff = new HandoffTool.HandoffHolder();
         ChatComposer.ComposedRequest composed = composer.buildRequest(conversationId, message, conv, agent,
-                paramFillingService.buildParamBlock(decision), material, trace, prefetchedQuery);
+                paramFillingService.buildParamBlock(decision), material, trace, prefetchedQuery, handoff);
         ChatClient.ChatClientRequestSpec spec = composed.spec();
         // content() 标注 @Nullable（模型可能只产出工具调用而无正文）：必须在此收口，否则 null 会走到同步接口的
         // Map.of("content", reply) —— Map.of 拒绝 null 值 → NPE → 500。与流式路径 emitChunks 的归一口径一致。
         String reply = spec.call().content();
         if (reply == null) reply = "";
-        // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定的保持不变。
-        if (!explicitBinding) conversationService.unbindAgent(conversationId);
+
+        // 转交接力：原智能体把会话交了出去 —— 落 HANDOFF 绑定（粘住），并用目标智能体的完整人设重跑本轮。
+        if (handoff.handedOff()) {
+            Agent target = handoff.target();
+            progress.accept("🔁 已把会话转交给智能体「" + target.getName() + "」，由它接续回答");
+            conversationService.bindAgentHandoff(conversationId, target.getId());
+            if (trace != null) {
+                trace.route(SRC_HANDOFF, target.getAgentCode());
+            }
+            ChatComposer.HandoffOutcome relayed = composer.handoffAnswer(
+                    conversationId, message, conv, target, handoff.reason(), material, trace);
+            if (relayed.reply().isBlank()) {
+                // 接手方没产出：保留原智能体的转交说明（至少让用户知道发生了什么），不谎报成功
+                log.warn("转交接力：目标智能体「{}」未产出内容，保留转交说明", target.getAgentCode());
+                return RoundResult.answer(reply, composed.citations()).withRecall(composed.recallJson());
+            }
+            // 覆盖刚刚被记忆 Advisor 写下的「转交说明」：库里与界面必须是同一个答案（否则下一个 turn 的
+            // 模型会读到一段用户根本没见过的内容 —— 典型的事实漂移）
+            conversationService.overwriteLatestAssistantMessage(conversationId, relayed.reply());
+            return RoundResult.answer(relayed.reply(), relayed.citations()).withRecall(composed.recallJson());
+        }
+
+        // 路由命中的 agent 在完成回答后解绑，恢复后续轮的正常智能路由；显式绑定 / 转交绑定的保持不变。
+        if (!stickyBinding) conversationService.unbindAgent(conversationId);
         // 带上本轮 RAG 引用（由 ChatService 落库到本轮 assistant 消息、前端渲染角标）与跨会话召回
         // （仅推 SSE recall 事件供展示，不落库）。召回为空时 withRecall 原样返回，不影响其余字段。
         return RoundResult.answer(reply, composed.citations()).withRecall(composed.recallJson());

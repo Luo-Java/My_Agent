@@ -271,6 +271,26 @@ body {
 .um-tag.is-off { color: #cbd5e1; background: rgba(148, 163, 184, .16); }
 .um-tag.is-role { color: var(--primary-text); background: var(--primary-soft); }
 
+/* ===== 审计列 ===== */
+.um-tag.is-action { color: #c7d2fe; background: rgba(99, 102, 241, .16); }
+
+.um-table th.um-col-ip { width: 130px; }
+.um-table td.um-col-ip {
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* 明细是自由文本：允许换行并给个下限宽度，否则一条长明细会把整表撑出横向滚动 */
+.um-table td.um-detail {
+    word-break: break-word;
+    min-width: 260px;
+    color: var(--text);
+}
+
+.um-target { color: var(--text-soft); font-size: 12px; }
+.um-target-id { color: var(--primary-text); font-variant-numeric: tabular-nums; margin-left: 4px; }
+
 /* ===== 分页 ===== */
 .um-pager {
     display: flex;

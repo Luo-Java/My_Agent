@@ -102,6 +102,44 @@ agent:
     cases-file: classpath:eval-cases.yaml
     timeout-seconds: 60         # 单用例超时，超时记该条失败而不拖垮整批(被测调用自身没有 per-request 超时)
 
+  # 提示词改动门禁(PromptGateProperties)：把「改了 prompts.yaml 到底变好还是变差」从靠手感变成有结论，
+  # 并让它在改动发生的那一刻就被看见 —— 算 prompts.yaml 的内容指纹，与最近一次快照比对；
+  # 不一样就留一条 PENDING 快照(零模型调用)，可由 POST /api/eval/gate 或 auto-run 触发验证。
+  # enabled 默认 true：指纹比对不花钱，没理由关。auto-run 默认 false：跑批=真实模型调用，必须显式开。
+  prompt-gate:
+    enabled: true              # 总开关：关掉则既不比对指纹、也不记录快照
+    auto-run: false            # 检测到变更时是否自动跑批(开启后启动阶段会发起一次真实模型调用)
+    fail-on-broken: true       # 出现 broken(上批过、本批败)是否判为不通过；false=只记录
+
+  # 定时任务(ScheduleProperties)：把「一句话 + 一个周期」变成自动执行的对话(每周学情报告/每月成绩分析)。
+  # 触发方式是「轮询表」而非内存定时器：新增/修改/删除立即生效、重启自动恢复，代价是可能重复触发，
+  # 故执行前用 next_run_at 做 CAS 抢占，同一时刻只有一个执行者。
+  schedule:
+    enabled: true              # 调度器总开关(关掉后不再扫描，已有任务定义保留)
+    poll-interval-ms: 30000    # 轮询间隔(毫秒)；它决定「最坏晚多久执行」，默认 30 秒
+    max-per-tick: 3            # 单轮最多执行几个到期任务，防同一时刻堆积把模型额度打满
+    max-result-chars: 500      # 结果摘要落库与通知正文的截断长度(全文在承载会话里)
+
+  # 通知外发(NotifyProperties)：把落库的通知再往站外推一份(钉钉/企业微信机器人文本消息)。
+  # 默认不外发 —— webhook-url 为空时只落库、由前端轮询展示，不产生任何外部请求。
+  # webhook-url 属敏感信息(内含 access_token)，与 API Key 同处置：写 application-local.yaml 或环境变量。
+  notify:
+    webhook-url: ${NOTIFY_WEBHOOK_URL:}   # 为空=不外发；填了则低于 min-level 的通知仍只落库
+    connect-timeout-ms: 3000
+    read-timeout-ms: 5000
+    min-level: WARN            # 最低外发级别(INFO/WARN/ERROR)：INFO 全量外发会把群刷爆，等于把告警变噪声
+
+  # 工具审批闸门(ToolApprovalProperties)：声明「哪些工具执行前要先问过用户」。
+  # 背景：工具调用发生在模型内部，此前一路绿灯 —— 查库/画图/转交一键就执行，用户看不到「要干什么」也喊不停。
+  # 默认 enabled=false 且清单为空 ⇒ 不包装任何工具，行为与不装这套机制完全一致。
+  # 开启方式：enabled=true + 在 tools 里列出要拦的工具名(与 agent.tools_json 白名单同名)。
+  # 例：tools: [query, call_agent] —— 把只读 SQL 与外发子任务压到用户点头之后。
+  # 粒度是「会话 × 工具」：批准一次在本会话内持续有效(expire-minutes 后自动回到待确认)，不逐次打断。
+  tool-approval:
+    enabled: false             # 总开关；关掉时连一次额外查询都没有
+    tools: []                  # 需要审批的工具名清单；例 [query, call_agent, handoff_agent]
+    expire-minutes: 30         # 一次授权的有效期(分钟)；0=永不过期。只作用于「已批准」，「已拒绝」一票到底
+
   # 教务模块(EduProperties)：各 /api/edu/**/list 下拉选项接口的返回上限。
   # 这些接口语义是「返回全部可选项」，原本 SQL 层没有上界 —— score 的 selectOptions 要 join 5 张表
   # 再 concat 拼文案，在 5 万行数据下全量装载既慢又占内存。超出上限时截断并留 WARN（不静默）。
@@ -134,6 +172,15 @@ agent:
     input-patterns: []         # 输入侧正则规则(任一命中即拒绝)。示例：["(?i)\\brm\\s+-rf\\s+/"]
     output-patterns: []        # 输出侧正则规则(任一命中即替换正文)。示例：["(?i)sk-[a-zA-Z0-9]{20,}"]
 
+  # 数据侧脱敏(PiiProperties)：在「持久化边界」把手机号 / 身份证 / 邮箱 / 银行卡遮住中段，默认开启。
+  # 三处同时生效、共用一个开关：chat_message 正文、agent_trace 追踪留档、应用日志(见 logback-spring.xml 的 %pii)。
+  # 为什么只有一个开关：feedback.user_input(取自 chat_message)要逐字匹配 agent_trace.user_message，
+  #   两处若可分别开关，匹配会静默失效(表现为「转用例偶尔失败」且只留一句 WARN)。一致性由结构保证。
+  # 唯一副作用：chat_message 脱敏后会被读回、注入下一轮上下文 ⇒ 模型此后看不到完整号码(只看到 138****8000)。
+  #   工具调用与检索都在脱敏之前执行完毕，不受影响。关掉它 = 明文落库，仅在业务需要模型复述完整号码时才关。
+  pii:
+    enabled: true              # false = 三处全部短路
+
   # 并行评审(ReviewProperties)：会话开「⚖ 评审」后，本轮由多个候选智能体并行作答、再由裁决者综合成最终答案。
   # 候选由 LLM 按「谁最适合回答这个问题」从智能体库里选；会话若已绑定智能体则固定占一个候选位。
   # 不足 2 个候选时明确播报原因并回退普通对话 —— 不静默降级成单模型回答。
@@ -147,12 +194,29 @@ agent:
   # 为什么是关键词而非向量：会话消息逐轮写入，走向量检索等于每条消息多一次 embedding 调用 + 一套副本维护链路，
   # 且会与知识库块(kb_chunk)的向量空间互相干扰；代价是召回质量受限于提词质量与字面匹配(明确接受的边界)。
   # 归属隔离靠 JOIN conversation(user_id)，并强制排除当前会话(当前会话已在记忆窗口里)。
+  # 阈值告警与周期报告(AlertService)：把可观测面板里「要人主动去看」的指标变成越线主动推(落 notification 表)。
+  # 三道防噪：样本不足不判定(min-sample)、同一项冷却期内不重报(cooldown-minutes)、空窗口不发报告。
+  # 收件人 = 全部 ADMIN；一个都查不到时改为广播并记 WARN(告警没人收到比广播更糟)。
+  alert:
+    enabled: true
+    window-days: 1              # 告警看「现在怎么样」，不是「这周平均怎么样」
+    min-sample: 10              # 低于该轮次不做判定(小流量下 1 次失败就是 33% 成功率)
+    min-success-rate: 0.90      # 成功率下限(0~1)
+    max-avg-elapsed-ms: 15000   # 平均耗时上限(毫秒)
+    max-low-score-count: 5      # 低分自评轮次上限(低分阈值复用 agent.self-eval.low-score-threshold)
+    cooldown-minutes: 60        # 同一项告警的冷却期(指标是持续状态，每轮重报会把通知面板刷满)
+    check-interval-ms: 600000   # 检查间隔(毫秒)；由 @Scheduled 占位符直接读取，不进 AlertProperties
+    report-enabled: true
+    report-cron: "0 0 9 * * *"  # 周期报告 cron(默认每天 09:00)；同上，由 @Scheduled 占位符直接读取
+    report-days: 1
+
   cross-session:
     enabled: true              # 能力总开关(真正的启用条件是「本开关开 且 会话开关开」)
     recall-limit: 50           # SQL 层候选条数上限(先粗拉再在 Java 侧定型，避免大表无界扫描)
     top-k: 3                   # 最终注入上下文的条数
-    max-keywords: 5            # 从当前问题抽取的关键词个数上限
+    max-keywords: 8            # 检索词个数上限(含「同义说法」，故比纯原词提词时要多)
     snippet-chars: 300         # 单条召回内容注入与展示的截断长度
+    semantic-rerank: true      # 用精排对召回候选做语义重排(阈值复用 agent.rag.rerank-min-score)；关掉或精排不可用则退回命中词数排序
 
   # 失控刹车(ToolCallProperties)：给 Spring AI 默认无限工具循环装三道刹车，防死循环/重复调用/单轮烧穿。
   # 三道都是「软刹车」——不抛错，而是把「停止调工具、基于已有信息作答」追加进 system，让模型用已查到的
@@ -180,6 +244,12 @@ agent:
     fallback-max-chunks: 2000 # Chroma 不可用时回退 MySQL 的扫描上限，防无界扫描 OOM
     query-rewrite-enabled: true
     query-rewrite-history-size: 6   # 参与指代消解的历史条数上限
+    # 混合检索：向量一路 + 关键词一路，两路用 RRF(只比名次，免疫两路分数尺度差异)融合后再交精排。
+    # 关键词一路只在精排可用时参与 —— 融合分不是相似度，离开精排就只能退回纯向量(降级路径要的是行为可预期)。
+    keyword-recall-enabled: true
+    keyword-recall-k: 20             # 关键词路候选数(与 recall-k 同量级，融合后统一收敛到 recall-k)
+    keyword-recall-scan-cap: 2000    # 关键词 LIKE 查询的 SQL 候选上限(有界，防 TEXT 列无界扫描)
+    rrf-k: 60                        # RRF 常数：越大越强调「两路都命中」的共识
 
 # MyBatis-Plus
 mybatis-plus:

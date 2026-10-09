@@ -480,6 +480,12 @@ const app = createApp({
         // 因此重发走的仍是同一条 /api/chat/stream 通路，不需要第二套发送逻辑。
         const editingIndex = ref(-1);
 
+        // ===== 工具审批闸门 =====
+        // 后端 agent.tool-approval.tools 声明「哪些工具执行前要先问过用户」。命中拦截时后端落一条待确认记录、
+        // 同时给模型一句「需要确认」让它收口 —— 所以用户会先看到「执行 X 需要确认」的回答，再看到这条待确认条。
+        // 拉取方式用 GET 而非 SSE：授权粒度是「本会话 × 工具」，切走再回来、刷新页面都该还在。
+        const toolApprovals = ref([]);
+
         // ===== 长期记忆面板 =====
         // 双层记忆此前完全黑盒：压缩由后端异步写入，用户看不到「它记住了什么」、也无法纠正记错的内容。
         // 本面板把「逐条长期事实 / 旧版归档 / 滚动摘要」摊开可编辑；summarizedCount 是执行游标，只展示不可改。
@@ -495,8 +501,23 @@ const app = createApp({
         // 用户删掉一条自动条目后若它又出现，那不是 bug，而是「对话里又提到了一次」。
         const factTopics = ['身份', '偏好', '待办', '背景', '其它'];
         const factBusy = ref(false);
-        const factAdd = reactive({ topic: '偏好', fact: '' });
-        const factEdit = reactive({ id: null, topic: '偏好', fact: '' });
+        // expiresAt 用 datetime-local 的原生值（"YYYY-MM-DDTHH:mm"）：这个形状**正好**是
+        // Java LocalDateTime 的 ISO 解析格式，前后端都不需要转换。空串 = 永不过期。
+        const factAdd = reactive({ topic: '偏好', fact: '', expiresAt: '' });
+        const factEdit = reactive({ id: null, topic: '偏好', fact: '', expiresAt: '' });
+
+        /** datetime-local 的原生值 → 请求体：空串要送 null（送 "" 会让后端解析失败）。 */
+        function factExpires(v) {
+            return v && String(v).trim() ? String(v).trim() : null;
+        }
+
+        /** 置信度分档配色：1~2 低（可能是臆测）/ 3 中性 / 4~5 高。 */
+        function factConfClass(f) {
+            const n = Number(f && f.confidence) || 3;
+            if (n <= 2) return 'lv-low';
+            if (n >= 4) return 'lv-high';
+            return '';
+        }
 
         // ===== 引用回链：查看被引用的那段原文 =====
         // 气泡里的「引用来源」此前只有「库名 · 文件名 · 相关度」，看不到真正回答问题的原文段落，
@@ -975,6 +996,7 @@ const app = createApp({
                 reviewEnabled.value = false;  // 评审默认关闭（多候选 = 多次模型调用，显式开启才走）
                 crossSession.value = false;   // 跨会话检索默认关闭（需要时在输入框自行开启）
                 runningTask.value = null;   // 新会话无未完成任务
+                toolApprovals.value = [];   // 新会话无审批记录（授权按会话隔离）
                 mainView.value = 'chat';
                 scrollToBottom();
             } catch (e) {
@@ -1042,6 +1064,7 @@ const app = createApp({
             } catch (e) { /* 忽略 */ }
             if (seq !== historySeq) return;   // 结果已过期：不写 messages，也不滚动/渲染图表
             await loadFeedback();             // 反馈单独拉一次，按 messageId 合并到消息上（见 loadFeedback 注释）
+            await loadToolApprovals();        // 待确认的工具调用也单独拉（授权是会话级的，不属于某条消息）
             scrollToBottom();
             renderChartsNow(); // 历史消息可能含 echarts 块，渲染图表
         }
@@ -1183,6 +1206,135 @@ const app = createApp({
             }
         }
 
+        // ===== 工具审批闸门 =====
+        // 三条动作的共同点：都是「改一条本会话的授权状态」，改完重新拉一次列表 —— 界面永远以服务端的
+        // effective 为准（已批准/已过期的折算在后端算，前端不写第二份「过期了没有」的判据）。
+
+        /**
+         * 拉取本人当前会话的审批记录。
+         * <p>只展示「还不能用」的那些：PENDING（待确认）、REJECTED（已拒绝，可撤销），以及
+         * 「已批准但授权已过期」的（后端已折算成 PENDING，会带着过期说明重现）。已批准且有效的行不显示 ——
+         * 它无事可做，留着只会长期占位置。
+         * <p>拉不到就当没有：审批条是附加信息，不该因为它影响对话本身。
+         */
+        async function loadToolApprovals() {
+            if (!currentId.value) { toolApprovals.value = []; return; }
+            try {
+                const resp = await apiFetch('/api/tool-approval?conversationId=' + encodeURIComponent(currentId.value));
+                if (!resp.ok) { toolApprovals.value = []; return; }
+                const list = await resp.json();
+                toolApprovals.value = (Array.isArray(list) ? list : [])
+                    .filter(x => x && x.effective && x.effective !== 'APPROVED')
+                    .map(x => Object.assign({}, x, { busy: false }));
+            } catch (e) { toolApprovals.value = []; }
+        }
+
+        /** 待确认条上的状态说明（「已批准但过期」要说出来，否则用户会以为批准没生效）。 */
+        function approveStateText(a) {
+            if (!a) return '';
+            if (a.effective === 'PENDING') {
+                return a.status === 'APPROVED' ? '授权已过期，需重新确认' : '等待确认';
+            }
+            return a.effective === 'REJECTED' ? '已拒绝（本会话内一直挡住）' : '已批准';
+        }
+
+        /** 入参摘要：一行之内说清「它要干什么」（完整内容在 title 里）。 */
+        function approveInputText(a) {
+            const s = (a && a.inputJson) ? String(a.inputJson) : '';
+            return s.length > 160 ? s.slice(0, 160) + '…' : s;
+        }
+
+        /**
+         * 批准：本会话内放行该工具，随后立刻重跑刚才那一轮。
+         * <p>重跑走的是既有「重新生成」通路（开新版本 + 重发同一提问），不新增发送逻辑，
+         * 也不会让同一条提问在历史里留下两份 —— 旧版本会被标记为非生效版本，模型看不见它。
+         */
+        async function approveTool(a) {
+            if (!a || a.busy) return;
+            a.busy = true;
+            try {
+                const resp = await apiFetch('/api/tool-approval/' + a.id + '/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            } catch (e) {
+                a.busy = false;
+                alert('批准失败：' + e.message);
+                return;
+            }
+            a.busy = false;
+            await loadToolApprovals();
+            await rerunApprovedTool(a.userMessage);
+        }
+
+        /** 拒绝：本会话内一直挡住（后端会回给模型「已被拒绝」，模型不再重试也不绕道）。 */
+        async function rejectTool(a) {
+            if (!a || a.busy) return;
+            const note = prompt('拒绝原因（选填，最多 200 字）。模型将不再尝试该工具：', '');
+            if (note === null) return;   // 取消 = 不改动
+            a.busy = true;
+            try {
+                const resp = await apiFetch('/api/tool-approval/' + a.id + '/reject', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ note: note || null })
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            } catch (e) {
+                alert('拒绝失败：' + e.message);
+            }
+            a.busy = false;
+            await loadToolApprovals();
+        }
+
+        /** 撤销拒绝：回到待确认，让用户改主意（没有这个口，点错了就只能删会话）。 */
+        async function resetTool(a) {
+            if (!a || a.busy) return;
+            a.busy = true;
+            try {
+                const resp = await apiFetch('/api/tool-approval/' + a.id + '/reset', { method: 'POST' });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            } catch (e) {
+                alert('撤销失败：' + e.message);
+            }
+            a.busy = false;
+            await loadToolApprovals();
+        }
+
+        /**
+         * 批准后重跑：找到那条提问在本地消息列表里的位置，走「编辑重发」通路发出去。
+         * <p>找不到（例如已切到别的会话、历史被裁掉）就退化成一句提示，不瞎发 ——
+         * 发错的代价是把一次未授权的工具调用挂到无关的提问上。
+         */
+        async function rerunApprovedTool(userMessage) {
+            if (loading.value) return;
+            const idx = findAskIndex(userMessage);
+            if (idx < 0) {
+                alert('已批准。请重新发送刚才的提问，该工具这次会直接执行。');
+                return;
+            }
+            editingIndex.value = idx;
+            input.value = messages.value[idx].content || '';
+            await send();
+        }
+
+        /** 在本地消息里倒着找那条用户提问的下标；原文对不上时退回「最后一条用户消息」。 */
+        function findAskIndex(userMessage) {
+            const text = (userMessage == null ? '' : String(userMessage)).trim();
+            if (text) {
+                for (let i = messages.value.length - 1; i >= 0; i--) {
+                    const m = messages.value[i];
+                    if (m.role === 'user' && (m.content || '').trim() === text) return i;
+                }
+            }
+            for (let i = messages.value.length - 1; i >= 0; i--) {
+                if (messages.value[i].role === 'user') return i;
+            }
+            return -1;
+        }
+
         // ===== 会话导出 =====
         /** 导出当前会话为 Markdown。后端回文本、这里拼 Blob 下载 —— 裸链接带不上 Authorization 请求头。 */
         async function exportConversation() {
@@ -1263,11 +1415,12 @@ const app = createApp({
                 const resp = await apiFetch('/api/chat/conversation/' + encodeURIComponent(currentId.value) + '/facts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ topic: factAdd.topic, fact: text })
+                    body: JSON.stringify({ topic: factAdd.topic, fact: text, expiresAt: factExpires(factAdd.expiresAt) })
                 });
                 const d = await resp.json().catch(() => null);
                 if (!resp.ok) throw new Error((d && d.message) || ('HTTP ' + resp.status));
                 factAdd.fact = '';
+                factAdd.expiresAt = '';
                 await reloadFacts();
                 alert('已添加（手动条目不会被自动整理删除）');
             } catch (e) {
@@ -1282,12 +1435,16 @@ const app = createApp({
             factEdit.id = f.id;
             factEdit.topic = f.topic;
             factEdit.fact = f.fact;
+            // 只取到分钟：datetime-local 认 "YYYY-MM-DDTHH:mm"，后端给的带秒值直接塞进去
+            // 在部分浏览器上会被判为非法值而显示为空（用户以为「这条没有有效期」）。
+            factEdit.expiresAt = f.expiresAt ? String(f.expiresAt).slice(0, 16) : '';
         }
 
         function cancelFactEdit() {
             factEdit.id = null;
             factEdit.topic = '偏好';
             factEdit.fact = '';
+            factEdit.expiresAt = '';
         }
 
         /** 保存行内编辑：内容与主题都会写回；后端会把该条转为「手动」来源（人工修正过的不再被自动淘汰）。 */
@@ -1305,7 +1462,9 @@ const app = createApp({
                     + '/facts/' + encodeURIComponent(id), {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ topic: factEdit.topic, fact: text })
+                    // 有效期留空即「清除有效期」（重新变成永久有效），不是「保持原值」——
+                    // 表单上留空就是「不过期」，这与用户的直观预期一致（后端注释里也写明了这条口径）。
+                    body: JSON.stringify({ topic: factEdit.topic, fact: text, expiresAt: factExpires(factEdit.expiresAt) })
                 });
                 const d = await resp.json().catch(() => null);
                 if (!resp.ok) throw new Error((d && d.message) || ('HTTP ' + resp.status));
@@ -2494,7 +2653,12 @@ const app = createApp({
         }
         /** 处理方来源 → 中文标签（与后端 agent_trace.route_source 取值对应）。 */
         function routeLabel(src) {
-            return ({ BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排', REVIEW: '并行评审' })[src] || (src || '-');
+            return ({
+                BOUND: '会话绑定', ROUTE: '智能路由', NONE: '通用助手', PLAN: '规划编排', REVIEW: '并行评审',
+                // HANDOFF = 智能体在本轮里主动把会话交出去（与「用户显式选择」都粘住，但要能分辨）：
+                // 追踪里如果两者都显示成「会话绑定」，就再也查不出「这个绑定是谁定的」
+                HANDOFF: '智能体转交'
+            })[src] || (src || '-');
         }
         /** 形态 → 中文标签。 */
         function modeLabel(mode) {
@@ -2530,7 +2694,9 @@ const app = createApp({
             open: false, scenario: '', caseCount: 0,
             running: false, error: '', result: null, batches: [], compare: null,
             // 库内用例（yaml 之外的增量，目前唯一来源是「用户反馈转用例」）：json / 读取错误 / 正在删的那条 id
-            dbCases: [], dbError: '', dbBusy: 0
+            dbCases: [], dbError: '', dbBusy: 0,
+            // 提示词门禁（P0-1）：当前指纹、有没有变、验没验过、最近结论。见 PromptGateService。
+            gate: null, gateBusy: false
         });
 
         /** 打开评测弹窗：先读用例集把条数显示出来（点「跑一批」前就该知道会发起多少次模型调用）。 */
@@ -2541,12 +2707,98 @@ const app = createApp({
             await loadEvalCases();
             await loadEvalDbCases();
             await loadEvalBatches();
+            await loadEvalGate();
         }
 
         function closeEval() {
             evalModal.open = false;
             evalModal.result = null;
             evalModal.compare = null;
+        }
+
+        // ---- 提示词门禁（P0-1）：把「提示词是哪一版」与「跑的结论」绑起来 ----
+        // 补的缺口：跑批 + 跨批对比早就有，但**只有手动触发**，于是真实流程是「改了 prompts.yaml →
+        // 上线 → 觉得不对 → 才想起来跑评测」，中间那段「这版到底验过没有」全靠人记。
+        // 这里展示的内容指纹只回答「变了没有」，不回答「改了哪句」——后者要 diff，不是它的职责。
+
+        /** 读当前门禁状态（打开评测弹窗时拉一次）。失败即置空，横幅不渲染，不弹错 —— 它是旁路信息。 */
+        async function loadEvalGate() {
+            try {
+                const resp = await apiFetch('/api/eval/gate');
+                if (!resp.ok) { evalModal.gate = null; return; }
+                evalModal.gate = await resp.json();
+            } catch (e) {
+                evalModal.gate = null;
+            }
+        }
+
+        /**
+         * 「校验并留档」= 跑一批 + 与上一批对比 + 把结论固化成一版快照。
+         * <p>与「▶ 跑一批」的区别：那个只看本次结果，这个把「这一版提示词行不行」写进库，
+         * 于是重启、隔天、换个人来看，结论都还在。代价一模一样（一次真实跑批），故同样先确认再置忙。
+         * <p>刻意<b>不</b>在确认框里写「失败会拦发布」—— 本项目里门禁只把结论摆出来，不拦任何东西。
+         */
+        async function runEvalGate() {
+            if (evalModal.gateBusy) return;
+            if (!confirm('校验当前提示词？\n\n'
+                    + '会跑一批完整用例（真实模型调用，消耗计入成本看板），并与上一批对比后把结论留档。\n'
+                    + '用例较多时可能等几十秒。')) return;
+            evalModal.gateBusy = true;
+            evalModal.error = '';
+            try {
+                const resp = await apiFetch('/api/eval/gate', { method: 'POST' });
+                if (resp.status === 403) throw new Error('仅管理员可用（当前账号无 ADMIN 角色）');
+                if (!resp.ok) throw new Error(await evalErrorText(resp));
+                await loadEvalGate();
+                await loadEvalBatches();
+                pushNotice('提示词门禁：' + gateVerdictText(evalModal.gate));
+            } catch (e) {
+                evalModal.error = '门禁校验失败：' + e.message;
+            } finally {
+                evalModal.gateBusy = false;
+            }
+        }
+
+        /** 门禁结论 → 横幅配色类。四态与评测列表的三态同构，「没验过」与「验过变差」必须分开。 */
+        function gateClass(g) {
+            if (!g) return '';
+            const v = g.latest ? g.latest.verdict : null;
+            if (v === 'DEGRADED') return 'gate-degraded';
+            if (v === 'ERROR') return 'gate-error';
+            if (v === 'PASS' && g.verified) return 'gate-pass';
+            if (v === 'STILL_FAILED' && g.verified) return 'gate-still';
+            return 'gate-pending';
+        }
+
+        /** 门禁结论 → 一句「我现在该做什么」。措辞直白优先，不用「状态：PASS」这种要查表的写法。 */
+        function gateVerdictText(g) {
+            if (!g) return '';
+            if (!g.latest) return '尚无校验记录（首次使用请先跑一批留档）';
+            if (!g.verified) {
+                return g.latest.verdict === 'ERROR'
+                        ? '上次校验本身失败了，未产出结论' : '提示词已变更，尚未验证';
+            }
+            switch (g.latest.verdict) {
+                case 'PASS': return '当前提示词已通过校验';
+                case 'DEGRADED': return '当前提示词出现新增失败（相对上一批劣化）';
+                case 'STILL_FAILED': return '无新增失败，但仍有未通过用例';
+                default: return '当前提示词状态：' + g.latest.verdict;
+            }
+        }
+
+        /** 门禁明细：把 detailJson 的 broken / fixed 翻成一句可读的话；解析失败就什么都不显示。 */
+        function gateDetailText(g) {
+            if (!g || !g.latest || !g.latest.detailJson) return '';
+            let d;
+            try { d = JSON.parse(g.latest.detailJson); } catch (e) { return ''; }
+            const parts = [];
+            if (d.broken && d.broken.length) parts.push('新增失败：' + d.broken.join('、'));
+            if (d.fixed && d.fixed.length) parts.push('已修复：' + d.fixed.join('、'));
+            if (d.error) parts.push('错误：' + d.error);
+            if (d.note) parts.push(d.note);
+            if (!parts.length) return '';
+            const at = g.latest.createdAt ? '（' + fmtTime(g.latest.createdAt) + '）' : '';
+            return parts.join(' · ') + at;
         }
 
         /**
@@ -3088,6 +3340,9 @@ const app = createApp({
                 buf += decoder.decode();
                 flushEvents();
                 renderChartsNow(); // 流结束：强制渲染图表（防抖可能还没到点）
+                // 本轮可能被审批闸门拦下（工具要用户点头）：拉一次待确认列表，让「待确认条」浮现。
+                // 放在流结束之后而不是解析事件时——拦截发生在模型内部，SSE 里没有对应事件。
+                loadToolApprovals();
                 // 刷新侧边栏（标题/排序可能因首条消息而更新）
                 loadConversations();
             } catch (e) {
@@ -3721,6 +3976,280 @@ const app = createApp({
             }
         }
 
+        // ==================================================================
+        // 通知出口（P0-2 定时任务 / P1-4 阈值告警 / P0-1 门禁 共用）
+        // ==================================================================
+        // 为什么是轮询而不是长连接：这些事的产生时机（定时任务到点 / 聚合指标越线 / 门禁出结论）与
+        // 任何一次 HTTP 请求无关，没有可依附的 SSE 通道 —— 硬塞长连接既不经济也不可靠（关页面就丢）。
+        // 落表 + 轮询换来「可重放、可回看」，代价是最多晚一个周期到达，对「昨天的任务失败了」足够。
+        // 角标只拉未读数（一次轻查询）；只有点开面板才取列表 —— 别让后台轮询每次都拖回 50 条正文。
+        const NOTIFY_POLL_MS = 60000;
+        const notifyState = reactive({ open: false, unread: 0, items: [], error: '' });
+        let notifyTimer = null;
+
+        /** 未读数（铃铛角标）。失败静默：这是后台轮询，网络抖一下就弹提示反而更吵。 */
+        async function loadNotifyUnread() {
+            try {
+                const resp = await apiFetch('/api/notification/unread');
+                if (!resp.ok) return;
+                notifyState.unread = (await resp.json()).count || 0;
+            } catch (e) { /* 后台轮询，忽略 */ }
+        }
+
+        /** 开 / 收通知面板。只在展开时拉列表；收起不清空，避免再次展开白屏一瞬。 */
+        async function toggleNotify() {
+            notifyState.open = !notifyState.open;
+            if (notifyState.open) await loadNotifyList();
+        }
+
+        function closeNotify() {
+            notifyState.open = false;
+        }
+
+        async function loadNotifyList() {
+            notifyState.error = '';
+            try {
+                const resp = await apiFetch('/api/notification');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                notifyState.items = await resp.json();
+            } catch (e) {
+                notifyState.items = [];
+                notifyState.error = '通知读取失败：' + e.message;
+            }
+            await loadNotifyUnread();
+        }
+
+        /**
+         * 点某条通知 → 先标已读，再按 refType 跳到对应位置（目前只有会话可跳：
+         * 定时任务的执行结果就在它的承载会话里，「点通知 → 落到那段对话」是最短的路径）。
+         */
+        async function openNotify(n) {
+            if (!n) return;
+            if (!n.readAt) {
+                try {
+                    await apiFetch('/api/notification/' + n.id + '/read', { method: 'POST' });
+                    n.readAt = 'just-now';
+                    await loadNotifyUnread();
+                } catch (e) { /* 标记失败不改跳转行为 */ }
+            }
+            if (n.refType === 'CONVERSATION' && n.refId) {
+                notifyState.open = false;
+                await selectConversation(n.refId);
+            }
+        }
+
+        /** 这条通知点了有没有反应：只有能跳转的才给手型光标，免得「看起来能点但什么都不发生」。 */
+        function notifyClickable(n) {
+            return !!n && n.refType === 'CONVERSATION' && !!n.refId;
+        }
+
+        async function markAllNotifyRead() {
+            if (!notifyState.unread) return;
+            try {
+                await apiFetch('/api/notification/read-all', { method: 'POST' });
+                notifyState.items.forEach(x => { if (!x.readAt) x.readAt = 'just-now'; });
+                await loadNotifyUnread();
+            } catch (e) {
+                notifyState.error = '标记失败：' + e.message;
+            }
+        }
+
+        /** 通知类型 → 中文短标签（列表里当分类胶囊用）。 */
+        function notifyTypeLabel(t) {
+            return ({ SYSTEM: '系统', SCHEDULED_TASK: '定时', ALERT: '告警', PROMPT_GATE: '门禁' })[t] || '其它';
+        }
+
+        /** 级别 → 配色类（INFO 蓝 / WARN 黄 / ERROR 红）。 */
+        function notifyLevelClass(n) {
+            const lv = (n && n.level) || 'INFO';
+            if (lv === 'ERROR') return 'notify-lv-error';
+            if (lv === 'WARN') return 'notify-lv-warn';
+            return 'notify-lv-info';
+        }
+
+        // ==================================================================
+        // 定时任务（P0-2）
+        // ==================================================================
+        // 与「规划任务」（task 表）是两回事：那张表是一轮规划的**运行实例**（状态机 + 起止），
+        // 这里管的是长期存在的**定义**（周期 / 开关 / 下次触发时间），到点才产生一次执行。
+        // 执行体不另造一套 —— 到点后就是「以本人身份在承载会话里把提示词问一遍」，
+        // 故记忆 / RAG / 工具 / 成本统计一样都不少。
+        // cron 的合法性**只由后端判**（Spring CronExpression），前端不写第二份正则：
+        // 两处口径迟早不一致，届时前端放行、后端 400，看起来就像 bug。
+        const SCHED_PRESETS = [
+            { label: '每小时整点', cron: '0 0 * * * ?' },
+            { label: '每天 09:00', cron: '0 0 9 * * ?' },
+            { label: '每天 18:00', cron: '0 0 18 * * ?' },
+            { label: '每周一 09:00', cron: '0 0 9 ? * MON' },
+            { label: '每月 1 号 09:00', cron: '0 0 9 1 * ?' }
+        ];
+
+        const schedModal = reactive({
+            open: false, list: [], error: '', busyId: 0, saving: false, form: null
+        });
+
+        // 绑定智能体的可选项：首项「不绑定」的值是 null（走后端智能路由）。
+        // 注意不能复用 agentChoices —— 那是「尚无专属知识库的智能体」，与这里要的「全部智能体」不是一回事。
+        const schedAgentChoices = computed(() => [
+            { value: null, label: '不绑定（走智能路由）' },
+            ...agents.value.map(a => ({ value: a.id, label: (a.icon || '🤖') + ' ' + a.name }))
+        ]);
+
+        async function openSched() {
+            schedModal.open = true;
+            schedModal.form = null;
+            await loadSched();
+        }
+
+        function closeSched() {
+            schedModal.open = false;
+            schedModal.form = null;
+        }
+
+        async function loadSched() {
+            schedModal.error = '';
+            try {
+                const resp = await apiFetch('/api/schedule');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                schedModal.list = await resp.json();
+            } catch (e) {
+                schedModal.list = [];
+                schedModal.error = '任务列表读取失败：' + e.message;
+            }
+        }
+
+        function newSched() {
+            schedModal.form = {
+                id: null, name: '', cron: '0 0 9 * * ?', agentId: null, prompt: '',
+                enabled: true, notifyOn: true
+            };
+        }
+
+        function editSched(t) {
+            schedModal.form = {
+                id: t.id, name: t.name, cron: t.cron, agentId: t.agentId == null ? null : t.agentId,
+                prompt: t.prompt || '', enabled: !!t.enabled, notifyOn: !!t.notifyOn
+            };
+        }
+
+        /** 新建 / 修改共用。空值在前端先拦一道只是省一次往返，真正的校验（cron 合法性）在后端。 */
+        async function submitSched() {
+            const f = schedModal.form;
+            if (!f || schedModal.saving) return;
+            if (!f.name.trim()) { schedModal.error = '任务名称不能为空'; return; }
+            if (!f.cron.trim()) { schedModal.error = '触发周期不能为空'; return; }
+            if (!f.prompt.trim()) { schedModal.error = '提示词不能为空'; return; }
+            schedModal.saving = true;
+            schedModal.error = '';
+            try {
+                const resp = await apiFetch('/api/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id: f.id, name: f.name.trim(), cron: f.cron.trim(), agentId: f.agentId,
+                        prompt: f.prompt.trim(), enabled: f.enabled, notifyOn: f.notifyOn
+                    })
+                });
+                if (!resp.ok) throw new Error(await schedErrorText(resp));
+                schedModal.form = null;
+                await loadSched();
+            } catch (e) {
+                schedModal.error = '保存失败：' + e.message;
+            } finally {
+                schedModal.saving = false;
+            }
+        }
+
+        async function toggleSched(t) {
+            if (schedModal.busyId) return;
+            schedModal.busyId = t.id;
+            schedModal.error = '';
+            try {
+                const resp = await apiFetch('/api/schedule/' + t.id + '/toggle?enabled=' + (!t.enabled),
+                    { method: 'PUT' });
+                if (!resp.ok) throw new Error(await schedErrorText(resp));
+                await loadSched();
+            } catch (e) {
+                schedModal.error = '操作失败：' + e.message;
+            } finally {
+                schedModal.busyId = 0;
+            }
+        }
+
+        /**
+         * 立即执行一次。**会发起真实模型调用**（任务本身就是一次对话），故先确认 ——
+         * 与「跑一批评测」同一性质：点一下要花钱，且这一下可能等十几秒。
+         * 后端同步返回（等这次对话跑完），故期间整个面板的行按钮都置忙。
+         */
+        async function runSchedNow(t) {
+            if (schedModal.busyId) return;
+            if (!confirm('立即执行「' + t.name + '」一次？\n\n'
+                    + '这会发起一次真实模型调用（消耗计入成本看板），可能等十几秒。\n'
+                    + '不影响既定排期。')) return;
+            schedModal.busyId = t.id;
+            schedModal.error = '';
+            try {
+                const resp = await apiFetch('/api/schedule/' + t.id + '/run', { method: 'POST' });
+                if (!resp.ok) throw new Error(await schedErrorText(resp));
+                await loadSched();
+                pushNotice('定时任务已执行：' + t.name);
+            } catch (e) {
+                schedModal.error = '执行失败：' + e.message;
+            } finally {
+                schedModal.busyId = 0;
+            }
+        }
+
+        async function deleteSched(t) {
+            if (schedModal.busyId) return;
+            if (!confirm('删除定时任务「' + t.name + '」？\n\n'
+                    + '承载会话与其中的执行记录会保留（那是真实对话，不该跟着定义一起消失）。')) return;
+            schedModal.busyId = t.id;
+            schedModal.error = '';
+            try {
+                const resp = await apiFetch('/api/schedule/' + t.id, { method: 'DELETE' });
+                if (!resp.ok) throw new Error(await schedErrorText(resp));
+                await loadSched();
+            } catch (e) {
+                schedModal.error = '删除失败：' + e.message;
+            } finally {
+                schedModal.busyId = 0;
+            }
+        }
+
+        /**
+         * cron 的「人话」翻译。**只覆盖常见形态，认不出就返回空串** ——
+         * 这一份纯粹是列表里的提示文案，不是校验器；宁可什么都不显示，也不要猜错给用户错觉。
+         */
+        function schedCronText(cron) {
+            if (!cron) return '';
+            const known = {
+                '0 0 * * * ?': '每小时整点',
+                '0 0 9 * * ?': '每天 09:00',
+                '0 0 18 * * ?': '每天 18:00',
+                '0 0 9 ? * MON': '每周一 09:00',
+                '0 0 9 1 * ?': '每月 1 号 09:00'
+            };
+            return known[cron.trim()] || '';
+        }
+
+        /** 读后端错误体的 message（统一响应形状 {code,message,data}），读不到则退回状态码。 */
+        async function schedErrorText(resp) {
+            try {
+                const j = await resp.json();
+                if (j && j.message) return j.message;
+            } catch (e) { /* 非 JSON 响应，退回状态码 */ }
+            return 'HTTP ' + resp.status;
+        }
+
+        // 面板展开时点空白处收起（与 ui-select 的「外点关闭」同一手法；用 mousedown 捕获阶段，
+        // 免得按钮自己的 click 先把面板关掉再被这里判成「点在面板外」）。
+        function onNotifyDocDown(e) {
+            if (!notifyState.open) return;
+            const el = e.target && e.target.closest ? e.target.closest('.notify-wrap') : null;
+            if (!el) notifyState.open = false;
+        }
+
         onMounted(() => {
             // 不自动打开最近会话：进入与刷新都落在空白欢迎页（点侧边栏历史才打开）。
             loadConversations();
@@ -3728,6 +4257,16 @@ const app = createApp({
             loadTools(); // 可用工具清单（智能体弹窗「工具装配」用）
             loadKbs(); // 侧边栏「知识库」计数
             loadQuota(); // 本日成本配额用量（后端未启用时 enabled=false，输入区不显示）
+            // 通知：进页面先取一次未读数，之后按 NOTIFY_POLL_MS 轮询（只在未读数上，不拉列表）
+            loadNotifyUnread();
+            notifyTimer = setInterval(loadNotifyUnread, NOTIFY_POLL_MS);
+            document.addEventListener('mousedown', onNotifyDocDown, true);
+        });
+
+        // 卸载清理：轮询与文档级监听都必须摘掉，否则热重载 / 多实例挂载会叠加出多个定时器
+        onUnmounted(() => {
+            if (notifyTimer) { clearInterval(notifyTimer); notifyTimer = null; }
+            document.removeEventListener('mousedown', onNotifyDocDown, true);
         });
 
         return {
@@ -3739,6 +4278,8 @@ const app = createApp({
             toggleStepApproval, approveAndResume, cancelPlanTask,
             // 执行中干预：暂停（canPause/pausing/pauseTask）、跳过卡住的步骤（nextSkippable/skipping/skipStep）
             canPause, pausing, pauseTask, nextSkippable, skipping, skipStep,
+            // 工具审批闸门：待确认条（toolApprovals）+ 批准/拒绝/撤销
+            toolApprovals, approveTool, rejectTool, resetTool, approveStateText, approveInputText,
             // 成本配额刻度（只展示，闸门在后端；fmtTokens 已在成本看板处导出）
             quota,
             // 规划模板：存 / 列 / 套用 / 删
@@ -3761,7 +4302,9 @@ const app = createApp({
             chunkModal, openCite, closeCite, onCiteClick,
             exportConversation, memoryModal, openMemory, saveMemory, resetMemory, memoryCoverage,
             // 长期事实条目（逐条）：增 / 改 / 删 + 行内编辑态（factTopics 与后端 TOPICS 同口径）
-            factTopics, factBusy, factAdd, factEdit, addFact, startFactEdit, cancelFactEdit, saveFact, deleteFact,
+            // factConfClass：置信度分档配色（1~2 低 / 3 中性 / 4~5 高）—— 生命周期三档之一
+            factTopics, factBusy, factAdd, factEdit, factConfClass,
+            addFact, startFactEdit, cancelFactEdit, saveFact, deleteFact,
             // 记忆透明化：单条「不参与记忆」开关（面板里的「当前窗口构成」读 memoryModal.window）
             toggleMemoryExcluded,
             // 消息反馈（👎 → 回归用例）：fbReasons 是原因下拉的可选项（与后端 REASONS 同口径）
@@ -3794,7 +4337,16 @@ const app = createApp({
             isAdmin,
             // 提示词回归评测：evalModal + 跑批/用例数/批次对比 + 库内用例（来自反馈）的列出与删除
             evalScenarios, evalModal, openEval, closeEval, loadEvalCases, runEval, evalItemClass, evalTag,
-            deleteEvalCase
+            deleteEvalCase,
+            // 提示词门禁（P0-1）：门禁横幅的结论文案与配色 + 「校验并留档」
+            runEvalGate, gateClass, gateVerdictText, gateDetailText,
+            // 通知出口（P0-2/P1-4/门禁共用）：铃铛未读数 + 面板列表 + 标记已读
+            notifyState, toggleNotify, openNotify, notifyClickable, notifyTypeLabel, notifyLevelClass,
+            markAllNotifyRead,
+            // 定时任务（P0-2）：列表 / 新建 / 编辑 / 启停 / 立即执行 / 删除 + cron 预设与人话翻译
+            schedModal, SCHED_PRESETS, schedAgentChoices, schedCronText,
+            openSched, closeSched, newSched, editSched, submitSched,
+            toggleSched, runSchedNow, deleteSched
         };
     }
 });

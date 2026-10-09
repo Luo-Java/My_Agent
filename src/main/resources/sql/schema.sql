@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS conversation (
     title      VARCHAR(255) DEFAULT '新对话'           COMMENT '会话标题，默认“新对话”，由首条用户消息派生（最多20字）',
     agent_id   BIGINT       DEFAULT NULL               COMMENT '绑定的智能体ID，关联 agent.id（自增主键），为空表示默认助手',
     planner        TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '是否规划模式会话：1=动态规划器（运行时由 LLM 规划多智能体步骤），0=普通/智能体会话',
-    agent_bind_source VARCHAR(16) DEFAULT NULL          COMMENT '智能体绑定来源：EXPLICIT=用户显式选择（保持粘住），CLARIFY=追问流程临时绑定（允许话题切换时解绑）；空=未绑定',
+    agent_bind_source VARCHAR(16) DEFAULT NULL          COMMENT '智能体绑定来源：EXPLICIT=用户显式选择（保持粘住），HANDOFF=智能体主动转交（同样粘住），CLARIFY=追问流程临时绑定（允许话题切换时解绑）；空=未绑定',
     rag_enabled  TINYINT(1)   NOT NULL DEFAULT 0      COMMENT '会话级 RAG 开关：1=每轮对话自动检索资料库（通用知识库 + 路由到智能体时其专属库）并把命中内容注入上下文；0=不使用 RAG（仅靠模型自身知识）',
     planner_confirm TINYINT(1) NOT NULL DEFAULT 0      COMMENT '规划模式「先看计划」开关：1=规划只产出计划并暂停，用户确认后才执行（计划作为待执行任务落库）；0=规划后直接执行（默认）',
     review_enabled TINYINT(1)  NOT NULL DEFAULT 0      COMMENT '并行评审开关：1=本轮由多个候选智能体并行作答、再由裁决者综合成最终回答（候选与最终答案同推，候选不落记忆）；0=普通单智能体回答（默认）。与 planner 互斥：两者都是「编排形态」，不允许同时开',
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     trace_id          VARCHAR(64)  NOT NULL                COMMENT '本轮唯一追踪ID（UUID，同一轮内所有阶段共用一个）',
     conversation_id   VARCHAR(64)  DEFAULT NULL            COMMENT '所属会话ID，关联 conversation.id',
     mode              VARCHAR(16)  DEFAULT NULL            COMMENT '本轮形态：agent=普通/智能体对话，planner=规划模式，review=并行评审（多候选作答 + 裁决综合）',
-    route_source      VARCHAR(24)  DEFAULT NULL            COMMENT '处理方来源：BOUND=会话显式绑定，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审',
+    route_source      VARCHAR(24)  DEFAULT NULL            COMMENT '处理方来源：BOUND=会话显式绑定，HANDOFF=智能体主动转交，ROUTE=智能路由命中，NONE=通用助手，PLAN=规划编排，REVIEW=并行评审',
     agent_code        VARCHAR(64)  DEFAULT NULL            COMMENT '本轮实际处理/路由到的智能体编码（规划模式为最终步骤的智能体）',
     user_message      VARCHAR(1000) DEFAULT NULL           COMMENT '用户本轮输入（截断）',
     retrieval_query   VARCHAR(1000) DEFAULT NULL           COMMENT '本轮实际用于知识库检索的问题（多轮查询改写产物）；NULL=未改写（未开RAG/首轮/关闭改写/原话已自包含）',
@@ -281,6 +281,10 @@ CREATE TABLE IF NOT EXISTS eval_case (
 -- fact_hash 的必要性：条目由 LLM 每次重新生成，同一件事实两次合并的措辞会微微变化，不去重就会
 -- 一涨一大片；唯一键 (conversation_id, fact_hash) 把「同一会话内同一条事实」收敛为一行。
 -- 不用 fact 本身做唯一键：VARCHAR(500) utf8mb4 超索引长度上限，必须用定长摘要
+-- 生命周期三件套（confidence / expires_at / status）：此前一条事实写进来就永远是「现在时」，
+-- 于是「下周三要交的报告」在三个月后仍被当成待办注入。三列各治一种：expires_at 让有时限的事实自动退场，
+-- status+superseded_by 让同主题被新说法顶替的旧值留档而不注入，confidence 让「被反复确认」的条目浮到高位。
+-- 注意三者都<b>只影响注入，不自动删除</b>：数据库里留着，面板上照实显示，删不删由用户决定。
 CREATE TABLE IF NOT EXISTS conversation_fact (
     id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     conversation_id VARCHAR(64)  NOT NULL                COMMENT '所属会话ID，关联 conversation.id',
@@ -288,9 +292,193 @@ CREATE TABLE IF NOT EXISTS conversation_fact (
     fact            VARCHAR(500) NOT NULL                COMMENT '事实内容（单条，不含主题前缀）',
     fact_hash       CHAR(32)     NOT NULL                COMMENT 'topic+fact 的 MD5，用于同会话内去重（见建表注释）',
     source          VARCHAR(16)  NOT NULL DEFAULT 'MERGE' COMMENT '来源：MERGE=自动合并产出（每次合并按 diff 重写）/ USER=用户手动添加（合并绝不覆盖或删除）',
+    confidence      TINYINT      NOT NULL DEFAULT 3      COMMENT '置信度1~5：用户手写起始5、模型整理起始3，此后每次合并里仍被列出就+1（封顶5）；面板据此排序',
+    expires_at      DATETIME     DEFAULT NULL            COMMENT '有效期：NULL=永不过期；过期的条目不再注入但仍留在面板（标「已过期」），删不删由用户定',
+    status          VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE' COMMENT '状态：ACTIVE=生效中（参与注入与合并）/ SUPERSEDED=已被同主题的新说法取代（不注入，留档可查）',
+    superseded_by   BIGINT       DEFAULT NULL            COMMENT '被哪一条取代（status=SUPERSEDED 时有值），用于面板「被……取代」回链',
     created_at      DATETIME                             COMMENT '首次写入时间',
     updated_at      DATETIME                             COMMENT '最后被确认/改写时间（合并里仍然有效即刷新，故它等于「这条最近还在被维护」）',
     PRIMARY KEY (id),
     UNIQUE KEY uk_conv_fact (conversation_id, fact_hash),
-    INDEX idx_fact_conv (conversation_id, updated_at)
+    INDEX idx_fact_conv (conversation_id, updated_at),
+    INDEX idx_fact_status (conversation_id, status)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '会话长期事实条目表：把 core_facts 那一段文本拆成逐条可管理的行';
+
+-- 定时任务表：把「一句话 + 一个周期」变成自动执行。刻意不复用 task —— 那是一轮规划的**运行实例**
+-- （状态机 RUNNING→DONE/FAILED、单会话单 RUNNING），生命周期以「一次执行」为单位；本表是长期存在的
+-- **定义**（周期 / 开关 / 下次触发时间），每次到点才产生一次执行。执行体也不另造：到点后就是
+-- 「以本用户身份，在承载会话（conversation_id）里把 prompt 问一遍」，走既有对话链路。
+CREATE TABLE IF NOT EXISTS scheduled_task (
+    id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    user_id         BIGINT       NOT NULL                COMMENT '归属用户ID，关联 sys_user.id；按用户隔离，越权一律 404',
+    name            VARCHAR(100) NOT NULL                COMMENT '任务名称（同时用作首次执行时创建会话的标题）',
+    cron            VARCHAR(64)  NOT NULL                COMMENT '触发周期（Spring CronExpression 六段式：秒 分 时 日 月 周）',
+    agent_id        BIGINT       DEFAULT NULL            COMMENT '绑定智能体ID，关联 agent.id；NULL=走智能路由',
+    prompt          TEXT         NOT NULL                COMMENT '到点时发给对话的提示词（就是一句用户话）',
+    conversation_id VARCHAR(64)  DEFAULT NULL            COMMENT '承载本任务的会话ID：首次执行时创建并回填，之后一直复用',
+    enabled         TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '是否启用：0=停用（保留定义与历史，不再触发）',
+    notify_on       TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '执行完成后是否发通知（不发通知的定时任务等于跑给人看不见）',
+    last_run_at     DATETIME     DEFAULT NULL            COMMENT '上次执行时间',
+    last_status     VARCHAR(16)  DEFAULT NULL            COMMENT '上次执行状态：OK / ERROR / RUNNING（RUNNING 是「这一轮正在进行」的展示态；重叠触发由 next_run_at 的 CAS 挡住）',
+    last_result     VARCHAR(1000) DEFAULT NULL           COMMENT '上次执行结果摘要（截断；全文在承载会话里）',
+    next_run_at     DATETIME     DEFAULT NULL            COMMENT '下次触发时间（由 cron 预先算出并落库，扫描据此取「到点的」）；NULL=未排期',
+    created_at      DATETIME                             COMMENT '创建时间',
+    updated_at      DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    -- 调度扫描是「WHERE enabled = 1 AND next_run_at <= now ORDER BY next_run_at」：复合索引让过滤与排序一趟走完
+    INDEX idx_sched_due (enabled, next_run_at),
+    INDEX idx_sched_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '定时任务表：周期性地把一句话送进对话链路';
+
+-- 通知表：给「用户不在对话里时发生的事」一个到达用户的出口（定时任务完成 / 阈值告警 / 门禁结论）。
+-- 为什么不直接推 SSE：SSE 通道的生命周期绑在一次对话请求上，而通知的产生时机与任何请求无关
+-- （后台线程 / 定时器），硬塞长连接既不经济也不可靠（关页面就丢）。落表 + 轮询：简单、可重放、可回看。
+-- user_id 为 NULL = 全员广播（系统级）；前端取「本人 + 广播」。
+CREATE TABLE IF NOT EXISTS notification (
+    id         BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    user_id    BIGINT        DEFAULT NULL            COMMENT '目标用户ID，关联 sys_user.id；NULL=全员广播（系统级）',
+    type       VARCHAR(24)   NOT NULL                COMMENT '类型：SYSTEM=系统 / SCHEDULED_TASK=定时任务完成 / ALERT=阈值告警 / PROMPT_GATE=提示词门禁',
+    level      VARCHAR(8)    NOT NULL DEFAULT 'INFO' COMMENT '级别：INFO / WARN / ERROR（决定前端配色与外发门槛）',
+    title      VARCHAR(200)  NOT NULL                COMMENT '标题（列表一行一句）',
+    content    VARCHAR(1000) DEFAULT NULL            COMMENT '正文（被通知事件的摘要，已截断）',
+    ref_type   VARCHAR(24)   DEFAULT NULL            COMMENT '关联对象类型：CONVERSATION / SCHEDULED_TASK / PROMPT_SNAPSHOT / ALERT_RULE',
+    ref_id     VARCHAR(64)   DEFAULT NULL            COMMENT '关联对象ID（字符串，兼容自增主键与业务 UUID）',
+    read_at    DATETIME      DEFAULT NULL            COMMENT '已读时间；NULL=未读',
+    created_at DATETIME                              COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_notify_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '通知表：用户不在对话里时发生之事的送达出口';
+
+-- 提示词门禁快照表：把「某一版 prompts.yaml 的评测结论」固化下来，回答「改了提示词变好还是变差」。
+-- 与 eval_result 的分工：那张表只记「某一批跑了什么」，不知道跑的是哪一版提示词；本表用内容指纹
+-- (fingerprint) 把提示词与批次绑定，改没改 / 跑没跑 / 结论如何一眼可判。
+-- 不认识 prompt 语义：指纹只回答「变了没有」；注释类改动同样会让指纹变化（注释也会进模型上下文）。
+CREATE TABLE IF NOT EXISTS prompt_snapshot (
+    id           BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fingerprint  VARCHAR(64)  DEFAULT NULL            COMMENT 'prompts.yaml 内容的 SHA-256 定长前缀（只回答「变了没有」，不回答「改了哪句」）；NULL=读不到文件',
+    batch_id     VARCHAR(32)  DEFAULT NULL            COMMENT '关联 eval_result.batch_id；NULL=尚未跑批（PENDING）',
+    total        INT          DEFAULT NULL            COMMENT '本次跑批用例总数',
+    passed       INT          DEFAULT NULL            COMMENT '通过数',
+    failed       INT          DEFAULT NULL            COMMENT '失败数（不含配置错误）',
+    config_error INT          DEFAULT NULL            COMMENT '用例配置错误数（用例自己写错，不是提示词问题）',
+    broken_count INT          DEFAULT NULL            COMMENT '相对上一批「上批过、本批败」的用例数（>0 即劣化）',
+    fixed_count  INT          DEFAULT NULL            COMMENT '相对上一批「上批败、本批过」的用例数',
+    verdict      VARCHAR(16)  NOT NULL                COMMENT '结论：PENDING=已变更待验证 / PASS=通过 / DEGRADED=出现 broken / STILL_FAILED=无新坏但仍有未过 / ERROR=跑批本身失败',
+    detail_json  TEXT         DEFAULT NULL            COMMENT '明细 JSON：{broken:[用例名],fixed:[用例名],error:"..."}',
+    created_at   DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_snapshot_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词改动门禁快照表：绑定提示词指纹与评测结论';
+
+-- 工具审批闸门表：给「智能体要调用敏感工具」加一道人工确认，回答「它要干什么、我同意了吗」。
+-- 为什么需要：工具调用发生在模型内部，此前一路绿灯 —— 查库 / 画图 / 转交一键就执行，用户既看不到
+-- 「这一步要做什么」，也没有喊停的机会。本表就是闸门的落点：命中拦截时落一行，用户在前端点批准。
+-- 粒度为「会话 × 工具」一行（uk_conv_tool），语义是「本会话内该工具是否放行」：
+-- 批准 = 本会话后续调用不再逐次打断（一次授权、用起来才不烦）；拒绝 = 本会话一直挡住（不反复弹窗）。
+-- 授权有有效期（见 agent.tool-approval.expire-minutes）：过期后自动回到「待确认」，不留下长期敞口。
+-- 归属不落 user_id 列：加了就得把身份一路传进工具回调链路，归属一律查询侧 JOIN conversation 判定，
+-- 与 agent_trace 同一口径（见 AgentTraceMapper.xml 的说明）。
+CREATE TABLE IF NOT EXISTS tool_approval (
+    id              BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    conversation_id VARCHAR(64)   NOT NULL                COMMENT '所属会话，关联 conversation.id',
+    agent_id        BIGINT        DEFAULT NULL            COMMENT '发起调用的智能体ID（可空：通用助手/转交场景）',
+    tool_name       VARCHAR(128)  NOT NULL                COMMENT '工具名（与 agent.tools_json 白名单里的名字一致）',
+    input_json      TEXT          DEFAULT NULL            COMMENT '触发拦截的入参原样留档（供用户判断「它到底要干什么」）',
+    user_message    VARCHAR(1000) DEFAULT NULL            COMMENT '触发该调用的用户原话（批准后据此重跑同一轮）',
+    status          VARCHAR(16)   NOT NULL DEFAULT 'PENDING' COMMENT '状态：PENDING=待确认 / APPROVED=已批准 / REJECTED=已拒绝',
+    note            VARCHAR(255)  DEFAULT NULL            COMMENT '用户决断时的备注',
+    decided_by      BIGINT        DEFAULT NULL            COMMENT '决断人ID，关联 sys_user.id（留痕）',
+    decided_at      DATETIME      DEFAULT NULL            COMMENT '决断时间',
+    used_count      INT           NOT NULL DEFAULT 0      COMMENT '批准后实际放行执行次数（回答「批了之后真的用了吗」）',
+    last_used_at    DATETIME      DEFAULT NULL            COMMENT '最近一次放行执行时间',
+    created_at      DATETIME                              COMMENT '首次拦截时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_conv_tool (conversation_id, tool_name),
+    INDEX idx_approval_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '工具审批闸门表：会话级「该工具是否放行」的决断留痕';
+
+-- 管理操作审计表：ADMIN 的敏感动作（给谁加了什么角色、停用了谁、删了哪个角色）逐条留痕，只增不改。
+-- 为什么需要：权限变更此前只在业务表上留下「结果」（sys_user_role 换了一行），留不下「谁、什么时候、
+-- 把谁的什么权限改成了什么」。事后追查「这个管理员是谁授权的」时无从下手 —— 这正是审计要回答的问题。
+-- 用户名快照：用户被改名或删除后，只留 user_id 会让记录变成一串读不懂的数字，审计记录必须自解释。
+-- detail 落库前经 PII 脱敏（见 PiiMasker）：审计表本身不该成为新的敏感信息聚集地。
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          BIGINT        NOT NULL AUTO_INCREMENT COMMENT '审计ID',
+    user_id     BIGINT        DEFAULT NULL            COMMENT '操作者用户ID（关联 sys_user.id；为空=系统自身/无身份上下文）',
+    username    VARCHAR(64)   DEFAULT NULL            COMMENT '操作者用户名快照（改名/删除后仍可追溯）',
+    action      VARCHAR(64)   NOT NULL                COMMENT '动作编码（取值见 AuditAction：CREATE/UPDATE/DELETE_USER、UPDATE_PASSWORD、CREATE/UPDATE/DELETE_ROLE）',
+    target_type VARCHAR(32)   DEFAULT NULL            COMMENT '对象类型（USER / ROLE 等）',
+    target_id   VARCHAR(64)   DEFAULT NULL            COMMENT '对象ID',
+    detail      VARCHAR(1000) DEFAULT NULL            COMMENT '明细（已 PII 脱敏）',
+    ip          VARCHAR(64)   DEFAULT NULL            COMMENT '请求来源 IP',
+    created_at  DATETIME                              COMMENT '发生时间',
+    PRIMARY KEY (id),
+    INDEX idx_audit_created (created_at),
+    INDEX idx_audit_user (user_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '管理操作审计表：ADMIN 敏感动作留痕（只增不改）';
+
+-- 定时任务表：把「一句话 + 一个周期」变成自动执行。刻意不复用 task —— 那是一轮规划的**运行实例**
+-- （状态机 RUNNING→DONE/FAILED、单会话单 RUNNING），生命周期以「一次执行」为单位；本表是长期存在的
+-- **定义**（周期 / 开关 / 下次触发时间），每次到点才产生一次执行。执行体也不另造：到点后就是
+-- 「以本用户身份，在承载会话（conversation_id）里把 prompt 问一遍」，走既有对话链路。
+CREATE TABLE IF NOT EXISTS scheduled_task (
+  id              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  user_id         BIGINT       NOT NULL                COMMENT '归属用户ID，关联 sys_user.id；按用户隔离，越权一律 404',
+  name            VARCHAR(100) NOT NULL                COMMENT '任务名称（同时用作首次执行时创建会话的标题）',
+    cron            VARCHAR(64)  NOT NULL                COMMENT '触发周期（Spring CronExpression 六段式：秒 分 时 日 月 周）',
+    agent_id        BIGINT       DEFAULT NULL            COMMENT '绑定智能体ID，关联 agent.id；NULL=走智能路由',
+    prompt          TEXT         NOT NULL                COMMENT '到点时发给对话的提示词（就是一句用户话）',
+    conversation_id VARCHAR(64)  DEFAULT NULL            COMMENT '承载本任务的会话ID：首次执行时创建并回填，之后一直复用',
+    enabled         TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '是否启用：0=停用（保留定义与历史，不再触发）',
+    notify_on       TINYINT(1)   NOT NULL DEFAULT 1      COMMENT '执行完成后是否发通知（不发通知的定时任务等于跑给人看不见）',
+    last_run_at     DATETIME     DEFAULT NULL            COMMENT '上次执行时间',
+    last_status     VARCHAR(16)  DEFAULT NULL            COMMENT '上次执行状态：OK / ERROR / RUNNING（RUNNING 是「这一轮正在进行」的展示态；重叠触发由 next_run_at 的 CAS 挡住）',
+    last_result     VARCHAR(1000) DEFAULT NULL           COMMENT '上次执行结果摘要（截断；全文在承载会话里）',
+    next_run_at     DATETIME     DEFAULT NULL            COMMENT '下次触发时间（由 cron 预先算出并落库，扫描据此取「到点的」）；NULL=未排期',
+    created_at      DATETIME                             COMMENT '创建时间',
+    updated_at      DATETIME                             COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    -- 调度扫描是「WHERE enabled = 1 AND next_run_at <= now ORDER BY next_run_at」：复合索引让过滤与排序一趟走完
+    INDEX idx_sched_due (enabled, next_run_at),
+    INDEX idx_sched_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '定时任务表：周期性地把一句话送进对话链路';
+
+-- 通知表：给「用户不在对话里时发生的事」一个到达用户的出口（定时任务完成 / 阈值告警 / 门禁结论）。
+-- 为什么不直接推 SSE：SSE 通道的生命周期绑在一次对话请求上，而通知的产生时机与任何请求无关
+-- （后台线程 / 定时器），硬塞长连接既不经济也不可靠（关页面就丢）。落表 + 轮询：简单、可重放、可回看。
+-- user_id 为 NULL = 全员广播（系统级）；前端取「本人 + 广播」。
+CREATE TABLE IF NOT EXISTS notification (
+    id         BIGINT        NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    user_id    BIGINT        DEFAULT NULL            COMMENT '目标用户ID，关联 sys_user.id；NULL=全员广播（系统级）',
+    type       VARCHAR(24)   NOT NULL                COMMENT '类型：SYSTEM=系统 / SCHEDULED_TASK=定时任务完成 / ALERT=阈值告警 / PROMPT_GATE=提示词门禁',
+    level      VARCHAR(8)    NOT NULL DEFAULT 'INFO' COMMENT '级别：INFO / WARN / ERROR（决定前端配色与外发门槛）',
+    title      VARCHAR(200)  NOT NULL                COMMENT '标题（列表一行一句）',
+    content    VARCHAR(1000) DEFAULT NULL            COMMENT '正文（被通知事件的摘要，已截断）',
+    ref_type   VARCHAR(24)   DEFAULT NULL            COMMENT '关联对象类型：CONVERSATION / SCHEDULED_TASK / PROMPT_SNAPSHOT / ALERT_RULE',
+    ref_id     VARCHAR(64)   DEFAULT NULL            COMMENT '关联对象ID（字符串，兼容自增主键与业务 UUID）',
+    read_at    DATETIME      DEFAULT NULL            COMMENT '已读时间；NULL=未读',
+    created_at DATETIME                              COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_notify_user (user_id, created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '通知表：用户不在对话里时发生之事的送达出口';
+
+-- 提示词门禁快照表：把「某一版 prompts.yaml 的评测结论」固化下来，回答「改了提示词变好还是变差」。
+-- 与 eval_result 的分工：那张表只记「某一批跑了什么」，不知道跑的是哪一版提示词；本表用内容指纹
+-- (fingerprint) 把提示词与批次绑定，改没改 / 跑没跑 / 结论如何一眼可判。
+-- 不认识 prompt 语义：指纹只回答「变了没有」；注释类改动同样会让指纹变化（注释也会进模型上下文）。
+CREATE TABLE IF NOT EXISTS prompt_snapshot (
+   id           BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+   fingerprint  VARCHAR(64)  DEFAULT NULL            COMMENT 'prompts.yaml 内容的 SHA-256 定长前缀（只回答「变了没有」，不回答「改了哪句」）；NULL=读不到文件',
+    batch_id     VARCHAR(32)  DEFAULT NULL            COMMENT '关联 eval_result.batch_id；NULL=尚未跑批（PENDING）',
+    total        INT          DEFAULT NULL            COMMENT '本次跑批用例总数',
+    passed       INT          DEFAULT NULL            COMMENT '通过数',
+    failed       INT          DEFAULT NULL            COMMENT '失败数（不含配置错误）',
+    config_error INT          DEFAULT NULL            COMMENT '用例配置错误数（用例自己写错，不是提示词问题）',
+    broken_count INT          DEFAULT NULL            COMMENT '相对上一批「上批过、本批败」的用例数（>0 即劣化）',
+    fixed_count  INT          DEFAULT NULL            COMMENT '相对上一批「上批败、本批过」的用例数',
+    verdict      VARCHAR(16)  NOT NULL                COMMENT '结论：PENDING=已变更待验证 / PASS=通过 / DEGRADED=出现 broken / STILL_FAILED=无新坏但仍有未过 / ERROR=跑批本身失败',
+    detail_json  TEXT         DEFAULT NULL            COMMENT '明细 JSON：{broken:[用例名],fixed:[用例名],error:"..."}',
+    created_at   DATETIME                             COMMENT '记录时间',
+    PRIMARY KEY (id),
+    INDEX idx_snapshot_created (created_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '提示词改动门禁快照表：绑定提示词指纹与评测结论';

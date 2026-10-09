@@ -8,6 +8,7 @@ import jakarta.annotation.Resource;
 import org.luo.common.exception.AiBusinessException;
 import org.luo.common.exception.AiErrorCode;
 import org.luo.common.result.PageResult;
+import org.luo.system.constant.AuditAction;
 import org.luo.system.dto.SaveRoleRequest;
 import org.luo.system.dto.SysRoleDTO;
 import org.luo.system.dto.UpdateRoleRequest;
@@ -15,6 +16,7 @@ import org.luo.system.entity.SysRole;
 import org.luo.system.entity.SysUserRole;
 import org.luo.system.mapper.SysRoleMapper;
 import org.luo.system.mapper.SysUserRoleMapper;
+import org.luo.system.service.AuditService;
 import org.luo.system.service.SysRoleService;
 import org.luo.system.vo.SysRoleVO;
 import org.springframework.stereotype.Service;
@@ -40,6 +42,10 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
 
     @Resource
     private SysUserRoleMapper userRoleMapper;
+
+    /** 管理操作审计：角色的增删改都会改变「谁能进管理端」，属权限相关动作，逐条留痕。 */
+    @Resource
+    private AuditService auditService;
 
     @Override
     public PageResult<SysRoleVO> page(SysRoleDTO dto) {
@@ -73,16 +79,23 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
         baseMapper.insert(entity);
+        auditService.record(AuditAction.CREATE_ROLE, AuditAction.TARGET_ROLE, entity.getId(),
+                "新增角色 " + code + "（" + entity.getName() + "）");
         return toVO(entity);
     }
 
     @Override
     public SysRoleVO updateRole(UpdateRoleRequest req) {
         SysRole exist = requireRole(req.getId());
+        // 旧名先取：下面会写新值，之后再拿不到「改前叫什么」——而审计的价值就在这个对比
+        String oldName = exist.getName();
         exist.setName(requireName(req.getName()));
         exist.setDescription(trimToNull(req.getDescription()));
         exist.setUpdatedAt(LocalDateTime.now());
         baseMapper.updateById(exist);
+        auditService.record(AuditAction.UPDATE_ROLE, AuditAction.TARGET_ROLE, exist.getId(),
+                "角色 " + exist.getCode() + "：名称 " + describe(oldName) + "→" + describe(exist.getName())
+                        + "；描述=" + describe(exist.getDescription()));
         return toVO(exist);
     }
 
@@ -96,6 +109,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
                     "角色「" + exist.getName() + "」已分配给 " + used + " 个用户，不能删除");
         }
         baseMapper.deleteById(id);
+        auditService.record(AuditAction.DELETE_ROLE, AuditAction.TARGET_ROLE, id,
+                "删除角色 " + exist.getCode() + "（" + exist.getName() + "）");
     }
 
     @Override
@@ -182,6 +197,11 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
     /** 字符串筛选条件：null 与纯空白都视为不筛。 */
     private static boolean hasText(String s) {
         return s != null && !s.isBlank();
+    }
+
+    /** 空值展示成「（空）」而不是 null：审计明细里的 null 分不清「没填」与「没读到」。 */
+    private static String describe(String s) {
+        return s == null || s.isBlank() ? "（空）" : s;
     }
 
     private static String trimToNull(String s) {

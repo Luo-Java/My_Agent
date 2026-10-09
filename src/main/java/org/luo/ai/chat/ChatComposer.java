@@ -10,7 +10,9 @@ import org.luo.ai.entity.Conversation;
 import org.luo.ai.service.ConversationFactService;
 import org.luo.ai.service.CrossSessionSearchService;
 import org.luo.ai.service.KbSearchService;
+import org.luo.ai.tool.HandoffTool;
 import org.luo.ai.tool.SubAgentTool;
+import org.luo.ai.tool.ToolApprovalGate;
 import org.luo.ai.tool.ToolRegistry;
 import org.luo.ai.trace.RoundTrace;
 import org.springframework.ai.chat.client.ChatClient;
@@ -23,6 +25,7 @@ import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -70,6 +73,10 @@ public class ChatComposer {
     private final ToolRegistry toolRegistry;
     /** 转交工具（{@code call_agent}）：实例依赖调用方智能体，故由本类每轮现场构造（见 {@link SubAgentTool}）。 */
     private final SubAgentTool subAgentTool;
+    /** 会话转交工具（{@code handoff_agent}）：与上者的区别见 {@link HandoffTool}（调一次 vs 交出去）。 */
+    private final HandoffTool handoffTool;
+    /** 工具审批闸门：把声明要审批的工具包一层（配置关闭时零开销，见 {@link ToolApprovalGate}）。 */
+    private final ToolApprovalGate approvalGate;
     private final ChatMemory chatMemory;
     private final KbSearchService kbSearchService;
     private final QueryRewriteService queryRewriteService;
@@ -87,6 +94,8 @@ public class ChatComposer {
                         PromptService promptService,
                         ToolRegistry toolRegistry,
                         SubAgentTool subAgentTool,
+                        HandoffTool handoffTool,
+                        ToolApprovalGate approvalGate,
                         ChatMemory chatMemory,
                         PromptProperties promptProperties,
                         KbSearchService kbSearchService,
@@ -102,6 +111,8 @@ public class ChatComposer {
         this.promptService = promptService;
         this.toolRegistry = toolRegistry;
         this.subAgentTool = subAgentTool;
+        this.handoffTool = handoffTool;
+        this.approvalGate = approvalGate;
         this.chatMemory = chatMemory;
         this.realtimeDataRule = promptProperties.realtimeRule();
         this.kbSearchService = kbSearchService;
@@ -119,6 +130,16 @@ public class ChatComposer {
     /** 无记忆的 ChatClient：动态规划中间步骤专用。 */
     public ChatClient internalChatClient() {
         return internalChatClient;
+    }
+
+    /**
+     * 造审批闸门上下文（透传 {@link ToolApprovalGate#context}）：规划步骤与评审候选各自组装请求，
+     * 需要与普通对话同一把闸门。闸门关闭时返回 {@code null}，调用方零分支。
+     *
+     * @param message 触发本轮的<b>用户原话</b>（规划逐步模式传原始目标；批准后前端据此重跑）
+     */
+    public ToolApprovalGate.GateContext approvalContext(String conversationId, Agent agent, String message) {
+        return approvalGate.context(conversationId, agent, message);
     }
 
     /**
@@ -140,6 +161,17 @@ public class ChatComposer {
     public ComposedRequest buildRequest(String conversationId, String message, Conversation conv,
                                        Agent agent, String paramBlock, String material, RoundTrace trace,
                                        CompletableFuture<String> prefetchedQuery) {
+        return buildRequest(conversationId, message, conv, agent, paramBlock, material, trace, prefetchedQuery, null);
+    }
+
+    /**
+     * 同上，另带「会话转交」持有者：非 null 时按白名单决定是否挂 {@code handoff_agent} 工具，
+     * 工具命中会写入 holder，由调用方（{@code AgentRoundHandler}）执行接力。
+     */
+    public ComposedRequest buildRequest(String conversationId, String message, Conversation conv,
+                                       Agent agent, String paramBlock, String material, RoundTrace trace,
+                                       CompletableFuture<String> prefetchedQuery,
+                                       HandoffTool.HandoffHolder handoffHolder) {
         KbSearchService.KbContext kb = retrieve(conversationId, message, conv, agent, trace, prefetchedQuery);
         // 跨会话召回：只作用于普通对话（规划步骤与规划回退不走这里，见 CrossSessionSearchService 类注释）
         CrossSessionSearchService.Recall recall = recall(conversationId, message, conv, trace);
@@ -148,7 +180,46 @@ public class ChatComposer {
                 .system(systemPrompt)
                 .user(message)
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId));
-        return new ComposedRequest(decorateRequest(spec, agent, trace, conversationId), kb.citations(), recall);
+        // 审批闸门上下文：带上「本轮用户原话」，批准后前端据此重跑同一轮（见 ToolApprovalGate.GateContext）
+        ToolApprovalGate.GateContext gate = approvalGate.context(conversationId, agent, message);
+        return new ComposedRequest(decorateRequest(spec, agent, trace, conversationId, handoffHolder, gate),
+                kb.citations(), recall);
+    }
+
+    /**
+     * 转交接力回答：由<b>目标智能体</b>用完整人设重跑本轮。
+     * <p>
+     * <b>为什么走无记忆客户端 + 显式注入历史</b>：本轮的用户消息已经被记忆 Advisor 落过一次库，
+     * 这里若再用带记忆的客户端，同一条用户消息会被再写一遍，历史里就出现两条一模一样的提问
+     * （而模型会把它们当成用户真的问了两遍）。无记忆客户端只在提示词里显式拼一段历史，
+     * 既让接手方看得到来龙去脉，又不产生任何多余的落库。
+     * <p>
+     * 题外：本方法<b>不做</b>落库，接力回答由调用方覆盖写回那条「转交说明」助手消息
+     * （{@code ConversationService#overwriteLatestAssistantMessage}），保证库里与界面是同一个答案。
+     */
+    public HandoffOutcome handoffAnswer(String conversationId, String message, Conversation conv, Agent target,
+                                        String reason, String material, RoundTrace trace) {
+        KbSearchService.KbContext kb = retrieve(conversationId, message, conv, target, trace, null);
+        String history = buildHistoryContextText(conversationId, 0,
+                "[此前的对话历史（你刚接手这个会话，请据此接续）]\n");
+        String systemPrompt = buildRoundSystemPrompt(target, conv, kb.text(), null, material, null);
+        if (!history.isBlank()) {
+            systemPrompt = systemPrompt + "\n\n" + history;
+        }
+        systemPrompt = systemPrompt + "\n\n[接手说明] 你刚刚从另一个智能体那里接过这段对话"
+                + (reason == null || reason.isBlank() ? "" : "（转交原因：" + reason + "）")
+                + "。请直接回答用户最近这条消息，不要评论转交这件事本身。";
+        ChatClient.ChatClientRequestSpec spec = internalChatClient.prompt()
+                .system(systemPrompt)
+                .user(message);
+        // 接力这一轮同样过闸门：它照样是「拿用户的提问去驱动工具」，放过它就等于闸门只挡了前半程
+        ToolApprovalGate.GateContext gate = approvalGate.context(conversationId, target, message);
+        String reply = decorateRequest(spec, target, trace, conversationId, null, gate).call().content();
+        return new HandoffOutcome(reply == null ? "" : reply, kb.citations());
+    }
+
+    /** 转交接力的产出：接手方的回答 + 它自己这一轮的检索引用（引用由它这轮检索产生，不能沿用交棒方的）。 */
+    public record HandoffOutcome(String reply, List<KbCitation> citations) {
     }
 
     /**
@@ -306,20 +377,53 @@ public class ChatComposer {
      */
     public ChatClient.ChatClientRequestSpec decorateRequest(ChatClient.ChatClientRequestSpec spec, Agent agent,
                                                             RoundTrace trace, String conversationId) {
+        return decorateRequest(spec, agent, trace, conversationId, null, null);
+    }
+
+    /**
+     * 同上，另带「会话转交」持有者：非 null 且白名单声明了 {@code handoff_agent} 时一并挂载该工具。
+     */
+    public ChatClient.ChatClientRequestSpec decorateRequest(ChatClient.ChatClientRequestSpec spec, Agent agent,
+                                                            RoundTrace trace, String conversationId,
+                                                            HandoffTool.HandoffHolder handoffHolder) {
+        return decorateRequest(spec, agent, trace, conversationId, handoffHolder, null);
+    }
+
+    /**
+     * 同上，另带「审批闸门」上下文：非 null 时，落在 {@code agent.tool-approval.tools} 清单里的工具会被
+     * 包一层 —— 执行前先问过用户（见 {@link ToolApprovalGate}）。传 {@code null} 即不设闸门。
+     * <p>
+     * 闸门放在这里而不是各工具内部：这是全项目<b>唯一</b>的挂工具点（注解式、动态式、将来新增的都从这儿过），
+     * 只有一处就不会漏 —— 漏一处的闸门等于没有闸门。
+     */
+    public ChatClient.ChatClientRequestSpec decorateRequest(ChatClient.ChatClientRequestSpec spec, Agent agent,
+                                                            RoundTrace trace, String conversationId,
+                                                            HandoffTool.HandoffHolder handoffHolder,
+                                                            ToolApprovalGate.GateContext gate) {
         if (trace != null) {
             spec = spec.advisors(a -> a.param(RoundTrace.CONTEXT_KEY, trace));
         }
         if (agent == null) return spec;
         ToolCallback[] staticTools = toolRegistry.resolve(agent.getToolsJson());
-        // 转交工具：白名单专属（全量不含它，理由见 SubAgentTool 类注释）
-        ToolCallback dynamicTool = toolRegistry.dynamicToolRequested(agent.getToolsJson(), SubAgentTool.TOOL_NAME)
-                ? subAgentTool.build(agent, conversationId)
-                : null;
-        int total = staticTools.length + (dynamicTool == null ? 0 : 1);
+        // 动态工具：实例依赖调用方（候选清单要排除自己），故不能进静态池，只能按白名单现场构造
+        List<ToolCallback> dynamicTools = new ArrayList<>(2);
+        if (toolRegistry.dynamicToolRequested(agent.getToolsJson(), SubAgentTool.TOOL_NAME)) {
+            dynamicTools.add(subAgentTool.build(agent, conversationId));
+        }
+        if (handoffHolder != null
+                && toolRegistry.dynamicToolRequested(agent.getToolsJson(), HandoffTool.TOOL_NAME)) {
+            dynamicTools.add(handoffTool.build(agent, handoffHolder));
+        }
+        int total = staticTools.length + dynamicTools.size();
         if (total > 0) {
+            // 静态与动态合并后一次性挂载：分两次调用 .tools() 后者会覆盖前者
             ToolCallback[] tools = new ToolCallback[total];
             System.arraycopy(staticTools, 0, tools, 0, staticTools.length);
-            if (dynamicTool != null) tools[staticTools.length] = dynamicTool;
+            for (int i = 0; i < dynamicTools.size(); i++) {
+                tools[staticTools.length + i] = dynamicTools.get(i);
+            }
+            // 合并之后过闸门：动态工具（call_agent / handoff_agent）也在这个数组里，一并受管
+            tools = approvalGate.wrap(tools, gate);
             // 显式 (Object[]) 传参：消除 tools(ToolCallback...) 的 varargs 提示性告警（@SuppressWarnings 实测无效）
             spec = spec.tools((Object[]) tools);
         }

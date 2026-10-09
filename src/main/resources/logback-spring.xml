@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  本项目唯一的日志改动：把官方默认 console pattern 里的「消息」用 %pii() 包一层做 PII 脱敏，
+  「异常栈」用自定义 %piiEx（继承 ExtendedThrowableProxyConverter，只对其结果做 mask）。其余一律保持 Spring Boot 默认。
+
+  为什么需要新建这个文件：项目原先没有日志配置（走 Spring Boot 默认），而注册 %pii / %piiEx 转换符、
+  把脱敏挂到 pattern 上，必须有配置入口 —— 没有别的注入点。
+
+  ⚠ 换行陷阱（曾导致「控制台日志不换行」）：logback 解析器在 composite 转换器（%pii(...) / %clr(...)）的右括号 ')'
+  之后紧跟的 %n 会被当成**字面字符串**而非换行符，结果所有日志挤成一行。实证：%m%n 正常、%pii(%m)%n 却输出字面 %n。
+  修复：把 %n 放进 composite 内部（%pii(%m%n)），让 %n 作为子模式的一部分被正常解析。异常栈 %piiEx 是普通转换器，
+  其渲染结果自带末尾换行，无需在它后面再加 %n。
+  时间戳 / 级别 / PID / 线程 / logger 名都不含用户内容，保持原样。
+
+  开关 agent.pii.enabled 与数据库两处（chat_message / agent_trace）共用同一个键：三处必须同开同关，
+  否则会破坏「feedback.user_input ↔ agent_trace.user_message」的跨表逐字匹配（见 PiiProperties 注释）。
+-->
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <springProperty scope="context" name="piiMaskEnabled" source="agent.pii.enabled" defaultValue="true"/>
+    <conversionRule conversionWord="pii" converterClass="org.luo.common.log.PiiMaskingConverter"/>
+    <conversionRule conversionWord="piiEx" converterClass="org.luo.common.log.PiiThrowableConverter"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%clr(%d{${LOG_DATEFORMAT_PATTERN:-yyyy-MM-dd'T'HH:mm:ss.SSSXXX}}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}){} %clr(${PID:-}){magenta} %clr(--- %esb(){APPLICATION_NAME}%esb{APPLICATION_GROUP}[%15.15t] ${LOG_CORRELATION_PATTERN:-}){faint}%clr(%-40.40logger{39}){cyan} %clr(:){faint} %pii%n%piiEx</pattern>
+            <charset>${CONSOLE_LOG_CHARSET:-${file.encoding:-UTF-8}}</charset>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

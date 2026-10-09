@@ -23,12 +23,17 @@ import org.luo.ai.infrastructure.rerank.RerankService;
  * @param queryRewriteEnabled     是否启用多轮查询改写（指代消解）；首轮无历史时自动跳过，不产生调用
  * @param queryRewriteHistorySize 参与改写的最近历史条数上限（控制改写调用的 token 成本）
  * @param fallbackMaxChunks       回退 MySQL 余弦检索时单次扫描的块数上限（有界化，防 OOM）
+ * @param keywordRecallEnabled    是否启用关键词召回（与向量召回做 RRF 混合）；false=退化为纯向量检索
+ * @param keywordRecallK          关键词召回候选条数（与 {@code recallK} 并行的一路，融合后再统一收敛）
+ * @param keywordRecallScanCap    关键词召回的 SQL 候选上限（{@code LIMIT}，防大库无界扫描）
+ * @param rrfK                    RRF 融合常数 k（见 {@link org.luo.ai.util.Rrf}；越大越强调「多路共识」）
  */
 @ConfigurationProperties(prefix = "agent.rag")
 public record RagProperties(Boolean rerankEnabled, String rerankModel, String rerankUrl, Double rerankMinScore,
                             Integer recallK, Integer topK, Double recallMinScore, Double minScore,
                             Integer timeoutSeconds, Boolean queryRewriteEnabled, Integer queryRewriteHistorySize,
-                            Integer fallbackMaxChunks) {
+                            Integer fallbackMaxChunks, Boolean keywordRecallEnabled, Integer keywordRecallK,
+                            Integer keywordRecallScanCap, Integer rrfK) {
 
     public RagProperties {
         if (rerankEnabled == null) rerankEnabled = true;
@@ -45,6 +50,15 @@ public record RagProperties(Boolean rerankEnabled, String rerankModel, String re
         if (queryRewriteEnabled == null) queryRewriteEnabled = true;
         if (queryRewriteHistorySize == null || queryRewriteHistorySize <= 0) queryRewriteHistorySize = 6;
         if (fallbackMaxChunks == null || fallbackMaxChunks <= 0) fallbackMaxChunks = 2000;
+        if (keywordRecallEnabled == null) keywordRecallEnabled = true;
+        if (keywordRecallK == null || keywordRecallK <= 0) keywordRecallK = 20;
+        if (keywordRecallScanCap == null || keywordRecallScanCap <= 0) keywordRecallScanCap = 2000;
+        if (rrfK == null || rrfK <= 0) rrfK = org.luo.ai.util.Rrf.DEFAULT_K;
+    }
+
+    /** 是否启用关键词召回（静态开关；真正是否走混合还取决于精排是否可用，见 KbSearchService）。 */
+    public boolean keywordRecallOn() {
+        return Boolean.TRUE.equals(keywordRecallEnabled);
     }
 
     /** 是否启用多轮查询改写（静态开关；「首轮无历史」由调用方按历史是否为空再跳过一次）。 */

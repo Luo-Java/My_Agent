@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.luo.ai.mapper.ToolApprovalMapper">
+
+    <!--
+      带归属过滤的审批记录查询：tool_approval 表没有 user_id 列 —— 加列就得把身份一路传进工具回调
+      链路（而去重窗口内一行只保留一次调用，见 uk_conv_tool），会破坏「闸门只拿会话上下文」这条边界。
+      故归属一律由 JOIN conversation 判定（conversation.idx_user 支撑），与 agent_trace 同一口径。
+    -->
+    <select id="selectOwned" resultType="org.luo.ai.entity.ToolApproval">
+        SELECT a.*
+        FROM tool_approval a
+        JOIN conversation c ON c.id = a.conversation_id
+        <where>
+            c.user_id = #{userId}
+            <if test="conversationId != null and conversationId != ''">
+                AND a.conversation_id = #{conversationId}
+            </if>
+        </where>
+        ORDER BY a.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectOwnedById" resultType="org.luo.ai.entity.ToolApproval">
+        SELECT a.*
+        FROM tool_approval a
+        JOIN conversation c ON c.id = a.conversation_id
+        WHERE a.id = #{id}
+          AND c.user_id = #{userId}
+        LIMIT 1
+    </select>
+
+</mapper>

@@ -7,8 +7,10 @@ import org.luo.ai.entity.ChatMessage;
 import org.luo.ai.entity.Conversation;
 import org.luo.ai.mapper.ChatMessageMapper;
 import org.luo.ai.mapper.ConversationMapper;
+import org.luo.ai.infrastructure.rerank.RerankService;
 import org.luo.ai.properties.CrossSessionProperties;
 import org.luo.ai.properties.PromptProperties;
+import org.luo.ai.properties.RagProperties;
 import org.luo.ai.trace.LlmUsageService;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -26,18 +28,25 @@ import java.util.Map;
 import java.util.function.Consumer;
 
 /**
- * 跨会话搜索：在<b>本人其他会话</b>的历史消息里做关键词召回，产出「注入 system 的文本 + 展示用命中列表」。
+ * 跨会话搜索：在<b>本人其他会话</b>的历史消息里做召回，产出「注入 system 的文本 + 展示用命中列表」。
  * <p>
- * 与 {@link KbSearchService} 的关系：都是「先检索、再注入」，但<b>对象与机制完全不同</b> —— 前者检索外部资料
- * （向量 + 精排），本服务检索用户自己的历史对话（关键词字面匹配）。刻意不合并成一个「统一检索服务」：
- * 两者的召回语义、阈值口径、失败降级方式都不一样，硬合并只会让两边都难解释。
+ * <b>两段式检索</b>：① <b>关键词召回</b>（提词 → 有界 {@code LIKE}，按命中词项数降序）→
+ * ② <b>语义重排</b>（{@link RerankService} 交叉编码按 query↔片段打分，丢弃低分候选）。
+ * 召回侧靠「提词扩展」（见 prompts.yaml 的 {@code cross-session-query-system}：要求同时产出原词与
+ * 用户当时可能用的同义说法），排序侧靠精排 —— 两头补的就是原来纯字面匹配缺的「语义」。
  * <p>
- * 为何用关键词而非向量：会话消息逐轮写入，走向量意味着每条消息落库多一次 embedding（成本翻倍）且要新增一套
- * 向量副本维护链路；现有向量设施围绕 {@code kb_chunk} 建，混进会话消息会让「知识库命中」与「历史回忆」互相干扰。
- * 代价是<b>召回质量受限于提词质量与字面匹配</b>（换说法就召回不到），这是明确接受的边界。
+ * 与 {@link KbSearchService} 的关系：都是「先检索、再注入」，但<b>对象不同</b> —— 前者检索外部资料
+ * （向量 + 关键词 + RRF 融合 + 精排），本服务检索用户自己的历史对话（关键词 + 精排重排）。
+ * 刻意不合并成一个「统一检索服务」：两者的召回语义、阈值口径、失败降级方式都不一样，硬合并只会让两边都难解释。
  * <p>
- * <b>绝不阻断对话</b>：提词失败、SQL 出错、模型异常一律降级为「本轮不带历史」并记日志；但<b>降级不静默</b> ——
- * 命中 0 条会在执行过程里明确播报，让用户区分「真没有」与「功能没生效」。
+ * <b>为何不走向量</b>：会话消息逐轮写入，给每条消息存向量意味着每轮多一次 embedding 调用，且要新增一套
+ * 向量副本维护链路（写入、删除、回填、一致性）；而现有向量设施围绕 {@code kb_chunk} 建，混进会话消息会让
+ * 「知识库命中」与「历史回忆」互相干扰。语义能力改由「提词扩展 + 精排重排」承担：前者让换种说法也能召回，
+ * 后者把碰巧含同一个词但语境无关的片段筛掉。<b>代价</b>：召回仍是字面驱动，用户当时若用了完全不同的措辞、
+ * 且该措辞未被提词模型想到，仍会漏 —— 这是明确接受的边界（要突破得先解决上面那条副本链路的成本与一致性）。
+ * <p>
+ * <b>绝不阻断对话</b>：提词失败、SQL 出错、精排异常一律降级为「本轮不带历史」或「沿用字面排序」并记日志；
+ * 但<b>降级不静默</b> —— 命中 0 条会明确播报，且「字面没命中」与「命中但被语义筛掉」播报不同。
  * <b>零成本短路</b>：会话开关未开 / 全局开关关闭 / 本轮消息为空，任一成立即直接返回空，零模型调用、零 SQL。
  */
 @Slf4j
@@ -53,11 +62,20 @@ public class CrossSessionSearchService {
     /** LIKE 通配符与转义符：关键词来自 LLM 输出，必须清洗后再进 SQL 参数（否则 `%` 会变成全表匹配）。 */
     private static final char[] LIKE_SPECIALS = {'%', '_', '\\'};
 
+    /**
+     * 语义重排的候选条数上限：精排<b>按条计费</b>，不必把 SQL 拉回的候选全送去打分
+     * （SQL 已按命中词项数降序，高相关区就在前若干条）。
+     */
+    private static final int RERANK_CANDIDATES = 10;
+
     private final ChatMessageMapper chatMessageMapper;
     private final ConversationMapper conversationMapper;
     private final ChatModel chatModel;
     private final PromptProperties promptProperties;
     private final CrossSessionProperties props;
+    private final RerankService rerankService;
+    /** 只读精排阈值（{@code agent.rag.rerank-min-score}）：与知识库复用同一把尺子（同一个精排模型，同一套 0~1 分）。 */
+    private final RagProperties ragProps;
     /** 裸调用成本采集（新增用途 {@code RECALL}，与 REWRITE / ROUTE 等同一口径）。 */
     private final LlmUsageService llmUsageService;
 
@@ -66,12 +84,16 @@ public class CrossSessionSearchService {
                                      ChatModel chatModel,
                                      PromptProperties promptProperties,
                                      CrossSessionProperties props,
+                                     RerankService rerankService,
+                                     RagProperties ragProps,
                                      LlmUsageService llmUsageService) {
         this.chatMessageMapper = chatMessageMapper;
         this.conversationMapper = conversationMapper;
         this.chatModel = chatModel;
         this.promptProperties = promptProperties;
         this.props = props;
+        this.rerankService = rerankService;
+        this.ragProps = ragProps;
         this.llmUsageService = llmUsageService;
     }
 
@@ -101,11 +123,23 @@ public class CrossSessionSearchService {
                 progress.accept("🔎 未在历史会话中回忆到相关内容");
                 return Recall.EMPTY;
             }
-            List<RecallHit> hits = toHits(rows, keywords);
+            // 候选条数随「是否语义重排」变：要重排就得多取一些给它筛 —— 否则只是在 topK 条里挑 topK 条，
+            // 重排只能过滤、不能换人，等于白做。不重排时维持原口径，行为与改造前逐字一致。
+            boolean useRerank = reranking();
+            int candidates = useRerank ? Math.min(props.recall(), RERANK_CANDIDATES) : props.k();
+            List<RecallHit> hits = toHits(rows, keywords, candidates);
+            int before = hits.size();
+            hits = semanticRerank(hits, message, useRerank);
+            if (hits.isEmpty()) {
+                // 「字面命中但语义不相关被筛掉」与「压根没命中」是两件事，播报必须分开
+                progress.accept("🔎 历史召回命中 " + before + " 条，语义筛选后均不相关，本轮不带历史");
+                return Recall.EMPTY;
+            }
             String json = RecallHit.toJson(hits);
-            progress.accept("🔎 回忆起 " + hits.size() + " 条历史记录");
-            log.debug("跨会话召回：会话={}，关键词={}，SQL 候选 {} 条 → 注入 {} 条",
-                    currentConversationId, keywords, rows.size(), hits.size());
+            String tail = before != hits.size() ? "（语义筛选自 " + before + " 条）" : "";
+            progress.accept("🔎 回忆起 " + hits.size() + " 条历史记录" + tail);
+            log.debug("跨会话召回：会话={}，检索词={}，SQL 候选 {} 条 → 注入 {} 条（语义重排={}）",
+                    currentConversationId, keywords, rows.size(), hits.size(), useRerank);
             return new Recall(render(hits), json, hits.size());
         } catch (Exception e) {
             // 检索是增强不是依赖：任何异常都只降级为「本轮不带历史」，但绝不静默到不播报
@@ -183,17 +217,19 @@ public class CrossSessionSearchService {
     // ==================== ② 命中整形 ====================
 
     /**
-     * SQL 行 → 展示用命中列表：取前 {@code top-k} 条，逐条算命中关键词数并截断片段。
+     * SQL 行 → 展示用命中列表：取前 {@code limit} 条，逐条算命中关键词数并截断片段。
      * <p>
      * 命中数在内存里重算（SQL 只负责排序）：这样 SQL 的 {@code resultType} 可以保持 {@code ChatMessage}
      * 走列名自动映射，不必为多出来的聚合列引入 record 投影（那会踩「列数/列序必须一一对应」的坑）。
      * 排序已在 SQL 完成，这里只做截断，<b>不重排</b>（重排会让 SQL 的命中数排序白做）。
+     *
+     * @param limit 候选条数上限（是否语义重排决定取值，见 {@link #recall}）
      */
-    private List<RecallHit> toHits(List<ChatMessage> rows, List<String> keywords) {
-        int limit = Math.min(props.k(), rows.size());
-        Map<String, String> titles = titles(rows.subList(0, limit));
-        List<RecallHit> hits = new ArrayList<>(limit);
-        for (int i = 0; i < limit; i++) {
+    private List<RecallHit> toHits(List<ChatMessage> rows, List<String> keywords, int limit) {
+        int n = Math.min(limit, rows.size());
+        Map<String, String> titles = titles(rows.subList(0, n));
+        List<RecallHit> hits = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
             ChatMessage m = rows.get(i);
             String content = m.getContent() == null ? "" : m.getContent().strip();
             hits.add(new RecallHit(
@@ -203,9 +239,60 @@ public class CrossSessionSearchService {
                     m.getRole(),
                     m.getCreatedAt(),
                     snippet(content),
-                    hitCount(content, keywords)));
+                    hitCount(content, keywords),
+                    0));   // 语义分留待重排阶段回填；此处 0 表示「尚未重排」
         }
         return hits;
+    }
+
+    // ==================== ②b 语义重排 ====================
+
+    /** 是否对召回候选做语义重排：开关开 <b>且</b> 精排服务在途可用。 */
+    private boolean reranking() {
+        return props.semanticRerankOn() && rerankService.available();
+    }
+
+    /**
+     * 语义重排：把「字面命中」的候选交给交叉编码器按 query↔片段<b>成对</b>打分，重排并丢弃低于
+     * {@code agent.rag.rerank-min-score} 的候选。
+     * <p>
+     * <b>它补的是什么</b>：字面匹配召回的是「包含同一个词」的句子，但同一个词在不同语境下未必相关
+     * （问「项目进度」会召回「这个项目我放弃了」）。精排是 query 与候选一起过模型，判的是<b>语义相关</b>，
+     * 正是字面一路缺的那半。这也是本条链路不做向量副本的原因：语义能力由「提词扩展（召回侧）」+
+     * 「精排重排（排序侧）」两头补，无需为每条消息多存一份向量并维护副本。
+     * <p>
+     * 失败即降级为「命中词数」排序（返回值与入参同序），绝不阻断对话；返回空表表示候选被全部判为不相关。
+     */
+    private List<RecallHit> semanticRerank(List<RecallHit> hits, String query, boolean enabled) {
+        if (!enabled || hits.isEmpty()) {
+            return hits;
+        }
+        List<String> docs = new ArrayList<>(hits.size());
+        for (RecallHit h : hits) {
+            docs.add(h.snippet());
+        }
+        List<RerankService.Ranked> ranked = rerankService.rerank(query, docs, props.k());
+        if (ranked == null) {
+            log.debug("跨会话语义重排不可用或调用失败，沿用命中词数排序（{} 条）", hits.size());
+            return hits;
+        }
+        List<RecallHit> out = new ArrayList<>(Math.min(props.k(), ranked.size()));
+        for (RerankService.Ranked r : ranked) {
+            if (r.index() < 0 || r.index() >= hits.size()) {
+                continue;   // 响应越界，防御跳过
+            }
+            if (r.score() < ragProps.rerankMinScore()) {
+                continue;   // 语义相关度不足
+            }
+            RecallHit src = hits.get(r.index());
+            // 重编号：序号必须与注入文本的行首编号一致，重排后沿用旧序号会让「编号↔列表」错位
+            out.add(new RecallHit(out.size() + 1, src.conversationId(), src.conversationTitle(),
+                    src.role(), src.createdAt(), src.snippet(), src.hitCount(), r.score()));
+            if (out.size() >= props.k()) {
+                break;
+            }
+        }
+        return out;
     }
 
     /** 批量取会话标题（命中的会话可能分布在多个会话里）：一次 IN 查询，避免逐条回查。 */

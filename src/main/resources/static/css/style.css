@@ -3834,6 +3834,51 @@ button {
     border-radius: 8px; color: var(--text); font-family: inherit; font-size: 12.5px; padding: 6px 10px;
 }
 .mem-fact-input:focus { outline: none; border-color: var(--border-strong); }
+
+/* ── 事实的生命周期（P1-2）：置信度 / 有效期 / 已被取代 三枚小标 ──
+   为什么三样都要上屏：它们决定「这条现在还起不起作用」。只显示文本的话，用户看到一串事实
+   却不知道哪条已过期、哪条已被新说法顶替，等于还是回到「一段看不透的平铺文本」。
+   置信度按档配色：1~2 低（黄，只被提过一次，可能是模型的臆测）、3 中性、4~5 高（青，被反复确认）。
+   失效条目（已被取代 / 已过期）整行淡化 + 正文加删除线 —— 它们仍在列表里（留档可查），
+   但不参与注入；不淡化就会被读成「还在生效」。 */
+.mem-fact-conf {
+    flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px;
+    background: var(--surface); color: var(--text-soft); font-variant-numeric: tabular-nums;
+}
+.mem-fact-conf.lv-low { color: #fbbf24; background: rgba(251, 191, 36, .12); }
+.mem-fact-conf.lv-high { color: var(--cyan); background: rgba(34, 211, 238, .12); }
+
+.mem-fact-state { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px; }
+.mem-fact-state.is-superseded { color: var(--text-soft); background: var(--surface); border: 0.5px solid var(--border); }
+.mem-fact-state.is-expired { color: #fbbf24; background: rgba(251, 191, 36, .12); }
+
+.mem-fact-until { flex: none; font-size: 11px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+
+.mem-fact-item.is-inactive .mem-fact-text { color: var(--text-soft); text-decoration: line-through; }
+.mem-fact-item.is-inactive { opacity: .7; }
+
+/* 有效期输入（datetime-local）。原生控件的深色渲染由 :root 的 color-scheme: dark 负责，
+   这里只管盒模型与字号，与同一行的主题下拉 / 内容输入框对齐。
+   ⚠ width 必须显式给：`.modal-body input { width: 100% }` 的特异性是 (0,1,1)，比 .mem-fact-expires
+   的 (0,1,0) 高 —— 不覆盖的话输入框会独占一整行，把「留空 = 永不过期」挤到下一行。
+   这里用 .modal-body 前缀把特异性提到 (0,2,0)，正好压过它。 */
+.mem-fact-expires {
+    flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 6px;
+}
+.mem-fact-expires:focus { outline: none; border-color: var(--border-strong); }
+.modal-body .mem-fact-expires { width: 196px; }
+
+/* 新增行的第二排：有效期 + 说明。单独一行是为了不把「主题 / 内容 / 添加」挤成一条。
+   子项一律 nowrap + flex:none：这一排是 flex 行，默认 flex-shrink:1 会把「有效期」三个字压成
+   竖排（一行一个字），看起来像布局坏了 —— 与「flex 列容器的子项」那条坑同源，只是方向相反。 */
+.mem-fact-add-extra {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin: -2px 0 8px; font-size: 11.5px; color: var(--text-soft);
+}
+.mem-fact-add-extra > span { flex: none; white-space: nowrap; }
+.mem-fact-add-extra .mem-fact-expires { flex: 0 0 auto; }
+.mem-fact-add-extra .mem-mini { flex: none; }
 .mem-mini {
     flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
     color: var(--text-soft); cursor: pointer; font-size: 12px; padding: 4px 10px;
@@ -4090,3 +4135,235 @@ button {
 }
 .trace-mem-chars { flex: none; font-size: 11.5px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
 .trace-mem-none { padding: 4px 0; font-size: 12.5px; color: var(--text-soft); }
+
+/* ══ 顶栏通知铃铛（P0-2/P1-4/门禁共用的到达出口）══
+   为什么不走 SSE：通知的产生时机（定时任务到点 / 阈值越线 / 门禁出结论）与任何一次对话请求无关，
+   SSE 的生命周期绑在请求上，关掉页面就丢。落表 + 轮询换来「可重放、可回看」，代价是最多晚一个
+   轮询周期到达 —— 对「昨天的任务失败了」这类消息完全够用。
+   未读数轮询 60s 一次（见 app.js 的 NOTIFY_POLL_MS），未读数变化不做动画，避免无意义的闪动。 */
+.notify-wrap { position: relative; display: inline-flex; }
+
+.notify-btn { position: relative; padding-right: 12px; }
+
+/* 未读角标：绝对定位到铃铛右上角，数字最多两位（超出显示 99+）。
+   用 pointer-events:none 让点击落在按钮上而不是角标上（否则角标区域点不动）。 */
+.notify-badge {
+    position: absolute;
+    top: -5px; right: -5px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--danger);
+    color: #fff;
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    pointer-events: none;
+    box-shadow: 0 0 0 2px var(--panel);
+}
+
+.notify-panel {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 10px);
+    width: 372px;
+    max-width: calc(100vw - 24px);
+    max-height: 460px;
+    background: linear-gradient(180deg, #101a30, #0b1220);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 60;
+}
+
+.notify-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+    font-size: 13px; font-weight: 600; color: var(--text);
+}
+.notify-act { background: transparent; color: var(--primary-text); font-size: 12px; padding: 2px 6px; border-radius: 6px; }
+.notify-act:hover { background: var(--primary-soft); }
+.notify-act:disabled { color: var(--text-soft); cursor: default; }
+
+.notify-list { display: block; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+
+/* 未读与非未读靠左侧色条 + 底色区分，不靠加粗整行 —— 加粗会让长标题折行后更难扫读 */
+.notify-item {
+    display: block;
+    padding: 9px 12px 9px 14px;
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid transparent;
+    position: relative;
+}
+.notify-item.is-unread { background: rgba(59, 130, 246, .06); border-left-color: var(--primary); }
+.notify-item.is-clickable { cursor: pointer; }
+.notify-item.is-clickable:hover { background: rgba(255, 255, 255, .05); }
+.notify-item-top { display: flex; align-items: baseline; gap: 6px; }
+.notify-item-title { flex: 1; font-size: 12.5px; color: var(--text); }
+.notify-item-time { flex: none; font-size: 11px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+.notify-item-text { display: block; margin-top: 3px; font-size: 12px; color: var(--text-soft); line-height: 1.5; word-break: break-word; }
+.notify-tag { flex: none; font-size: 11px; padding: 0 6px; border-radius: 999px; border: 0.5px solid var(--border); color: var(--text-soft); }
+.notify-lv-warn { color: #fbbf24; border-color: rgba(251, 191, 36, .4); }
+.notify-lv-error { color: var(--danger); border-color: rgba(248, 113, 113, .4); }
+.notify-lv-info { color: var(--primary-text); border-color: rgba(59, 130, 246, .4); }
+.notify-empty { display: block; padding: 22px 12px; text-align: center; font-size: 12.5px; color: var(--text-soft); line-height: 1.6; }
+
+/* ══ 提示词门禁横幅（评测弹窗顶部）══
+   四种结论各有自己的配色，理由与评测列表的三态一致：**「改了没跑」与「跑了变差」不是一回事** ——
+   前者是待办，后者是事故，同色会让人把待办当事故、或反过来把事故看漏。
+   DEGRADED 用实心红，是唯一一处「一眼可见的告警」；PENDING 用中性色，不制造焦虑。 */
+.gate-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    /* flex: 0 0 auto 是必须的：.modal-body 是 flex-direction:column 的容器，子项默认 flex-shrink:1
+       会被等比压扁（详见「flex 列容器的子项」那条坑）。横幅一旦被压扁，两行明细会先被吃掉。 */
+    flex: 0 0 auto;
+    padding: 9px 12px; margin-bottom: 4px;
+    border: 0.5px solid var(--border); border-left: 3px solid var(--border-strong);
+    border-radius: 8px; background: var(--surface);
+    font-size: 12.5px; color: var(--text-soft);
+}
+.gate-bar.gate-pass { border-left-color: var(--online); }
+.gate-bar.gate-pending { border-left-color: #fbbf24; }
+.gate-bar.gate-degraded { border-left-color: var(--danger); background: rgba(248, 113, 113, .07); }
+.gate-bar.gate-still { border-left-color: #fbbf24; }
+.gate-bar.gate-error { border-left-color: var(--danger); }
+.gate-verdict { font-weight: 600; color: var(--text); }
+.gate-bar.gate-degraded .gate-verdict { color: var(--danger); }
+.gate-fp { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--text-soft); }
+.gate-spacer { flex: 1; }
+.gate-detail { flex-basis: 100%; margin-top: 2px; font-size: 12px; color: var(--text-soft); word-break: break-word; }
+
+/* ══ 定时任务弹窗 ══
+   列表与表单同屏：任务通常只有几条，来回切页反而更慢。表单默认折叠，点「+ 新建」或某条的「编辑」展开。 */
+.modal-sched { max-width: 760px; }
+/* 同上：这两块都是 .modal-body（column 容器）的直接子项，必须显式 flex: 0 0 auto 才不被压扁 */
+.sched-list { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
+.sched-item {
+    display: flex; align-items: center; gap: 8px;
+    border: 0.5px solid var(--border); border-left: 3px solid var(--border-strong);
+    border-radius: 8px; padding: 8px 10px;
+}
+.sched-item.is-off { opacity: .55; }
+.sched-item.is-error { border-left-color: var(--danger); }
+.sched-item.is-ok { border-left-color: var(--online); }
+.sched-item-main { flex: 1; min-width: 0; }
+.sched-item-name { font-size: 13px; color: var(--text); display: flex; align-items: baseline; gap: 6px; }
+.sched-item-sub { margin-top: 2px; font-size: 11.5px; color: var(--text-soft); }
+.sched-item-sub code { background: var(--surface); padding: 0 4px; border-radius: 4px; }
+.sched-item-acts { flex: none; display: inline-flex; align-items: center; gap: 4px; }
+.sched-mini {
+    background: transparent; border: 0.5px solid var(--border); color: var(--text-soft);
+    font-size: 11.5px; padding: 2px 7px; border-radius: 6px; cursor: pointer;
+}
+.sched-mini:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }
+.sched-mini:disabled { opacity: .5; cursor: default; }
+.sched-mini.is-danger:hover { border-color: var(--danger); color: var(--danger); background: rgba(248, 113, 113, .1); }
+
+.sched-form { flex: 0 0 auto; border: 0.5px solid var(--border-strong); border-radius: 8px; padding: 12px; margin-top: 10px; background: var(--surface); }
+/* 提示词框压回 3 行高：.modal-body textarea 的 min-height 是给「长文本编辑」定的 180px，
+   放在这里会把表单撑得很散（本表单有 5 个字段）。覆盖面只到定时任务表单，不动其它弹窗。 */
+.sched-form textarea { min-height: 76px; }
+.sched-presets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.sched-preset {
+    background: transparent; border: 0.5px solid var(--border); color: var(--text-soft);
+    font-size: 11.5px; padding: 2px 8px; border-radius: 999px; cursor: pointer;
+}
+.sched-preset:hover { border-color: var(--primary); color: var(--primary-text); background: var(--primary-soft); }
+.sched-hint { margin-top: 4px; font-size: 11.5px; color: var(--text-soft); line-height: 1.55; }
+.sched-row { display: flex; gap: 10px; }
+.sched-row > label { flex: 1; }
+.sched-check { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12.5px; color: var(--text-soft); }
+.sched-check input { width: auto; }
+/* 勾选行里的 label 要摘掉 .modal-body label 的上边距（那里是按「字段标题」定的 10px，
+   放在一行内会把文字压到跟复选框不齐） */
+.sched-check label { margin-top: 0; }
+.sched-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* ===== 工具审批闸门待确认条 ===== */
+/* 位置在输入区上方（不是挂在某条消息下）：授权粒度是「本会话 × 工具」，它不随某条消息存在。
+   信息层级：工具名（最醒目）→ 状态 → 入参摘要（它到底要干什么）→ 动作按钮。 */
+.approve-bar { display: flex; flex-direction: column; gap: 8px; flex: 0 0 auto; }
+.approve-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-left-width: 3px;
+    font-size: 12.5px;
+}
+/* 待确认=琥珀（要你注意但没出事）；已拒绝=红（已挡下），与「执行中/失败」的语义分开 */
+.approve-item.is-pending { border-left-color: #fbbf24; }
+.approve-item.is-rejected { border-left-color: var(--danger); }
+.approve-main { flex: 1; min-width: 0; }
+.approve-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.approve-tool { font-weight: 600; color: var(--text); font-family: ui-monospace, Menlo, Consolas, monospace; }
+.approve-state { color: var(--text-soft); font-size: 11.5px; }
+.approve-meta { color: var(--text-soft); font-size: 11px; }
+/* 入参摘要：等宽 + 两行截断。完整内容在 title 里，悬停可看 */
+.approve-input {
+    margin-top: 3px;
+    color: var(--text-soft);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-all;
+}
+.approve-note { margin-top: 3px; color: var(--text-soft); font-size: 11.5px; }
+.approve-actions { flex: none; display: flex; gap: 6px; align-items: center; }
+.approve-btn {
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 4px 11px;
+    border-radius: 7px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.approve-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* 批准是「放行一个敏感动作」，用主色实心以区别于拒绝 —— 两者视觉重量必须不同 */
+.approve-ok { background: var(--primary); border-color: var(--primary); color: #fff; }
+.approve-ok:hover:not(:disabled) { background: #2f75e6; }
+.approve-no:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+.approve-undo { color: var(--text-soft); }
+.approve-undo:hover:not(:disabled) { border-color: var(--primary); color: var(--primary-text); }
+
+/* ===== 混合检索可见化：召回方式徽章 + 语义分 ===== */
+/* 「词命中」是异常信号（向量没召回、由字面补上来的），值得一眼看见；「双路」是最可信的信号。
+   向量是默认路径，不加徽章 —— 每行都挂一个只会变成噪声。 */
+.cite-match {
+    flex: none;
+    font-size: 10.5px;
+    line-height: 1.6;
+    padding: 0 5px;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    cursor: help;
+}
+/* 双路＝琥珀（两路共识）；词命中＝主色（另一条路补位）。两者颜色必须不同：
+   一个是「更可信」，一个是「来源不同」，语义不同就不该长得一样。 */
+.cite-match.is-both { color: #fbbf24; background: rgba(251, 191, 36, .12); border-color: rgba(251, 191, 36, .35); }
+.cite-match.is-kw { color: var(--primary-text); background: var(--primary-soft); border-color: rgba(59, 130, 246, .35); }
+
+/* 语义分（跨会话召回）：与「×命中词数」并列 —— 两者是两种不同的排序依据（语义 vs 字面），视觉上要能区分 */
+.recall-score {
+    flex: none;
+    color: var(--primary-text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    opacity: .9;
+}
